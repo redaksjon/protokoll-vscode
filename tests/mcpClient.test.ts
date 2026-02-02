@@ -270,6 +270,46 @@ describe('McpClient', () => {
             // Verify the request completed successfully
             expect(client).toBeDefined();
         });
+
+        it('should work without directory parameter (use server default)', async () => {
+            const mockResponse: TranscriptsListResponse = {
+                directory: '/server/default/path',
+                transcripts: [
+                    {
+                        uri: 'protokoll://transcript/test1.md',
+                        path: '/server/default/path/test1.md',
+                        filename: 'test1.md',
+                        date: '2026-01-31',
+                    },
+                ],
+                pagination: {
+                    total: 1,
+                    limit: 100,
+                    offset: 0,
+                    hasMore: false,
+                },
+                filters: {},
+            };
+
+            mockHttpRequest({
+                statusCode: 200,
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    result: {
+                        contents: [{
+                            uri: 'protokoll://transcripts',
+                            mimeType: 'application/json',
+                            text: JSON.stringify(mockResponse),
+                        }],
+                    },
+                }),
+            });
+
+            const result = await client.listTranscripts(undefined);
+            expect(result.transcripts).toHaveLength(1);
+            expect(result.directory).toBe('/server/default/path');
+        });
     });
 
     describe('readTranscript', () => {

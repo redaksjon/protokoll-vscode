@@ -5,6 +5,7 @@
 import * as vscode from 'vscode';
 import { McpClient } from './mcpClient';
 import type { Transcript, TranscriptsListResponse } from './types';
+import { log } from './logger';
 
 interface YearMonth {
   year: string;
@@ -25,12 +26,26 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   constructor(private context: vscode.ExtensionContext) {}
 
   setClient(client: McpClient): void {
+    log('TranscriptsViewProvider.setClient called', { hasClient: !!client });
     this.client = client;
+  }
+
+  /**
+   * Manually fire the tree data change event to force VS Code to re-render
+   */
+  fireTreeDataChange(): void {
+    log('TranscriptsViewProvider.fireTreeDataChange called');
+    this._onDidChangeTreeData.fire();
   }
 
   setProjectFilter(projectId: string | null): void {
     this.selectedProjectFilter = projectId;
-    this._onDidChangeTreeData.fire();
+    // Refresh the transcript list with the new filter
+    this.refresh().catch(err => {
+      vscode.window.showErrorMessage(
+        `Failed to refresh transcripts: ${err instanceof Error ? err.message : String(err)}`
+      );
+    });
   }
 
   getProjectFilter(): string | null {
@@ -38,7 +53,15 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   }
 
   async refresh(directory?: string): Promise<void> {
+    log('TranscriptsViewProvider.refresh called', { 
+      hasClient: !!this.client, 
+      directory, 
+      currentDirectory: this.directory,
+      currentTranscriptsCount: this.transcripts.length 
+    });
+    
     if (!this.client) {
+      log('TranscriptsViewProvider.refresh: No client, returning early');
       return;
     }
 
@@ -94,13 +117,22 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
         }
       }
 
-      const response: TranscriptsListResponse = await this.client.listTranscripts(this.directory, {
+      // Pass directory only if set (empty string means use server default)
+      // Use this.directory directly, or undefined if empty (server will use its default)
+      const directoryToUse = this.directory || undefined;
+      log('TranscriptsViewProvider.refresh: Calling listTranscripts', { directoryToUse, projectFilter: this.selectedProjectFilter });
+      
+      const response: TranscriptsListResponse = await this.client.listTranscripts(directoryToUse, {
         limit: 100,
+        projectId: this.selectedProjectFilter || undefined,
       });
 
+      log('TranscriptsViewProvider.refresh: Got response', { transcriptsCount: response.transcripts.length });
       this.transcripts = response.transcripts;
       this._onDidChangeTreeData.fire();
+      log('TranscriptsViewProvider.refresh: Fired tree data change event');
     } catch (error) {
+      log('TranscriptsViewProvider.refresh: ERROR', { error: error instanceof Error ? error.message : String(error) });
       vscode.window.showErrorMessage(
         `Failed to load transcripts: ${error instanceof Error ? error.message : String(error)}`
       );
@@ -111,10 +143,35 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     return element;
   }
 
-  getChildren(element?: TranscriptItem): TranscriptItem[] {
+  private _isLoading = false;
+
+  async getChildren(element?: TranscriptItem): Promise<TranscriptItem[]> {
+    log('TranscriptsViewProvider.getChildren called', { 
+      hasElement: !!element, 
+      elementType: element?.type,
+      transcriptsCount: this.transcripts.length,
+      hasClient: !!this.client,
+      isLoading: this._isLoading
+    });
+    
+    // Auto-load transcripts if we have no data yet and have a client
+    if (!element && this.transcripts.length === 0 && this.client && !this._isLoading) {
+      this._isLoading = true;
+      log('TranscriptsViewProvider.getChildren: Starting auto-load');
+      try {
+        await this.refresh();
+        log('TranscriptsViewProvider.getChildren: Auto-load completed', { transcriptsCount: this.transcripts.length });
+      } catch (error) {
+        log('TranscriptsViewProvider.getChildren: Auto-load FAILED', { error: error instanceof Error ? error.message : String(error) });
+      } finally {
+        this._isLoading = false;
+      }
+    }
+
     if (!element) {
       // Root level - return year nodes
       const yearMonths = this.groupTranscriptsByYearMonth();
+      log('TranscriptsViewProvider.getChildren: Returning root level', { yearCount: Object.keys(yearMonths).length });
       return Object.keys(yearMonths)
         .sort((a, b) => b.localeCompare(a)) // Sort years descending (newest first)
         .map(year => {
@@ -161,9 +218,12 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
       
       return transcripts.map(t => {
         const projectNames = t.entities?.projects?.map(p => p.name).join(', ') || '';
+        const day = this.extractDay(t);
+        const dayPrefix = day !== null ? `${day}. ` : '';
+        const label = `${dayPrefix}${t.title || t.filename}`;
         
         return new TranscriptItem(
-          t.title || t.filename,
+          label,
           t.uri,
           vscode.TreeItemCollapsibleState.None,
           {
@@ -186,12 +246,9 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   private groupTranscriptsByYearMonth(): Record<string, Record<string, Transcript[]>> {
     const grouped: Record<string, Record<string, Transcript[]>> = {};
 
-    // Filter transcripts by selected project if filter is set
-    const filteredTranscripts = this.selectedProjectFilter
-      ? this.transcripts.filter(t => 
-          t.entities?.projects?.some(p => p.id === this.selectedProjectFilter)
-        )
-      : this.transcripts;
+    // Note: Filtering is now done server-side, but we keep this as a fallback
+    // The server should already have filtered by projectId if selectedProjectFilter is set
+    const filteredTranscripts = this.transcripts;
 
     for (const transcript of filteredTranscripts) {
       const yearMonth = this.extractYearMonth(transcript);
@@ -208,16 +265,30 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
       grouped[yearMonth.year][yearMonth.month].push(transcript);
     }
 
-    // Sort transcripts within each month by date descending
+    // Sort transcripts within each month by day ascending
     for (const year in grouped) {
       for (const month in grouped[year]) {
         grouped[year][month].sort((a, b) => {
-          const dateCompare = b.date.localeCompare(a.date);
+          const dayA = this.extractDay(a);
+          const dayB = this.extractDay(b);
+          
+          // Compare by day number (ascending)
+          if (dayA !== null && dayB !== null) {
+            const dayCompare = dayA - dayB;
+            if (dayCompare !== 0) {
+              return dayCompare;
+            }
+          }
+          
+          // If day extraction failed, fall back to date string comparison
+          const dateCompare = a.date.localeCompare(b.date);
           if (dateCompare !== 0) {
             return dateCompare;
           }
+          
+          // Then by time if available
           if (a.time && b.time) {
-            return b.time.localeCompare(a.time);
+            return a.time.localeCompare(b.time);
           }
           return 0;
         });
@@ -228,18 +299,8 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   }
 
   private extractYearMonth(transcript: Transcript): YearMonth | null {
-    // Try to extract from date field (YYYY-MM-DD format)
-    if (transcript.date) {
-      const dateMatch = transcript.date.match(/^(\d{4})-(\d{2})/);
-      if (dateMatch) {
-        return {
-          year: dateMatch[1],
-          month: String(parseInt(dateMatch[2])), // Remove leading zero
-        };
-      }
-    }
-
-    // Fallback: try to extract from path (e.g., "2026/1/29-...")
+    // Extract from path format: <year>/<month>/<day>-<name>.md
+    // e.g., "2026/1/29-control-your-context.md" or "2026/01/29-control-your-context.md"
     if (transcript.path) {
       const pathMatch = transcript.path.match(/(\d{4})\/(\d{1,2})\//);
       if (pathMatch) {
@@ -247,6 +308,46 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
           year: pathMatch[1],
           month: String(parseInt(pathMatch[2])), // Remove leading zero
         };
+      }
+    }
+
+    // Fallback: try to parse date field if path doesn't match expected format
+    if (transcript.date) {
+      // Format 1: YYYY-MM-DD (e.g., "2026-01-29")
+      const isoMatch = transcript.date.match(/^(\d{4})-(\d{2})/);
+      if (isoMatch) {
+        return {
+          year: isoMatch[1],
+          month: String(parseInt(isoMatch[2])), // Remove leading zero
+        };
+      }
+
+      // Format 2: Try to parse as Date object
+      try {
+        const dateObj = new Date(transcript.date);
+        if (!isNaN(dateObj.getTime())) {
+          return {
+            year: String(dateObj.getFullYear()),
+            month: String(dateObj.getMonth() + 1), // getMonth() is 0-based
+          };
+        }
+      } catch {
+        // Date parsing failed
+      }
+    }
+
+    // Last resort: try createdAt field
+    if (transcript.createdAt) {
+      try {
+        const dateObj = new Date(transcript.createdAt);
+        if (!isNaN(dateObj.getTime())) {
+          return {
+            year: String(dateObj.getFullYear()),
+            month: String(dateObj.getMonth() + 1),
+          };
+        }
+      } catch {
+        // Date parsing failed
       }
     }
 
@@ -260,6 +361,38 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
       'July', 'August', 'September', 'October', 'November', 'December'
     ];
     return monthNames[monthNum - 1] || `Month ${month}`;
+  }
+
+  private extractDay(transcript: Transcript): number | null {
+    // Extract from path format: <year>/<month>/<day>-<name>.md
+    // e.g., "2026/1/29-control-your-context.md" or "2026/01/29-control-your-context.md"
+    if (transcript.path) {
+      const pathMatch = transcript.path.match(/\d{4}\/\d{1,2}\/(\d{1,2})/);
+      if (pathMatch) {
+        return parseInt(pathMatch[1]);
+      }
+    }
+
+    // Fallback: try to extract day from date field if path doesn't match expected format
+    if (transcript.date) {
+      // Format 1: YYYY-MM-DD (e.g., "2026-01-29")
+      const isoMatch = transcript.date.match(/^\d{4}-\d{2}-(\d{2})/);
+      if (isoMatch) {
+        return parseInt(isoMatch[1]);
+      }
+
+      // Format 2: Try to parse as Date object
+      try {
+        const dateObj = new Date(transcript.date);
+        if (!isNaN(dateObj.getTime())) {
+          return dateObj.getDate();
+        }
+      } catch {
+        // Date parsing failed
+      }
+    }
+
+    return null;
   }
 }
 

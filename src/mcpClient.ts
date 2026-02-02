@@ -318,16 +318,21 @@ export class McpClient {
 
   /**
    * List transcripts from a directory
+   * If directory is not provided, uses the server's configured outputDirectory
    */
-  async listTranscripts(directory: string, options?: {
+  async listTranscripts(directory?: string, options?: {
     startDate?: string;
     endDate?: string;
     limit?: number;
     offset?: number;
+    projectId?: string;
   }): Promise<TranscriptsListResponse> {
     // Build the transcripts list URI
     const params = new URLSearchParams();
-    params.set('directory', directory);
+    // Only include directory if provided (server will use configured outputDirectory as fallback)
+    if (directory) {
+      params.set('directory', directory);
+    }
     if (options?.startDate) {
       params.set('startDate', options.startDate);
     }
@@ -340,8 +345,12 @@ export class McpClient {
     if (options?.offset !== undefined) {
       params.set('offset', String(options.offset));
     }
+    if (options?.projectId) {
+      params.set('projectId', options.projectId);
+    }
 
-    const uri = `protokoll://transcripts?${params.toString()}`;
+    const queryString = params.toString();
+    const uri = queryString ? `protokoll://transcripts?${queryString}` : 'protokoll://transcripts';
     const resource = await this.readResource(uri);
     
     return JSON.parse(resource.text) as TranscriptsListResponse;

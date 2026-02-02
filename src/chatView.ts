@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 import { McpClient } from './mcpClient';
 import { OpenAIClient } from './openaiClient';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
+import type { Transcript } from './types';
 
 interface TranscriptContext {
   title: string;
@@ -24,8 +25,31 @@ export class ChatViewProvider {
   private _messageHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
   private _openaiApiKey: string | null = null;
   private _currentTranscript: TranscriptContext | null = null;
+  private _chatsViewProvider: any | null = null; // ChatsViewProvider type
+  private _transcriptDetailProvider: { 
+    getCurrentTranscript: (uri: string) => { uri: string; transcript: Transcript } | undefined;
+    getAllOpenTranscripts?: () => Array<{ uri: string; transcript: Transcript }>;
+  } | null = null;
+  private _panelCounter: number = 0;
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
+
+  /**
+   * Set reference to chats view provider for panel tracking
+   */
+  setChatsViewProvider(provider: any): void {
+    this._chatsViewProvider = provider;
+  }
+
+  /**
+   * Set reference to transcript detail provider for context fallback
+   */
+  setTranscriptDetailProvider(provider: { 
+    getCurrentTranscript: (uri: string) => { uri: string; transcript: Transcript } | undefined;
+    getAllOpenTranscripts?: () => Array<{ uri: string; transcript: Transcript }>;
+  }): void {
+    this._transcriptDetailProvider = provider;
+  }
 
   setClient(client: McpClient): void {
     this._mcpClient = client;
@@ -62,6 +86,149 @@ export class ChatViewProvider {
     }
   }
 
+  /**
+   * Send an inline message for an entity and get the response
+   */
+  public async sendInlineEntityMessage(
+    message: string,
+    entityUri: string,
+    entityContext: { type: string; id: string; name: string; uri: string }
+  ): Promise<string> {
+    // Initialize OpenAI if needed
+    if (!this._openaiClient) {
+      await this.initializeOpenAI();
+    }
+
+    if (!this._openaiClient) {
+      throw new Error('OpenAI client not initialized');
+    }
+
+    // Build system message with entity context
+    const systemMessage: ChatCompletionMessageParam = {
+      role: 'system',
+      content: `You are helping the user edit a Protokoll entity.
+
+=== CURRENT ENTITY (THE ONLY ENTITY FOR THIS CONVERSATION) ===
+Type: ${entityContext.type}
+ID: ${entityContext.id}
+Name: ${entityContext.name}
+URI: ${entityContext.uri}
+
+=== MANDATORY RULES - FOLLOW THESE EXACTLY ===
+1. This ENTIRE conversation is about ONLY ONE entity: the one listed above.
+2. When the user makes ANY request (change name, edit description, update fields, etc.), you MUST use THIS entity.
+3. When calling ANY Protokoll MCP tool that requires an entity identifier, you MUST use:
+   - For person: personId="${entityContext.id}" or name="${entityContext.name}"
+   - For project: projectId="${entityContext.id}" or name="${entityContext.name}"
+   - For company: companyId="${entityContext.id}" or name="${entityContext.name}"
+   - For term: termId="${entityContext.id}" or name="${entityContext.name}"
+   DO NOT ask the user for the entity identifier - use "${entityContext.id}" or "${entityContext.name}" automatically.
+4. NEVER ask "which entity" - there is only ONE entity for this conversation.
+5. Execute the user's request immediately using the entity identifier above.`,
+    };
+
+    // Build messages array
+    const openaiMessages: ChatCompletionMessageParam[] = [
+      systemMessage,
+      { role: 'user', content: message },
+    ];
+
+    // Get available tools
+    const tools = this._openaiClient.getTools();
+
+    // Stream response from OpenAI
+    let assistantResponse = '';
+    const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+
+    for await (const chunk of this._openaiClient.streamChat(
+      openaiMessages,
+      tools,
+      (toolName, args) => {
+        toolCalls.push({ name: toolName, args });
+        console.log(`Protokoll: [INLINE ENTITY CHAT] Tool called: ${toolName}`, args);
+      }
+    )) {
+      assistantResponse += chunk;
+    }
+
+    return assistantResponse;
+  }
+
+  /**
+   * Send an inline message and get the response (for inline chat in transcript/entity views)
+   */
+  public async sendInlineMessage(
+    message: string,
+    transcriptUri: string,
+    transcriptContext: TranscriptContext
+  ): Promise<string> {
+    // Initialize OpenAI if needed
+    if (!this._openaiClient) {
+      await this.initializeOpenAI();
+    }
+
+    if (!this._openaiClient) {
+      throw new Error('OpenAI client not initialized');
+    }
+
+    // Build system message with transcript context
+    const transcriptIdentifier = transcriptContext.filename 
+      || (transcriptContext.path && !transcriptContext.path.startsWith('/') && !transcriptContext.path.match(/^[A-Za-z]:/)
+        ? transcriptContext.path 
+        : null)
+      || transcriptContext.title;
+
+    const systemMessage: ChatCompletionMessageParam = {
+      role: 'system',
+      content: `You are helping the user review and improve a Protokoll transcript.
+
+=== CURRENT TRANSCRIPT (THE ONLY TRANSCRIPT FOR THIS CONVERSATION) ===
+Title: ${transcriptContext.title || 'Untitled'}
+Filename: ${transcriptContext.filename || 'N/A'}
+Path: ${transcriptContext.path || 'N/A'}
+URI: ${transcriptContext.uri}
+
+=== MANDATORY RULES - FOLLOW THESE EXACTLY ===
+1. This ENTIRE conversation is about ONLY ONE transcript: the one listed above.
+2. When the user makes ANY request (change title, edit, add tags, update, rename, etc.), you MUST use THIS transcript.
+3. When calling ANY Protokoll MCP tool that requires a transcriptPath parameter, you MUST use:
+   transcriptPath: "${transcriptIdentifier}"
+   DO NOT ask the user for the transcript path - use "${transcriptIdentifier}" automatically.
+4. NEVER ask "which transcript" - there is only ONE transcript for this conversation.
+5. NEVER ask for the transcript filename or path - you already have it: "${transcriptIdentifier}"
+6. If the user says "change the title" or "rename" or "edit", they mean THIS transcript.
+7. Execute the user's request immediately using "${transcriptIdentifier}" as the transcriptPath.
+
+Example: If user says "Change the title to X", immediately call protokoll_edit_transcript with transcriptPath="${transcriptIdentifier}" and title="X". Do NOT ask which transcript.`,
+    };
+
+    // Build messages array
+    const openaiMessages: ChatCompletionMessageParam[] = [
+      systemMessage,
+      { role: 'user', content: message },
+    ];
+
+    // Get available tools
+    const tools = this._openaiClient.getTools();
+
+    // Stream response from OpenAI
+    let assistantResponse = '';
+    const toolCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+
+    for await (const chunk of this._openaiClient.streamChat(
+      openaiMessages,
+      tools,
+      (toolName, args) => {
+        toolCalls.push({ name: toolName, args });
+        console.log(`Protokoll: [INLINE CHAT] Tool called: ${toolName}`, args);
+      }
+    )) {
+      assistantResponse += chunk;
+    }
+
+    return assistantResponse;
+  }
+
   public async showChat(initialMessage?: string, transcriptUri?: string, transcriptContext?: TranscriptContext): Promise<void> {
     console.log('Protokoll: [CHAT] showChat called', { 
       hasInitialMessage: !!initialMessage, 
@@ -69,19 +236,6 @@ export class ChatViewProvider {
       hasTranscriptContext: !!transcriptContext,
       hasPanel: !!this._panel 
     });
-
-    // Update current transcript context FIRST if provided
-    if (transcriptContext) {
-      this._currentTranscript = transcriptContext;
-      console.log('Protokoll: [CHAT] Set transcript context:', {
-        title: transcriptContext.title,
-        filename: transcriptContext.filename,
-        path: transcriptContext.path,
-        uri: transcriptContext.uri
-      });
-    } else {
-      console.log('Protokoll: [CHAT] No transcript context provided - chat will be generic');
-    }
 
     // Initialize OpenAI if not already done
     if (!this._openaiClient) {
@@ -98,68 +252,34 @@ export class ChatViewProvider {
       }
     }
 
-    // Create or reveal panel
+    // ALWAYS dispose existing panel and create a new one
+    // This ensures each "Review Transcription" click opens a fresh chat
     if (this._panel) {
-      console.log('Protokoll: [CHAT] Panel exists, revealing...');
-      console.log('Protokoll: [CHAT] Current _currentTranscript:', this._currentTranscript ? 'SET' : 'NULL');
-      console.log('Protokoll: [CHAT] New transcriptContext provided:', transcriptContext ? 'YES' : 'NO');
-      
-      // CRITICAL: Always update transcript context if provided, even for existing panel
-      // This ensures context is current even if panel was opened without context initially
-      if (transcriptContext) {
-        console.log('Protokoll: [CHAT] Updating transcript context on existing panel');
-        this._currentTranscript = transcriptContext;
-        console.log('Protokoll: [CHAT] Updated transcript context:', {
-          title: transcriptContext.title,
-          filename: transcriptContext.filename,
-          path: transcriptContext.path,
-          uri: transcriptContext.uri
-        });
-      }
-      
-      // ALWAYS update panel title if we have transcript context
-      if (this._currentTranscript) {
-        const newTitle = this._currentTranscript.title || 'Untitled Transcript';
-        this._panel.title = newTitle;
-        console.log('Protokoll: [CHAT] Updated panel title to:', newTitle);
-        
-        // If history is empty or doesn't have a welcome message with context, add one
-        const hasWelcomeMessage = this._messageHistory.length > 0 && 
-          this._messageHistory[0].role === 'assistant' &&
-          this._messageHistory[0].content.includes('I\'m ready to help you with the transcript');
-        
-        if (!hasWelcomeMessage || this._messageHistory.length === 0) {
-          console.log('Protokoll: [CHAT] Adding welcome message with transcript context');
-          let welcomeMessage = 'Hello! I can help you review and improve Protokoll transcripts. I have access to Protokoll MCP tools.';
-          welcomeMessage += `\n\nI'm ready to help you with the transcript: **${this._currentTranscript.title}**`;
-          if (this._currentTranscript.filename) {
-            welcomeMessage += ` (${this._currentTranscript.filename})`;
-          }
-          welcomeMessage += `\n\nYou can ask me to change the title, update content, add tags, assign projects, or answer questions about it. I'll automatically use this transcript for all operations unless you specify otherwise.`;
-          
-          // Clear old history and add new welcome message
-          this._messageHistory = [{
-            role: 'assistant',
-            content: welcomeMessage,
-          }];
-        }
-      } else {
-        console.warn('Protokoll: [CHAT] ⚠️ WARNING: Panel exists but NO transcript context available!');
-      }
-      
-      this.updateWebview(); // Refresh to show context
-      this._panel.reveal();
-      
-      if (initialMessage) {
-        console.log('Protokoll: [CHAT] Sending initial message to existing panel');
-        // Small delay to ensure panel is ready, then send initial message
-        await new Promise(resolve => setTimeout(resolve, 300));
-        await this.sendMessage(initialMessage, transcriptUri);
-      }
-      return;
+      console.log('Protokoll: [CHAT] Disposing existing panel to create fresh chat');
+      this._panel.dispose();
+      this._panel = null;
+      this._messageHistory = [];
+      this._currentTranscript = null;
+    }
+
+    // Set current transcript context AFTER disposing old panel
+    if (transcriptContext) {
+      this._currentTranscript = transcriptContext;
+      console.log('Protokoll: [CHAT] Set transcript context for new panel:', {
+        title: transcriptContext.title,
+        filename: transcriptContext.filename,
+        path: transcriptContext.path,
+        uri: transcriptContext.uri
+      });
+    } else {
+      console.log('Protokoll: [CHAT] No transcript context provided - chat will be generic');
     }
 
     console.log('Protokoll: [CHAT] Creating new panel...');
+
+    // Generate unique panel ID
+    this._panelCounter++;
+    const panelId = `chat-${this._panelCounter}`;
 
     // Create new panel with transcript-aware title
     // If we have transcript context, use just the transcript title (more prominent)
@@ -178,9 +298,39 @@ export class ChatViewProvider {
       }
     );
     
-    console.log('Protokoll: [CHAT] Created panel with title:', panelTitle);
+    console.log('Protokoll: [CHAT] Created panel with ID:', panelId, 'title:', panelTitle);
 
-    // Set initial content
+    // Register with chats view
+    if (this._chatsViewProvider) {
+      this._chatsViewProvider.registerChat(panelId, panelTitle, transcriptUri);
+      console.log('Protokoll: [CHAT] Registered chat in chats view');
+    }
+
+    // Initialize message history with welcome message BEFORE setting HTML
+    // This ensures the transcript context is visible immediately when the panel opens
+    if (!initialMessage) {
+      console.log('Protokoll: [CHAT] Adding welcome message with transcript context');
+      let welcomeMessage = 'Hello! I can help you review and improve Protokoll transcripts. I have access to Protokoll MCP tools.';
+      if (this._currentTranscript) {
+        welcomeMessage += `\n\n**Current Transcript: ${this._currentTranscript.title}**`;
+        if (this._currentTranscript.filename) {
+          welcomeMessage += `\n**File:** ${this._currentTranscript.filename}`;
+        }
+        if (this._currentTranscript.path) {
+          welcomeMessage += `\n**Path:** ${this._currentTranscript.path}`;
+        }
+        welcomeMessage += `\n\nI'm ready to help you with this transcript. You can ask me to change the title, update content, add tags, assign projects, or answer questions about it. I'll automatically use this transcript for all operations unless you specify otherwise.`;
+      } else {
+        welcomeMessage += ' How can I help you today?';
+      }
+      this._messageHistory.push({
+        role: 'assistant',
+        content: welcomeMessage,
+      });
+      console.log('Protokoll: [CHAT] Welcome message added to history');
+    }
+
+    // Set initial content (webview will receive history via updateHistory message)
     this._panel.webview.html = this.getWebviewContent();
 
     // Handle messages from webview
@@ -206,17 +356,26 @@ export class ChatViewProvider {
     );
 
     // Clean up on dispose
-    // NOTE: We keep _currentTranscript so it can be restored when chat is reopened
     this._panel.onDidDispose(
       () => {
-        console.log('Protokoll: [CHAT] Panel disposed, clearing history but keeping transcript context');
+        console.log('Protokoll: [CHAT] Panel disposed, clearing all state');
         this._panel = null;
         this._messageHistory = [];
-        // DON'T clear _currentTranscript - keep it for when chat is reopened
-        // this._currentTranscript = null;
+        this._currentTranscript = null;
+        
+        // Unregister from chats view
+        if (this._chatsViewProvider) {
+          this._chatsViewProvider.unregisterChat(panelId);
+          console.log('Protokoll: [CHAT] Unregistered chat from chats view');
+        }
       },
       null
     );
+
+    // Update webview immediately to show the welcome message
+    // The HTML now includes the transcript context header, and this sends the message history
+    this.updateWebview();
+    console.log('Protokoll: [CHAT] Updated webview with initial state');
 
     // Send initial message if provided
     if (initialMessage) {
@@ -224,24 +383,6 @@ export class ChatViewProvider {
       // Small delay to ensure panel is fully initialized
       await new Promise(resolve => setTimeout(resolve, 500));
       await this.sendMessage(initialMessage, transcriptUri);
-    } else {
-      // Initialize with welcome message that includes transcript context if available
-      console.log('Protokoll: [CHAT] No initial message, adding welcome message');
-      let welcomeMessage = 'Hello! I can help you review and improve Protokoll transcripts. I have access to Protokoll MCP tools.';
-      if (this._currentTranscript) {
-        welcomeMessage += `\n\nI'm ready to help you with the transcript: **${this._currentTranscript.title}**`;
-        if (this._currentTranscript.filename) {
-          welcomeMessage += ` (${this._currentTranscript.filename})`;
-        }
-        welcomeMessage += `\n\nYou can ask me to change the title, update content, add tags, assign projects, or answer questions about it. I'll automatically use this transcript for all operations unless you specify otherwise.`;
-      } else {
-        welcomeMessage += ' How can I help you today?';
-      }
-      this._messageHistory.push({
-        role: 'assistant',
-        content: welcomeMessage,
-      });
-      this.updateWebview();
     }
   }
 
@@ -740,15 +881,14 @@ ${extractedFilename ? `Filename: ${extractedFilename}` : ''}
 </head>
 <body>
     <div class="chat-container">
-        <div class="transcript-context" id="transcriptContext" style="display: none;">
-            <strong>This chat is related to:</strong> <span id="transcriptTitle"></span>
-            <div class="transcript-path" id="transcriptPath" style="display: none;"></div>
+        <div class="transcript-context" id="transcriptContext" style="display: ${this._currentTranscript ? 'block' : 'none'};">
+            <strong>Current Transcript:</strong> <span id="transcriptTitle">${this._currentTranscript?.title || ''}</span>
+            <div class="transcript-path" id="transcriptPath" style="display: ${this._currentTranscript?.filename ? 'block' : 'none'};">
+                <code>${this._currentTranscript?.filename || ''}</code>
+            </div>
         </div>
         <div class="messages" id="messages">
-            <div class="message assistant">
-                <div class="message-role">Protokoll Assistant</div>
-                <div class="message-content">Hello! I can help you review and improve Protokoll transcripts. I have access to Protokoll MCP tools. How can I help you today?</div>
-            </div>
+            <!-- Messages will be populated by updateWebview -->
         </div>
         <div class="thinking" id="thinking">Thinking...</div>
         <div class="input-container">

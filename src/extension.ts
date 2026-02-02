@@ -5,19 +5,28 @@
 import * as vscode from 'vscode';
 import { McpClient } from './mcpClient';
 import { TranscriptsViewProvider, TranscriptItem } from './transcriptsView';
-import { TranscriptDetailViewProvider } from './transcriptDetailView';
+import { TranscriptDetailViewProvider, getTranscriptContentProvider } from './transcriptDetailView';
 import { ConnectionStatusViewProvider } from './connectionStatusView';
 import { ChatViewProvider } from './chatView';
+import { ChatsViewProvider } from './chatsView';
 import type { Transcript, TranscriptContent } from './types';
+import { log, initLogger } from './logger';
 
 let mcpClient: McpClient | null = null;
 let transcriptsViewProvider: TranscriptsViewProvider | null = null;
 let transcriptDetailViewProvider: TranscriptDetailViewProvider | null = null;
 let connectionStatusViewProvider: ConnectionStatusViewProvider | null = null;
 let chatViewProvider: ChatViewProvider | null = null;
+let chatsViewProvider: ChatsViewProvider | null = null;
+
+// Create an output channel for debugging
+const outputChannel = vscode.window.createOutputChannel('Protokoll Debug');
+
+// Initialize the shared logger
+initLogger(outputChannel);
 
 export async function activate(context: vscode.ExtensionContext) {
-  console.log('Protokoll extension is now active');
+  log('Protokoll extension is now active');
 
   // Initialize MCP client
   const config = vscode.workspace.getConfiguration('protokoll');
@@ -73,12 +82,29 @@ export async function activate(context: vscode.ExtensionContext) {
         
         // Subscribe to resource list change notifications (for transcript list)
         console.log('Protokoll: [EXTENSION] Registering notification handler for resources_changed');
-        mcpClient.onNotification('notifications/resources_changed', () => {
+        mcpClient.onNotification('notifications/resources_changed', async () => {
           console.log('Protokoll: [EXTENSION] 📢 Received resources_changed notification, refreshing transcripts');
           if (transcriptsViewProvider) {
-            transcriptsViewProvider.refresh();
+            await transcriptsViewProvider.refresh();
           } else {
             console.warn('Protokoll: [EXTENSION] ⚠️ transcriptsViewProvider is null, cannot refresh');
+          }
+          
+          // Also refresh any open transcript detail views, as they might need to update
+          // (e.g., if a transcript was renamed, the list will have the new name)
+          if (transcriptDetailViewProvider) {
+            const allOpenTranscripts = transcriptDetailViewProvider.getAllOpenTranscripts();
+            console.log(`Protokoll: [EXTENSION] Refreshing ${allOpenTranscripts.length} open transcript detail view(s)`);
+            for (const openTranscript of allOpenTranscripts) {
+              try {
+                // Refresh each open transcript to pick up any changes
+                await transcriptDetailViewProvider.refreshTranscript(openTranscript.uri);
+              } catch (error) {
+                console.warn(`Protokoll: [EXTENSION] ⚠️ Failed to refresh transcript ${openTranscript.uri}:`, error);
+                // If refresh fails (e.g., URI changed due to rename), try to find the new URI
+                // by refreshing the transcripts list and matching by content/metadata
+              }
+            }
           }
         });
         
@@ -111,14 +137,62 @@ export async function activate(context: vscode.ExtensionContext) {
             console.log(`Protokoll: [EXTENSION] Notification URI: ${params.uri}`);
             if (transcriptDetailViewProvider) {
               // Refresh the transcript view if it's open
-              const currentTranscript = transcriptDetailViewProvider.getCurrentTranscript(params.uri);
+              let currentTranscript = transcriptDetailViewProvider.getCurrentTranscript(params.uri);
               if (currentTranscript) {
                 console.log('Protokoll: [EXTENSION] ✅ Transcript is currently open, refreshing...');
                 console.log(`Protokoll: [EXTENSION] Stored URI: ${currentTranscript.uri}`);
                 await transcriptDetailViewProvider.refreshTranscript(params.uri);
               } else {
-                console.log('Protokoll: [EXTENSION] ⚠️ Transcript is not currently open, skipping refresh');
-                console.log(`Protokoll: [EXTENSION] Looking for URI: ${params.uri}`);
+                // Transcript might have been renamed - check all open transcripts
+                // to see if any might match this URI (e.g., if it was renamed via chat)
+                console.log('Protokoll: [EXTENSION] ⚠️ Transcript URI not found in open transcripts');
+                console.log('Protokoll: [EXTENSION] Checking if this might be a renamed transcript...');
+                
+                const allOpenTranscripts = transcriptDetailViewProvider.getAllOpenTranscripts();
+                console.log(`Protokoll: [EXTENSION] Found ${allOpenTranscripts.length} open transcript(s)`);
+                
+                // Try to read the transcript to get its metadata and see if we can match it
+                try {
+                  if (mcpClient) {
+                    const content = await mcpClient.readTranscript(params.uri);
+                    // Extract filename from URI: protokoll://transcript/../2026/1/file.md -> file.md
+                    const uriFilename = params.uri.split('/').pop() || '';
+                    
+                    // Check if any open transcript might be this one (by checking if they're in the same directory/timeframe)
+                    // This is a heuristic - if the notification is for a transcript we don't recognize,
+                    // it might be a renamed version of one we have open
+                    for (const openTranscript of allOpenTranscripts) {
+                      const openFilename = openTranscript.transcript.filename || '';
+                      // If the URIs are in similar paths (same year/month), it might be a rename
+                      const uriPath = params.uri.replace('protokoll://transcript/', '');
+                      const openPath = openTranscript.uri.replace('protokoll://transcript/', '');
+                      
+                      // Check if paths are in the same directory (same year/month)
+                      const uriDirMatch = uriPath.match(/^\.\.\/(\d+\/\d+)\//);
+                      const openDirMatch = openPath.match(/^\.\.\/(\d+\/\d+)\//);
+                      
+                      if (uriDirMatch && openDirMatch && uriDirMatch[1] === openDirMatch[1]) {
+                        // Same directory - might be a rename, update the tracking
+                        console.log(`Protokoll: [EXTENSION] 🔄 Possible rename detected: ${openTranscript.uri} -> ${params.uri}`);
+                        console.log(`Protokoll: [EXTENSION] Updating transcript tracking...`);
+                        
+                        // Update the transcript with new URI and refresh
+                        const updatedTranscript: Transcript = {
+                          ...openTranscript.transcript,
+                          uri: params.uri,
+                          path: uriPath,
+                          filename: uriFilename,
+                        };
+                        
+                        // The detail view provider will handle the URI update internally
+                        await transcriptDetailViewProvider.showTranscript(params.uri, updatedTranscript);
+                        break;
+                      }
+                    }
+                  }
+                } catch (error) {
+                  console.warn('Protokoll: [EXTENSION] ⚠️ Could not read transcript to check for rename:', error);
+                }
               }
             } else {
               console.warn('Protokoll: [EXTENSION] ⚠️ transcriptDetailViewProvider is null');
@@ -134,10 +208,16 @@ export async function activate(context: vscode.ExtensionContext) {
           try {
             const config = vscode.workspace.getConfiguration('protokoll');
             const transcriptsDir = config.get<string>('transcriptsDirectory', '');
-            if (transcriptsDir && mcpClient) {
-              const params = new URLSearchParams();
-              params.set('directory', transcriptsDir);
-              const transcriptsListUri = `protokoll://transcripts?${params.toString()}`;
+            if (mcpClient) {
+              let transcriptsListUri: string;
+              if (transcriptsDir) {
+                const params = new URLSearchParams();
+                params.set('directory', transcriptsDir);
+                transcriptsListUri = `protokoll://transcripts?${params.toString()}`;
+              } else {
+                // No directory configured - use server's default outputDirectory
+                transcriptsListUri = 'protokoll://transcripts';
+              }
               await mcpClient.subscribeToResource(transcriptsListUri);
               console.log(`Protokoll: [EXTENSION] ✅ Re-subscribed to transcripts list after recovery`);
             }
@@ -188,14 +268,15 @@ export async function activate(context: vscode.ExtensionContext) {
   transcriptsViewProvider = new TranscriptsViewProvider(context);
   if (mcpClient) {
     transcriptsViewProvider.setClient(mcpClient);
+    // Don't refresh here - wait for view to be revealed to avoid unnecessary API calls
+    log('Protokoll: Transcripts view provider initialized with MCP client');
+  } else {
+    log('Protokoll: Transcripts view provider initialized without MCP client (will need configuration)');
   }
 
   transcriptDetailViewProvider = new TranscriptDetailViewProvider(context.extensionUri);
   if (mcpClient) {
     transcriptDetailViewProvider.setClient(mcpClient);
-  }
-  if (chatViewProvider) {
-    transcriptDetailViewProvider.setChatProvider(chatViewProvider);
   }
 
   connectionStatusViewProvider = new ConnectionStatusViewProvider(context);
@@ -206,14 +287,58 @@ export async function activate(context: vscode.ExtensionContext) {
     connectionStatusViewProvider.setServerUrl(serverUrl);
   }
 
+  // Create chatViewProvider BEFORE setting it on transcriptDetailViewProvider
   chatViewProvider = new ChatViewProvider(context.extensionUri);
   if (mcpClient) {
     chatViewProvider.setClient(mcpClient);
   }
+  
+  // NOW set the chat provider on transcript detail view (after chatViewProvider is created)
+  transcriptDetailViewProvider.setChatProvider(chatViewProvider);
+  
+  // Set transcript detail provider reference for context fallback
+  chatViewProvider.setTranscriptDetailProvider(transcriptDetailViewProvider);
+
+  // Initialize chats view provider
+  chatsViewProvider = new ChatsViewProvider();
+  // Set chats view provider reference in chat view provider
+  if (chatViewProvider && chatsViewProvider) {
+    chatViewProvider.setChatsViewProvider(chatsViewProvider);
+  }
+
+  // Register transcript content provider for virtual documents
+  const transcriptContentProvider = getTranscriptContentProvider();
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider('protokoll-transcript', transcriptContentProvider)
+  );
 
   // Register tree views
   const transcriptsTreeView = vscode.window.createTreeView('protokollTranscripts', {
     treeDataProvider: transcriptsViewProvider,
+    showCollapseAll: false,
+  });
+
+  // Refresh transcripts when view becomes visible
+  let hasRefreshedOnce = false;
+  transcriptsTreeView.onDidChangeVisibility(async (e) => {
+    log('Protokoll: onDidChangeVisibility fired', { visible: e.visible, hasRefreshedOnce });
+    if (e.visible && !hasRefreshedOnce && transcriptsViewProvider) {
+      log('Protokoll: Transcripts view became visible, refreshing...');
+      hasRefreshedOnce = true;
+      await transcriptsViewProvider.refresh();
+      log('Protokoll: Auto-refresh on visibility completed');
+      
+      // VS Code sometimes doesn't render the tree immediately after visibility change
+      // Fire the change event again after a short delay to ensure rendering
+      setTimeout(() => {
+        log('Protokoll: Firing delayed tree refresh');
+        transcriptsViewProvider?.fireTreeDataChange();
+      }, 100);
+    }
+  });
+
+  const chatsTreeView = vscode.window.createTreeView('protokollChats', {
+    treeDataProvider: chatsViewProvider,
     showCollapseAll: false,
   });
 
@@ -222,12 +347,87 @@ export async function activate(context: vscode.ExtensionContext) {
     showCollapseAll: false,
   });
 
+  // Automatically reveal the Protokoll view in the Activity Bar when extension activates
+  // This is especially useful when debugging (F5)
+  // Use setTimeout to ensure views are fully initialized before revealing
+  setTimeout(async () => {
+    try {
+      log('Protokoll: Starting auto-reveal sequence');
+      
+      // First, load the data
+      if (transcriptsViewProvider && mcpClient) {
+        log('Protokoll: Pre-loading transcripts before reveal');
+        await transcriptsViewProvider.refresh();
+        log('Protokoll: Pre-load complete');
+      }
+      
+      // Try multiple approaches to reveal the view
+      // Approach 1: Use the auto-generated focus command (if it exists)
+      try {
+        await vscode.commands.executeCommand('protokollTranscripts.focus');
+        log('Protokoll: Revealed Protokoll view using focus command');
+        
+        // Force a tree refresh after focus
+        setTimeout(() => {
+          log('Protokoll: Forcing tree refresh after focus');
+          transcriptsViewProvider?.fireTreeDataChange();
+        }, 200);
+        
+        return; // Success, exit early
+      } catch (focusError) {
+        log('Protokoll: Focus command failed, trying next approach', focusError);
+        // Continue to next approach
+      }
+
+      // Approach 2: Use workbench view command
+      try {
+        await vscode.commands.executeCommand('workbench.view.extension.protokoll');
+        log('Protokoll: Revealed Protokoll view using workbench command');
+        return; // Success, exit early
+      } catch (workbenchError) {
+        log('Protokoll: Workbench command failed, trying next approach', workbenchError);
+        // Continue to next approach
+      }
+
+      // Approach 3: Try to reveal by showing the transcripts view
+      // Check if view is visible, if not try to make it visible
+      if (transcriptsViewProvider) {
+        const visible = transcriptsTreeView.visible;
+        log(`Protokoll: Transcripts view visible: ${visible}`);
+        if (!visible) {
+          // Try to get the first item and reveal it, which will show the view
+          const children = await transcriptsViewProvider.getChildren();
+          log(`Protokoll: Found ${children?.length || 0} transcript items`);
+          if (children && children.length > 0) {
+            await transcriptsTreeView.reveal(children[0], { focus: true, expand: false });
+            log('Protokoll: Revealed Protokoll view by revealing first item');
+          } else {
+            // No items yet, just refresh which might help
+            await transcriptsViewProvider.refresh();
+            log('Protokoll: Refreshed transcripts view (no items to reveal)');
+          }
+        } else {
+          log('Protokoll: View is already visible');
+        }
+      }
+    } catch (error) {
+      log('Protokoll: Could not automatically reveal view', error);
+    }
+  }, 1000); // Increased delay to ensure extension host is fully ready
+
   // Register commands
   const showTranscriptsCommand = vscode.commands.registerCommand(
     'protokoll.showTranscripts',
     async () => {
       if (!transcriptsViewProvider) {
         return;
+      }
+      // Reveal the view container by focusing on the transcripts view
+      try {
+        await vscode.commands.executeCommand('protokollTranscripts.focus');
+      } catch (error) {
+        // If focus command doesn't exist, just refresh
+        console.log('Protokoll: Could not focus transcripts view');
       }
       await transcriptsViewProvider.refresh();
     }
@@ -682,6 +882,37 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  const refreshChatsCommand = vscode.commands.registerCommand(
+    'protokoll.refreshChats',
+    async () => {
+      if (!chatsViewProvider) {
+        return;
+      }
+      chatsViewProvider.refresh();
+    }
+  );
+
+  const openChatPanelCommand = vscode.commands.registerCommand(
+    'protokoll.openChatPanel',
+    async (chatId: string) => {
+      // This command is called when clicking on a chat in the chats view
+      // The chat panel should already exist, we just need to reveal it
+      console.log('Protokoll: Opening chat panel:', chatId);
+      // The panel will be revealed automatically by VS Code when the command is triggered
+      // from the tree item, but we can add additional logic here if needed
+    }
+  );
+
+  const closeChatPanelCommand = vscode.commands.registerCommand(
+    'protokoll.closeChatPanel',
+    async (chatId: string) => {
+      // This command is called to close a specific chat panel
+      console.log('Protokoll: Closing chat panel:', chatId);
+      // The ChatViewProvider will handle the actual disposal
+      // and the chatsViewProvider will be notified via the onDidDispose event
+    }
+  );
+
   // Refresh transcripts when configuration changes
   const configWatcher = vscode.workspace.onDidChangeConfiguration(async (e) => {
     if (e.affectsConfiguration('protokoll.serverUrl')) {
@@ -729,20 +960,24 @@ export async function activate(context: vscode.ExtensionContext) {
     try {
       console.log('Protokoll: [EXTENSION] Setting up subscription to transcripts list...');
       // Get the transcripts list URI
+      // If directory is not configured, subscribe without it (server will use configured outputDirectory)
       const config = vscode.workspace.getConfiguration('protokoll');
       const transcriptsDir = config.get<string>('transcriptsDirectory', '');
-      console.log(`Protokoll: [EXTENSION] Transcripts directory from config: ${transcriptsDir || '(empty)'}`);
+      console.log(`Protokoll: [EXTENSION] Transcripts directory from config: ${transcriptsDir || '(empty - will use server default)'}`);
       
+      let transcriptsListUri: string;
       if (transcriptsDir) {
         const params = new URLSearchParams();
         params.set('directory', transcriptsDir);
-        const transcriptsListUri = `protokoll://transcripts?${params.toString()}`;
-        console.log(`Protokoll: [EXTENSION] Subscribing to transcripts list URI: ${transcriptsListUri}`);
-        await mcpClient.subscribeToResource(transcriptsListUri);
-        console.log(`Protokoll: [EXTENSION] ✅ Successfully subscribed to transcripts list: ${transcriptsListUri}`);
+        transcriptsListUri = `protokoll://transcripts?${params.toString()}`;
       } else {
-        console.warn('Protokoll: [EXTENSION] ⚠️ No transcripts directory configured, skipping subscription');
+        // No directory configured - use server's default outputDirectory
+        transcriptsListUri = 'protokoll://transcripts';
       }
+      
+      console.log(`Protokoll: [EXTENSION] Subscribing to transcripts list URI: ${transcriptsListUri}`);
+      await mcpClient.subscribeToResource(transcriptsListUri);
+      console.log(`Protokoll: [EXTENSION] ✅ Successfully subscribed to transcripts list: ${transcriptsListUri}`);
     } catch (error) {
       console.error('Protokoll: [EXTENSION] ❌ Failed to subscribe to transcripts list:', error);
     }
@@ -764,9 +999,14 @@ export async function activate(context: vscode.ExtensionContext) {
     copyTranscriptUrlCommand,
     copySessionIdCommand,
     openChatCommand,
+    refreshChatsCommand,
+    openChatPanelCommand,
+    closeChatPanelCommand,
     configWatcher,
     transcriptsTreeView,
-    connectionStatusTreeView
+    chatsTreeView,
+    connectionStatusTreeView,
+    outputChannel // Register output channel so it can be disposed properly
   );
 }
 

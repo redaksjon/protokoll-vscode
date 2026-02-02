@@ -8,10 +8,91 @@ import { McpClient } from './mcpClient';
 import { ChatViewProvider } from './chatView';
 import type { Transcript, TranscriptContent } from './types';
 
+/**
+ * Text Document Content Provider for transcript content
+ * Provides transcript text content for virtual documents
+ */
+class TranscriptContentProvider implements vscode.TextDocumentContentProvider {
+  private _contentCache: Map<string, string> = new Map();
+  private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
+
+  onDidChange?: vscode.Event<vscode.Uri> = this._onDidChange.event;
+
+  setContentForUri(virtualUri: vscode.Uri, content: string): void {
+    console.log(`Protokoll: [CONTENT PROVIDER] Setting content for URI: ${virtualUri.toString()}, path: ${virtualUri.path}`);
+    // Store content by the virtual URI's path
+    this._contentCache.set(virtualUri.path, content);
+    // Also store by the full URI string for lookup
+    this._contentCache.set(virtualUri.toString(), content);
+    // Store normalized path (without trailing slash)
+    const normalizedPath = virtualUri.path.replace(/\/$/, '');
+    this._contentCache.set(normalizedPath, content);
+    console.log(`Protokoll: [CONTENT PROVIDER] Content cached with keys: path=${virtualUri.path}, full=${virtualUri.toString()}, normalized=${normalizedPath}`);
+    // Notify VS Code that the content has changed
+    this._onDidChange.fire(virtualUri);
+  }
+
+  provideTextDocumentContent(uri: vscode.Uri): string {
+    console.log(`Protokoll: [CONTENT PROVIDER] Requested URI: ${uri.toString()}, path: ${uri.path}`);
+    console.log(`Protokoll: [CONTENT PROVIDER] Cache keys:`, Array.from(this._contentCache.keys()));
+    
+    // Try to get content by URI path first
+    let content = this._contentCache.get(uri.path);
+    if (content !== undefined) {
+      console.log(`Protokoll: [CONTENT PROVIDER] Found content by path`);
+      return content;
+    }
+    
+    // Try by full URI string
+    content = this._contentCache.get(uri.toString());
+    if (content !== undefined) {
+      console.log(`Protokoll: [CONTENT PROVIDER] Found content by full URI`);
+      return content;
+    }
+    
+    // Try normalized versions (with/without trailing slashes, etc.)
+    const normalizedPath = uri.path.replace(/\/$/, '');
+    content = this._contentCache.get(normalizedPath);
+    if (content !== undefined) {
+      console.log(`Protokoll: [CONTENT PROVIDER] Found content by normalized path`);
+      return content;
+    }
+    
+    // Try to extract transcript URI from path and look it up
+    // URI format: protokoll-transcript://transcript/{encoded-transcript-uri}/{filename} (read only)
+    const pathMatch = uri.path.match(/^\/transcript\/([^\/]+)/);
+    if (pathMatch) {
+      const encodedUri = pathMatch[1];
+      console.log(`Protokoll: [CONTENT PROVIDER] Extracted encoded URI: ${encodedUri}`);
+      // Try to find content that was stored with this encoded URI
+      for (const [key, value] of this._contentCache.entries()) {
+        if (key.includes(encodedUri) || encodedUri.includes(key)) {
+          console.log(`Protokoll: [CONTENT PROVIDER] Found content by partial match with key: ${key}`);
+          return value;
+        }
+      }
+    }
+    
+    console.warn(`Protokoll: [CONTENT PROVIDER] No content found for URI: ${uri.toString()}`);
+    return '// Loading transcript content...';
+  }
+}
+
+// Global content provider instance (will be registered in extension.ts)
+let transcriptContentProvider: TranscriptContentProvider | null = null;
+
+export function getTranscriptContentProvider(): TranscriptContentProvider {
+  if (!transcriptContentProvider) {
+    transcriptContentProvider = new TranscriptContentProvider();
+  }
+  return transcriptContentProvider;
+}
+
 export class TranscriptDetailViewProvider {
   public static readonly viewType = 'protokoll.transcriptDetail';
 
   private _panels: Map<string, vscode.WebviewPanel> = new Map();
+  private _entityPanels: Map<string, vscode.WebviewPanel> = new Map(); // Track entity panels
   private _client: McpClient | null = null;
   private _chatProvider: ChatViewProvider | null = null;
   private _currentTranscripts: Map<string, { uri: string; transcript: Transcript }> = new Map();
@@ -28,6 +109,13 @@ export class TranscriptDetailViewProvider {
    */
   getCurrentTranscript(uri: string): { uri: string; transcript: Transcript } | undefined {
     return this._currentTranscripts.get(uri);
+  }
+
+  /**
+   * Get all currently open transcripts (for context fallback)
+   */
+  getAllOpenTranscripts(): Array<{ uri: string; transcript: Transcript }> {
+    return Array.from(this._currentTranscripts.values());
   }
 
   /**
@@ -71,6 +159,69 @@ export class TranscriptDetailViewProvider {
       panel.webview.html = this.getWebviewContent(updatedTranscript, content);
     } catch (error) {
       console.error(`Protokoll: Error refreshing transcript ${transcriptUri}:`, error);
+      
+      // If the error suggests the resource doesn't exist (e.g., 404 or "not found"),
+      // the transcript might have been renamed. Try to find it in the transcripts list.
+      const errorMessage = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+      if (errorMessage.includes('not found') || errorMessage.includes('404') || errorMessage.includes('does not exist')) {
+        console.log(`Protokoll: [TRANSCRIPT VIEW] Transcript might have been renamed, searching for new URI...`);
+        try {
+          // Try to find the transcript by matching date/time or other metadata
+          const config = vscode.workspace.getConfiguration('protokoll');
+          const transcriptsDir = config.get<string>('transcriptsDirectory', '');
+          if (transcriptsDir && this._client) {
+            // Pass directory only if set (empty string means use server default)
+            const directory = transcriptsDir || undefined;
+            const transcriptsList = await this._client.listTranscripts(directory, { limit: 100 });
+            
+            // Try to find a matching transcript by date/time
+            const matchingTranscript = transcriptsList.transcripts.find(t => {
+              // Match by date and time if available
+              if (currentTranscript.transcript.date && t.date === currentTranscript.transcript.date) {
+                if (currentTranscript.transcript.time && t.time) {
+                  return t.time === currentTranscript.transcript.time;
+                }
+                return true; // Date matches, time might not be available
+              }
+              return false;
+            });
+            
+            if (matchingTranscript) {
+              console.log(`Protokoll: [TRANSCRIPT VIEW] ✅ Found renamed transcript: ${matchingTranscript.uri}`);
+              
+              // Update tracking with new URI
+              this._currentTranscripts.delete(transcriptUri);
+              this._panels.delete(transcriptUri);
+              
+              this._currentTranscripts.set(matchingTranscript.uri, {
+                uri: matchingTranscript.uri,
+                transcript: matchingTranscript,
+              });
+              this._panels.set(matchingTranscript.uri, panel);
+              
+              // Update panel title
+              panel.title = matchingTranscript.title || matchingTranscript.filename;
+              
+              // Unsubscribe from old URI and subscribe to new URI
+              try {
+                await this._client.unsubscribeFromResource(transcriptUri);
+                await this._client.subscribeToResource(matchingTranscript.uri);
+              } catch (subError) {
+                console.warn(`Protokoll: [TRANSCRIPT VIEW] ⚠️ Error updating subscriptions:`, subError);
+              }
+              
+              // Refresh with new URI
+              const newContent = await this._client.readTranscript(matchingTranscript.uri);
+              panel.webview.html = this.getWebviewContent(matchingTranscript, newContent);
+              return;
+            } else {
+              console.warn(`Protokoll: [TRANSCRIPT VIEW] ⚠️ Could not find renamed transcript in list`);
+            }
+          }
+        } catch (searchError) {
+          console.error(`Protokoll: [TRANSCRIPT VIEW] Error searching for renamed transcript:`, searchError);
+        }
+      }
     } finally {
       // Hide update indicator after a short delay
       setTimeout(() => {
@@ -194,6 +345,15 @@ export class TranscriptDetailViewProvider {
             break;
           case 'reviewTranscription':
             await this.handleReviewTranscription(currentTranscript.transcript, message.transcriptUri || transcriptUri);
+            break;
+          case 'startChatFromInput':
+            await this.handleStartChatFromInput(currentTranscript.transcript, message.message, message.transcriptUri || transcriptUri);
+            break;
+          case 'openSource':
+            await this.handleOpenSource(currentTranscript.transcript, message.transcriptPath, message.transcriptUri || transcriptUri);
+            break;
+          case 'createEntityFromSelection':
+            await this.handleCreateEntityFromSelection(message.selectedText, message.transcriptUri || transcriptUri);
             break;
         }
       },
@@ -435,23 +595,103 @@ export class TranscriptDetailViewProvider {
     }
 
     try {
-      await this._client.callTool('protokoll_edit_transcript', {
+      const result = await this._client.callTool('protokoll_edit_transcript', {
         transcriptPath: transcriptPath,
         title: newTitle.trim(),
-      });
+      }) as {
+        success?: boolean;
+        originalPath?: string;
+        outputPath?: string;
+        renamed?: boolean;
+        message?: string;
+      };
 
       vscode.window.showInformationMessage(`Protokoll: Title updated to "${newTitle.trim()}"`);
 
       // Refresh the transcripts list view
       await vscode.commands.executeCommand('protokoll.refreshTranscripts');
 
-      // Refresh the detail view after a short delay to allow the server to process
-      setTimeout(async () => {
+      // If the file was renamed, update the URI tracking
+      if (result.renamed && result.outputPath) {
+        // Construct the new URI from the output path
+        const newTranscriptUri = `protokoll://transcript/${result.outputPath}`;
+        
+        console.log(`Protokoll: [TRANSCRIPT VIEW] Transcript renamed, updating URI tracking`);
+        console.log(`Protokoll: [TRANSCRIPT VIEW] Old URI: ${transcriptUri}`);
+        console.log(`Protokoll: [TRANSCRIPT VIEW] New URI: ${newTranscriptUri}`);
+
+        // Get the current transcript data
         const currentTranscript = this._currentTranscripts.get(transcriptUri);
-        if (currentTranscript) {
-          await this.showTranscript(currentTranscript.uri, currentTranscript.transcript);
+        const panel = this._panels.get(transcriptUri);
+
+        if (currentTranscript && panel) {
+          // Update transcript with new title
+          const updatedTranscript: Transcript = {
+            ...currentTranscript.transcript,
+            title: newTitle.trim(),
+            path: result.outputPath,
+            filename: result.outputPath.split('/').pop() || result.outputPath,
+            uri: newTranscriptUri,
+          };
+
+          // Unsubscribe from old URI
+          try {
+            await this._client.unsubscribeFromResource(transcriptUri);
+            console.log(`Protokoll: [TRANSCRIPT VIEW] ✅ Unsubscribed from old URI: ${transcriptUri}`);
+          } catch (error) {
+            console.warn(`Protokoll: [TRANSCRIPT VIEW] ⚠️ Failed to unsubscribe from old URI:`, error);
+          }
+
+          // Update internal maps with new URI
+          this._currentTranscripts.delete(transcriptUri);
+          this._panels.delete(transcriptUri);
+          
+          this._currentTranscripts.set(newTranscriptUri, {
+            uri: newTranscriptUri,
+            transcript: updatedTranscript,
+          });
+          this._panels.set(newTranscriptUri, panel);
+
+          // Update panel title
+          panel.title = newTitle.trim();
+
+          // Subscribe to new URI
+          try {
+            await this._client.subscribeToResource(newTranscriptUri);
+            console.log(`Protokoll: [TRANSCRIPT VIEW] ✅ Subscribed to new URI: ${newTranscriptUri}`);
+          } catch (error) {
+            console.warn(`Protokoll: [TRANSCRIPT VIEW] ⚠️ Failed to subscribe to new URI:`, error);
+          }
+
+          // Refresh the view with new URI and updated transcript
+          await this.showTranscript(newTranscriptUri, updatedTranscript);
+        } else {
+          // Fallback: if we don't have current transcript data, refresh after delay
+          console.warn(`Protokoll: [TRANSCRIPT VIEW] ⚠️ No current transcript data found, using fallback refresh`);
+          setTimeout(async () => {
+            // Try to get updated transcript from list
+            await vscode.commands.executeCommand('protokoll.refreshTranscripts');
+            // The notification handler should pick up the change
+          }, 1000);
         }
-      }, 1000);
+      } else {
+        // File wasn't renamed, just refresh with existing URI
+        setTimeout(async () => {
+          const currentTranscript = this._currentTranscripts.get(transcriptUri);
+          if (currentTranscript) {
+            // Update title in stored transcript
+            const updatedTranscript: Transcript = {
+              ...currentTranscript.transcript,
+              title: newTitle.trim(),
+            };
+            this._currentTranscripts.set(transcriptUri, {
+              uri: transcriptUri,
+              transcript: updatedTranscript,
+            });
+            await this.showTranscript(transcriptUri, updatedTranscript);
+          }
+        }, 500);
+      }
     } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to update title: ${error instanceof Error ? error.message : String(error)}`
@@ -466,25 +706,30 @@ export class TranscriptDetailViewProvider {
     }
 
     try {
-      // Use provide_feedback tool to edit the transcript content
-      await this._client.callTool('protokoll_provide_feedback', {
+      // Use the new update_transcript_content tool to directly update the content
+      await this._client.callTool('protokoll_update_transcript_content', {
         transcriptPath: transcriptPath,
-        feedback: `Update the transcript content to:\n\n${newContent}`,
+        content: newContent,
       });
 
       vscode.window.showInformationMessage('Protokoll: Transcript content updated');
 
-      // Refresh the detail view after a short delay to allow the server to process
-      setTimeout(async () => {
-        const currentTranscript = this._currentTranscripts.get(transcriptUri);
-        if (currentTranscript) {
-          await this.showTranscript(currentTranscript.uri, currentTranscript.transcript);
-        }
-      }, 1000);
+      // Refresh the detail view immediately to show the updated content
+      const currentTranscript = this._currentTranscripts.get(transcriptUri);
+      if (currentTranscript) {
+        await this.showTranscript(currentTranscript.uri, currentTranscript.transcript);
+      }
     } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to update transcript: ${error instanceof Error ? error.message : String(error)}`
       );
+      // Notify the webview that save failed so it can re-enable the button
+      const panel = this._panels.get(transcriptUri);
+      if (panel) {
+        panel.webview.postMessage({
+          command: 'saveFailed'
+        });
+      }
     }
   }
 
@@ -519,9 +764,115 @@ export class TranscriptDetailViewProvider {
 
       // Display entity content
       panel.webview.html = this.getEntityContent(entityType, entityId, content.text, entityData);
+
+      // Track entity panel
+      this._entityPanels.set(entityUri, panel);
+
+      // Handle messages from entity webview
+      panel.webview.onDidReceiveMessage(
+        async (message) => {
+          switch (message.command) {
+            case 'startChatFromInputEntity':
+              await this.handleStartChatFromInputEntity(entityType, entityId, entityUri, message.message);
+              break;
+          }
+        },
+        null
+      );
+
+      // Clean up on dispose
+      panel.onDidDispose(() => {
+        this._entityPanels.delete(entityUri);
+      }, null);
     } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to open entity: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async handleStartChatFromInputEntity(
+    entityType: string,
+    entityId: string,
+    entityUri: string,
+    message: string
+  ): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    try {
+      // Read entity to get current data
+      const content = await this._client.readResource(entityUri);
+      const entityData = this.parseEntityContent(content.text);
+      const entityName = entityData.name || entityId;
+
+      // Create entity context similar to transcript context
+      const entityContext = {
+        type: entityType,
+        id: entityId,
+        name: entityName,
+        uri: entityUri,
+      };
+
+      // Start a new chat with the message already sent
+      // For entities, we'll need to adapt the chat provider to handle entity context
+      // For now, let's use a simplified approach - open chat and send message
+      if (this._chatProvider) {
+        // We'll need to add entity support to showChat, but for now let's use a workaround
+        await this._chatProvider.showChat(message, entityUri);
+      } else {
+        // Fallback: open chat command
+        await vscode.commands.executeCommand('protokoll.openChat');
+      }
+      
+    } catch (error) {
+      console.error('Protokoll: [ENTITY VIEW] Error starting chat:', error);
+      vscode.window.showErrorMessage(
+        `Failed to start chat: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async handleOpenSource(transcript: Transcript, transcriptPath: string, transcriptUri: string): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    try {
+      // Fetch transcript content from MCP server
+      const content: TranscriptContent = await this._client.readTranscript(transcriptUri);
+      
+      // Create a virtual document URI for the transcript
+      // Include "(read only)" in the path so it shows in the tab title
+      const filename = transcript.filename || transcriptPath.split('/').pop() || 'transcript';
+      const virtualUri = vscode.Uri.parse(`protokoll-transcript://transcript/${encodeURIComponent(transcriptUri)}/${encodeURIComponent(filename)} (read only)`);
+      
+      // Get the global content provider and set the content BEFORE opening the document
+      const provider = getTranscriptContentProvider();
+      provider.setContentForUri(virtualUri, content.text);
+      
+      // Small delay to ensure content is set before VS Code requests it
+      await new Promise(resolve => setTimeout(resolve, 10));
+      
+      // Open the virtual document
+      const document = await vscode.workspace.openTextDocument(virtualUri);
+      const editor = await vscode.window.showTextDocument(document, {
+        preview: false,
+        viewColumn: vscode.ViewColumn.Beside,
+        preserveFocus: false,
+      });
+
+      // Make the document read-only in this session
+      await vscode.commands.executeCommand('workbench.action.files.setActiveEditorReadonlyInSession');
+      
+      console.log(`Protokoll: Opened transcript content in editor: ${transcriptUri}`);
+    } catch (error) {
+      console.error('Protokoll: Error opening transcript content:', error);
+      vscode.window.showErrorMessage(
+        `Failed to open transcript content: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
@@ -537,23 +888,353 @@ export class TranscriptDetailViewProvider {
       const transcriptPath = transcript.path || transcript.filename;
       const transcriptTitle = transcript.title || transcript.filename;
       
-      // Open chat directly with transcript context - no feedback prompt
+      console.log('Protokoll: [TRANSCRIPT VIEW] Review Transcription clicked', {
+        transcriptTitle,
+        transcriptPath,
+        transcriptUri,
+        transcriptFilename: transcript.filename
+      });
+      
+      // Open chat directly with transcript context - reset context to clear history
       if (this._chatProvider) {
-        await this._chatProvider.showChat(undefined, transcriptUri, {
+        const transcriptContext = {
           title: transcriptTitle,
           path: transcriptPath,
           filename: transcript.filename,
           uri: transcriptUri,
-        });
+        };
+        
+        console.log('Protokoll: [TRANSCRIPT VIEW] Opening chat with context:', transcriptContext);
+        
+        // Always creates a new chat panel (old panel is disposed automatically)
+        await this._chatProvider.showChat(undefined, transcriptUri, transcriptContext);
       } else {
         // Fallback: open chat command
         await vscode.commands.executeCommand('protokoll.openChat');
       }
       
     } catch (error) {
+      console.error('Protokoll: [TRANSCRIPT VIEW] Error opening chat:', error);
       vscode.window.showErrorMessage(
         `Failed to open chat: ${error instanceof Error ? error.message : String(error)}`
       );
+    }
+  }
+
+  private async handleStartChatFromInput(transcript: Transcript, message: string, transcriptUri: string): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    try {
+      // Get transcript info for context
+      const transcriptPath = transcript.path || transcript.filename;
+      const transcriptTitle = transcript.title || transcript.filename;
+      
+      const transcriptContext = {
+        title: transcriptTitle,
+        path: transcriptPath,
+        filename: transcript.filename,
+        uri: transcriptUri,
+      };
+
+      // Start a new chat with the message already sent
+      if (this._chatProvider) {
+        await this._chatProvider.showChat(message, transcriptUri, transcriptContext);
+      } else {
+        // Fallback: open chat command
+        await vscode.commands.executeCommand('protokoll.openChat');
+      }
+      
+    } catch (error) {
+      console.error('Protokoll: [TRANSCRIPT VIEW] Error starting chat:', error);
+      vscode.window.showErrorMessage(
+        `Failed to start chat: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async handleCreateEntityFromSelection(selectedText: string, transcriptUri: string): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    if (!selectedText || selectedText.trim().length === 0) {
+      vscode.window.showWarningMessage('No text selected');
+      return;
+    }
+
+    try {
+      // Show quick pick to select entity type
+      const entityTypes = [
+        { label: 'Person', value: 'person', tool: 'protokoll_add_person' },
+        { label: 'Project', value: 'project', tool: 'protokoll_add_project' },
+        { label: 'Company', value: 'company', tool: 'protokoll_add_company' },
+        { label: 'Term', value: 'term', tool: 'protokoll_add_term' },
+      ];
+
+      const selected = await vscode.window.showQuickPick(entityTypes, {
+        placeHolder: `Create ${selectedText} as...`,
+      });
+
+      if (!selected) {
+        return; // User cancelled
+      }
+
+      // Create the entity using the appropriate MCP tool
+      const entityName = selectedText.trim();
+      let entityId: string;
+      let result: { 
+        success?: boolean;
+        message?: string;
+        entity?: { id: string; name: string; type: string; [key: string]: unknown };
+        [key: string]: unknown;
+      };
+
+      let entityCreated = false;
+      let entityNameFromServer = entityName;
+
+      try {
+        switch (selected.value) {
+          case 'person':
+            result = await this._client.callTool('protokoll_add_person', {
+              name: entityName,
+            }) as { 
+              success?: boolean;
+              message?: string;
+              entity?: { id: string; name: string; type: string; [key: string]: unknown };
+              [key: string]: unknown;
+            };
+            entityId = result.entity?.id || this.slugify(entityName);
+            if (result.entity?.name) {
+              entityNameFromServer = String(result.entity.name);
+            }
+            entityCreated = true;
+            break;
+
+          case 'project':
+            result = await this._client.callTool('protokoll_add_project', {
+              name: entityName,
+            }) as { 
+              success?: boolean;
+              message?: string;
+              entity?: { id: string; name: string; type: string; [key: string]: unknown };
+              [key: string]: unknown;
+            };
+            entityId = result.entity?.id || this.slugify(entityName);
+            if (result.entity?.name) {
+              entityNameFromServer = String(result.entity.name);
+            }
+            entityCreated = true;
+            break;
+
+          case 'company':
+            result = await this._client.callTool('protokoll_add_company', {
+              name: entityName,
+            }) as { 
+              success?: boolean;
+              message?: string;
+              entity?: { id: string; name: string; type: string; [key: string]: unknown };
+              [key: string]: unknown;
+            };
+            entityId = result.entity?.id || this.slugify(entityName);
+            if (result.entity?.name) {
+              entityNameFromServer = String(result.entity.name);
+            }
+            entityCreated = true;
+            break;
+
+          case 'term':
+            result = await this._client.callTool('protokoll_add_term', {
+              name: entityName,
+            }) as { 
+              success?: boolean;
+              message?: string;
+              entity?: { id: string; name: string; type: string; [key: string]: unknown };
+              [key: string]: unknown;
+            };
+            entityId = result.entity?.id || this.slugify(entityName);
+            if (result.entity?.name) {
+              entityNameFromServer = String(result.entity.name);
+            }
+            entityCreated = true;
+            break;
+
+          default:
+            vscode.window.showErrorMessage(`Unknown entity type: ${selected.value}`);
+            return;
+        }
+      } catch (createError) {
+        // Check if the error is "already exists"
+        const errorMessage = createError instanceof Error ? createError.message : String(createError);
+        const alreadyExistsMatch = errorMessage.match(/already exists.*?["']([^"']+)["']/i) || 
+                                   errorMessage.match(/ID\s+["']([^"']+)["']\s+already exists/i);
+        
+        if (alreadyExistsMatch) {
+          // Entity already exists - extract ID and continue
+          entityId = alreadyExistsMatch[1];
+          entityCreated = false;
+          
+          // Try to read the entity to get its name
+          try {
+            const entityUri = `protokoll://entity/${selected.value}/${encodeURIComponent(entityId)}`;
+            const entityContent = await this._client.readResource(entityUri);
+            const entityData = this.parseEntityContent(entityContent.text);
+            if (entityData.name) {
+              entityNameFromServer = String(entityData.name);
+            }
+          } catch (readError) {
+            // If we can't read it, use the original name
+            console.warn('Protokoll: Could not read existing entity:', readError);
+          }
+        } else {
+          // Some other error - rethrow it
+          throw createError;
+        }
+      }
+
+      if (!entityId) {
+        vscode.window.showErrorMessage('Failed to create entity: No ID returned');
+        return;
+      }
+
+      // Get current transcript to add entity reference
+      const currentTranscript = this._currentTranscripts.get(transcriptUri);
+      if (currentTranscript) {
+        const transcriptPath = currentTranscript.transcript.path || currentTranscript.transcript.filename;
+        
+        // Read transcript content to add entity reference
+        try {
+          const transcriptContent: TranscriptContent = await this._client.readTranscript(transcriptUri);
+          const updatedContent = this.addEntityReferenceToTranscript(
+            transcriptContent.text,
+            selected.value,
+            entityId,
+            entityNameFromServer
+          );
+          
+          // Update transcript content
+          await this._client.callTool('protokoll_update_transcript_content', {
+            transcriptPath: transcriptPath,
+            content: updatedContent,
+          });
+        } catch (updateError) {
+          console.warn('Protokoll: Could not update transcript with entity reference:', updateError);
+          // Continue anyway - we'll still open the entity view
+        }
+      }
+
+      if (entityCreated) {
+        vscode.window.showInformationMessage(`Created ${selected.label.toLowerCase()}: ${entityNameFromServer}`);
+      } else {
+        vscode.window.showInformationMessage(`Associated transcript with existing ${selected.label.toLowerCase()}: ${entityNameFromServer}`);
+      }
+
+      // Navigate to the entity view
+      await this.handleOpenEntity(selected.value, entityId);
+
+      // Refresh the transcript view to show the new entity reference
+      await this.refreshTranscript(transcriptUri);
+    } catch (error) {
+      console.error('Protokoll: [TRANSCRIPT VIEW] Error creating entity:', error);
+      vscode.window.showErrorMessage(
+        `Failed to create entity: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private slugify(text: string): string {
+    // Match the server's slugify function: uses hyphens, not underscores
+    return text
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/--+/g, '-')
+      .replace(/^-|-$/g, '');
+  }
+
+  private addEntityReferenceToTranscript(
+    transcriptText: string,
+    entityType: string,
+    entityId: string,
+    entityName: string
+  ): string {
+    // Check if Entity References section exists
+    const entityRefsMatch = transcriptText.match(/^([\s\S]*?##\s+Entity\s+References\s*\n)([\s\S]*?)(\n##|$)/i);
+    
+    if (entityRefsMatch) {
+      // Entity References section exists
+      const beforeSection = entityRefsMatch[1];
+      const sectionContent = entityRefsMatch[2];
+      const afterSection = entityRefsMatch[3] || '';
+      
+      // Check if this entity type subsection exists
+      const typePlural = entityType === 'person' ? 'people' : 
+                        entityType === 'company' ? 'companies' :
+                        entityType === 'term' ? 'terms' :
+                        entityType === 'project' ? 'projects' : entityType;
+      const typeSubsectionMatch = sectionContent.match(new RegExp(`(###\\s+${typePlural}\\s*\\n)([\\s\\S]*?)(\\n###|\\n##|$)`, 'i'));
+      
+      if (typeSubsectionMatch) {
+        // Subsection exists - check if entity already listed
+        const subsectionHeader = typeSubsectionMatch[1];
+        const subsectionContent = typeSubsectionMatch[2];
+        const afterSubsection = typeSubsectionMatch[3] || '';
+        
+        // Check if entity ID already exists
+        if (subsectionContent.includes(`\`${entityId}\``)) {
+          // Already exists, return original
+          return transcriptText;
+        }
+        
+        // Add entity reference
+        const newEntityLine = `- \`${entityId}\`: ${entityName}\n`;
+        const updatedSubsection = subsectionHeader + subsectionContent + newEntityLine;
+        const updatedSection = beforeSection + updatedSubsection + afterSubsection + afterSection;
+        
+        return transcriptText.replace(
+          /^([\s\S]*?##\s+Entity\s+References\s*\n)([\s\S]*?)(\n##|$)/i,
+          updatedSection
+        );
+      } else {
+        // Subsection doesn't exist - add it
+        const newSubsection = `### ${typePlural.charAt(0).toUpperCase() + typePlural.slice(1)}\n- \`${entityId}\`: ${entityName}\n\n`;
+        const updatedSection = beforeSection + sectionContent + (sectionContent.trim() ? '\n' : '') + newSubsection;
+        
+        return transcriptText.replace(
+          /^([\s\S]*?##\s+Entity\s+References\s*\n)([\s\S]*?)(\n##|$)/i,
+          updatedSection + afterSection
+        );
+      }
+    } else {
+      // Entity References section doesn't exist - add it before the content delimiter
+      const contentDelimiterMatch = transcriptText.match(/^([\s\S]*?)(\n---\s*\n[\s\S]*)$/);
+      
+      if (contentDelimiterMatch) {
+        const beforeDelimiter = contentDelimiterMatch[1];
+        const afterDelimiter = contentDelimiterMatch[2];
+        
+        const typePlural = entityType === 'person' ? 'people' : 
+                          entityType === 'company' ? 'companies' :
+                          entityType === 'term' ? 'terms' :
+                          entityType === 'project' ? 'projects' : entityType;
+        
+        const newSection = `## Entity References\n\n### ${typePlural.charAt(0).toUpperCase() + typePlural.slice(1)}\n- \`${entityId}\`: ${entityName}\n\n`;
+        
+        return beforeDelimiter + '\n' + newSection + afterDelimiter;
+      } else {
+        // No delimiter - append at the end
+        const typePlural = entityType === 'person' ? 'people' : 
+                          entityType === 'company' ? 'companies' :
+                          entityType === 'term' ? 'terms' :
+                          entityType === 'project' ? 'projects' : entityType;
+        
+        const newSection = `\n\n## Entity References\n\n### ${typePlural.charAt(0).toUpperCase() + typePlural.slice(1)}\n- \`${entityId}\`: ${entityName}\n`;
+        
+        return transcriptText + newSection;
+      }
     }
   }
 
@@ -952,6 +1633,59 @@ export class TranscriptDetailViewProvider {
             margin-top: 0;
             margin-bottom: 12px;
         }
+        .inline-chat-container {
+            margin-top: 24px;
+            padding-top: 16px;
+            border-top: 1px solid var(--vscode-panel-border);
+        }
+        .inline-chat-input-wrapper {
+            display: flex;
+            gap: 8px;
+            align-items: flex-end;
+            background-color: var(--vscode-input-background);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 8px;
+            padding: 8px 12px;
+        }
+        .inline-chat-input-wrapper:focus-within {
+            border-color: var(--vscode-focusBorder);
+        }
+        .inline-chat-input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: var(--vscode-input-foreground);
+            font-family: var(--vscode-font-family);
+            font-size: var(--vscode-font-size);
+            resize: none;
+            min-height: 24px;
+            max-height: 200px;
+            overflow-y: auto;
+            outline: none;
+            padding: 4px 0;
+        }
+        .inline-chat-input::placeholder {
+            color: var(--vscode-input-placeholderForeground);
+        }
+        .inline-chat-send {
+            background: transparent;
+            border: none;
+            color: var(--vscode-textLink-foreground);
+            cursor: pointer;
+            padding: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0.7;
+            transition: opacity 0.2s;
+        }
+        .inline-chat-send:hover {
+            opacity: 1;
+        }
+        .inline-chat-send:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
     </style>
 </head>
 <body>
@@ -989,6 +1723,111 @@ export class TranscriptDetailViewProvider {
         ${this.markdownToHtml(remainingContent)}
     </div>
     ` : ''}
+    <div class="inline-chat-container" id="inline-chat-container">
+        <div class="inline-chat-input-wrapper">
+            <textarea 
+                class="inline-chat-input" 
+                id="inline-chat-input" 
+                placeholder="Type a message to make changes... (e.g., Change the name to &quot;John Doe&quot;)"
+                rows="1"
+            ></textarea>
+            <button type="button" class="inline-chat-send" id="inline-chat-send">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M1.5 1.5L14.5 8L1.5 14.5L3.5 8L1.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+            </button>
+        </div>
+    </div>
+    <script>
+        const vscode = acquireVsCodeApi();
+        const entityType = ${JSON.stringify(entityType)};
+        const entityId = ${JSON.stringify(entityId)};
+        const entityUri = \`protokoll://entity/\${entityType}/\${encodeURIComponent(entityId)}\`;
+
+        function startChatFromInput() {
+            console.log('Protokoll Entity: startChatFromInput called');
+            const input = document.getElementById('inline-chat-input');
+            if (!input) {
+                console.error('Protokoll Entity: inline-chat-input not found');
+                return;
+            }
+            const message = input.value.trim();
+            if (!message) {
+                console.log('Protokoll Entity: No message to send');
+                return;
+            }
+            
+            console.log('Protokoll Entity: Sending message:', message);
+            
+            // Clear input
+            input.value = '';
+            adjustTextareaHeight(input);
+            
+            // Send message to extension to start a new chat
+            vscode.postMessage({
+                command: 'startChatFromInputEntity',
+                message: message,
+                entityType: entityType,
+                entityId: entityId,
+                entityUri: entityUri
+            });
+            console.log('Protokoll Entity: Message sent to extension');
+        }
+        
+        function adjustTextareaHeight(textarea) {
+            textarea.style.height = 'auto';
+            textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+        }
+        
+        // Set up inline chat event listeners
+        function setupInlineChatListeners() {
+            console.log('Protokoll Entity: Setting up inline chat listeners');
+            const chatInput = document.getElementById('inline-chat-input');
+            const sendButton = document.getElementById('inline-chat-send');
+            
+            console.log('Protokoll Entity: chatInput found:', !!chatInput);
+            console.log('Protokoll Entity: sendButton found:', !!sendButton);
+            
+            if (chatInput) {
+                chatInput.addEventListener('input', function() {
+                    adjustTextareaHeight(this);
+                });
+                
+                chatInput.addEventListener('keydown', function(e) {
+                    console.log('Protokoll Entity: keydown event, key:', e.key);
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        console.log('Protokoll Entity: Enter pressed, calling startChatFromInput');
+                        startChatFromInput();
+                    }
+                });
+                console.log('Protokoll Entity: chatInput listeners attached');
+            } else {
+                console.error('Protokoll Entity: inline-chat-input element not found!');
+            }
+            
+            if (sendButton) {
+                sendButton.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    console.log('Protokoll Entity: Send button clicked');
+                    startChatFromInput();
+                });
+                console.log('Protokoll Entity: sendButton listener attached');
+            } else {
+                console.error('Protokoll Entity: inline-chat-send element not found!');
+            }
+        }
+        
+        // Run setup immediately (script is at end of body, DOM should be ready)
+        setupInlineChatListeners();
+        
+        // Also run on DOMContentLoaded as backup
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', setupInlineChatListeners);
+        }
+    </script>
 </body>
 </html>`;
   }
@@ -1193,10 +2032,28 @@ export class TranscriptDetailViewProvider {
             border: 1px solid var(--vscode-input-border);
             padding: 4px 8px;
         }
-        .title-header .title-input {
+        .title-header .title-input,
+        #transcript-textarea {
             background-color: var(--vscode-input-background);
             color: var(--vscode-input-foreground);
             border: 1px solid var(--vscode-input-border);
+            padding: 8px;
+            width: 100%;
+            box-sizing: border-box;
+            font-family: var(--vscode-editor-font-family);
+            font-size: var(--vscode-editor-font-size);
+            line-height: 1.5;
+            resize: vertical;
+        }
+        #transcript-textarea {
+            min-height: 400px;
+            max-width: 120ch;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            overflow-y: auto;
+        }
+        .title-header .title-input {
             padding: 4px 8px;
             border-radius: 3px;
             font-size: inherit;
@@ -1270,10 +2127,35 @@ export class TranscriptDetailViewProvider {
             background-color: var(--vscode-editor-background);
             padding: 16px;
             border-radius: 4px;
-            word-wrap: break-word;
             margin: 0;
             text-align: left;
             line-height: 1.6;
+            max-width: 120ch;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            font-family: var(--vscode-editor-font-family);
+            position: relative;
+            user-select: text;
+        }
+        .create-entity-button {
+            position: absolute;
+            background-color: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+            z-index: 1000;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+            display: none;
+            margin-top: 4px;
+        }
+        .create-entity-button:hover {
+            background-color: var(--vscode-button-hoverBackground);
+        }
+        .create-entity-button.show {
+            display: block;
         }
         .transcript-content p {
             margin: 0 0 1em 0;
@@ -1298,6 +2180,7 @@ export class TranscriptDetailViewProvider {
         }
         .transcript-content-wrapper {
             margin-top: 24px;
+            position: relative;
         }
         .edit-button {
             background-color: var(--vscode-button-background);
@@ -1458,6 +2341,59 @@ export class TranscriptDetailViewProvider {
             border: 1px solid var(--vscode-inputValidation-errorBorder);
             border-radius: 4px;
         }
+        .inline-chat-container {
+            margin-top: 24px;
+            padding-top: 16px;
+            border-top: 1px solid var(--vscode-panel-border);
+        }
+        .inline-chat-input-wrapper {
+            display: flex;
+            gap: 8px;
+            align-items: flex-end;
+            background-color: var(--vscode-input-background);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 8px;
+            padding: 8px 12px;
+        }
+        .inline-chat-input-wrapper:focus-within {
+            border-color: var(--vscode-focusBorder);
+        }
+        .inline-chat-input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: var(--vscode-input-foreground);
+            font-family: var(--vscode-font-family);
+            font-size: var(--vscode-font-size);
+            resize: none;
+            min-height: 24px;
+            max-height: 200px;
+            overflow-y: auto;
+            outline: none;
+            padding: 4px 0;
+        }
+        .inline-chat-input::placeholder {
+            color: var(--vscode-input-placeholderForeground);
+        }
+        .inline-chat-send {
+            background: transparent;
+            border: none;
+            color: var(--vscode-textLink-foreground);
+            cursor: pointer;
+            padding: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0.7;
+            transition: opacity 0.2s;
+        }
+        .inline-chat-send:hover {
+            opacity: 1;
+        }
+        .inline-chat-send:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
     </style>
 </head>
 <body>
@@ -1516,16 +2452,6 @@ export class TranscriptDetailViewProvider {
                 <button class="tag-add" onclick="addTag()" title="Add tag">+ Add Tag</button>
             </div>
         </div>
-        ${routing ? `
-        <div class="metadata-row">
-            <div class="metadata-label">Routing:</div>
-            <div class="metadata-value">
-                ${routing.destination ? `<div><strong>Destination:</strong> ${this.escapeHtml(routing.destination)}</div>` : ''}
-                ${routing.confidence !== undefined ? `<div><strong>Confidence:</strong> <span class="confidence">${routing.confidence}%</span></div>` : ''}
-                ${routing.reasoning ? `<div style="margin-top: 8px;"><strong>Reasoning:</strong> ${this.escapeHtml(routing.reasoning)}</div>` : ''}
-            </div>
-        </div>
-        ` : ''}
         ${Object.entries(metadata).map(([key, value]) => `
         <div class="metadata-row">
             <div class="metadata-label">${this.escapeHtml(key)}:</div>
@@ -1536,17 +2462,35 @@ export class TranscriptDetailViewProvider {
     <div class="transcript-content-wrapper">
         <div style="display: flex; gap: 8px; margin-bottom: 16px;">
             <button class="edit-button" onclick="startEditTranscript()" id="edit-transcript-btn">Edit Transcript</button>
-            <button class="edit-button" onclick="reviewTranscription()" id="review-transcript-btn">Review Transcription</button>
+        </div>
+        <div class="inline-chat-container" id="inline-chat-container">
+            <div class="inline-chat-input-wrapper">
+                <textarea 
+                    class="inline-chat-input" 
+                    id="inline-chat-input" 
+                    placeholder="Type a message to make changes... (e.g., Change the title to &quot;Hello World&quot;)"
+                    rows="1"
+                ></textarea>
+                <button type="button" class="inline-chat-send" id="inline-chat-send">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M1.5 1.5L14.5 8L1.5 14.5L3.5 8L1.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </button>
+            </div>
         </div>
         <div class="transcript-content" id="transcript-content-display">
             ${this.markdownToHtml(transcriptText)}
         </div>
+        <button class="create-entity-button" id="create-entity-btn" onclick="createEntityFromSelection()">Create Entity</button>
         <div id="transcript-content-edit" style="display: none;">
-            <textarea id="transcript-textarea" class="title-input" style="min-height: 400px; font-family: var(--vscode-editor-font-family);">${this.escapeHtml(transcriptText)}</textarea>
+            <textarea id="transcript-textarea">${this.escapeHtml(transcriptText)}</textarea>
             <div style="margin-top: 8px;">
                 <button class="button" onclick="saveTranscript()">Save</button>
                 <button class="button button-secondary" onclick="cancelEditTranscript()">Cancel</button>
             </div>
+        </div>
+        <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--vscode-panel-border);">
+            <button class="edit-button" onclick="openSource()" id="open-source-btn">Source</button>
         </div>
     </div>
     ${this.renderEntityReferences(entityReferences)}
@@ -1650,6 +2594,13 @@ export class TranscriptDetailViewProvider {
             const textarea = document.getElementById('transcript-textarea');
             const newContent = textarea.value;
             
+            // Disable the save button while saving
+            const saveBtn = document.querySelector('#transcript-content-edit .button');
+            if (saveBtn) {
+                saveBtn.disabled = true;
+                saveBtn.textContent = 'Saving...';
+            }
+            
             vscode.postMessage({
                 command: 'editTranscript',
                 transcriptPath: transcriptPath,
@@ -1678,15 +2629,164 @@ export class TranscriptDetailViewProvider {
             });
         }
 
-        function reviewTranscription() {
+        function startChatFromInput() {
+            console.log('Protokoll: startChatFromInput called');
+            const input = document.getElementById('inline-chat-input');
+            if (!input) {
+                console.error('Protokoll: inline-chat-input not found');
+                return;
+            }
+            const message = input.value.trim();
+            if (!message) {
+                console.log('Protokoll: No message to send');
+                return;
+            }
+            
+            console.log('Protokoll: Sending message:', message);
+            
+            // Clear input
+            input.value = '';
+            adjustTextareaHeight(input);
+            
+            // Send message to extension to start a new chat
             vscode.postMessage({
-                command: 'reviewTranscription',
+                command: 'startChatFromInput',
+                message: message,
+                transcriptPath: transcriptPath,
+                transcriptUri: transcriptUri
+            });
+            console.log('Protokoll: Message sent to extension');
+        }
+        
+        function adjustTextareaHeight(textarea) {
+            textarea.style.height = 'auto';
+            textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+        }
+        
+        // Set up inline chat event listeners
+        function setupInlineChatListeners() {
+            console.log('Protokoll: Setting up inline chat listeners');
+            const chatInput = document.getElementById('inline-chat-input');
+            const chatSendBtn = document.getElementById('inline-chat-send');
+            
+            console.log('Protokoll: chatInput found:', !!chatInput);
+            console.log('Protokoll: chatSendBtn found:', !!chatSendBtn);
+            
+            if (chatInput) {
+                chatInput.addEventListener('input', function() {
+                    adjustTextareaHeight(this);
+                });
+                
+                chatInput.addEventListener('keydown', function(e) {
+                    console.log('Protokoll: keydown event, key:', e.key);
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        console.log('Protokoll: Enter pressed, calling startChatFromInput');
+                        startChatFromInput();
+                    }
+                });
+                console.log('Protokoll: chatInput listeners attached');
+            } else {
+                console.error('Protokoll: inline-chat-input element not found!');
+            }
+            
+            if (chatSendBtn) {
+                chatSendBtn.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    console.log('Protokoll: Send button clicked');
+                    startChatFromInput();
+                });
+                console.log('Protokoll: chatSendBtn listener attached');
+            } else {
+                console.error('Protokoll: inline-chat-send element not found!');
+            }
+        }
+        
+        // Run setup immediately (script is at end of body, DOM should be ready)
+        setupInlineChatListeners();
+        
+        // Also run on DOMContentLoaded as backup
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', setupInlineChatListeners);
+        }
+
+        function openSource() {
+            vscode.postMessage({
+                command: 'openSource',
                 transcriptPath: transcriptPath,
                 transcriptUri: transcriptUri
             });
         }
 
-        // Handle update indicator messages from extension
+        let selectedText = '';
+        let selectionRange = null;
+
+        function createEntityFromSelection() {
+            if (!selectedText || selectedText.trim().length === 0) {
+                return;
+            }
+            vscode.postMessage({
+                command: 'createEntityFromSelection',
+                selectedText: selectedText.trim(),
+                transcriptPath: transcriptPath,
+                transcriptUri: transcriptUri
+            });
+            // Hide the button after clicking
+            const btn = document.getElementById('create-entity-btn');
+            if (btn) {
+                btn.classList.remove('show');
+            }
+            selectedText = '';
+            selectionRange = null;
+        }
+
+        // Handle text selection in transcript content
+        const transcriptContent = document.getElementById('transcript-content-display');
+        const createEntityBtn = document.getElementById('create-entity-btn');
+        const wrapper = transcriptContent ? transcriptContent.closest('.transcript-content-wrapper') : null;
+
+        if (transcriptContent && createEntityBtn && wrapper) {
+            transcriptContent.addEventListener('mouseup', () => {
+                const selection = window.getSelection();
+                if (selection && selection.toString().trim().length > 0) {
+                    selectedText = selection.toString().trim();
+                    const range = selection.getRangeAt(0);
+                    const rect = range.getBoundingClientRect();
+                    const wrapperRect = wrapper.getBoundingClientRect();
+                    
+                    // Position button relative to the wrapper
+                    const relativeTop = rect.bottom - wrapperRect.top + wrapper.scrollTop + 5;
+                    const relativeLeft = rect.left - wrapperRect.left + wrapper.scrollLeft;
+                    
+                    createEntityBtn.style.top = relativeTop + 'px';
+                    createEntityBtn.style.left = relativeLeft + 'px';
+                    createEntityBtn.classList.add('show');
+                    selectionRange = range;
+                } else {
+                    createEntityBtn.classList.remove('show');
+                    selectedText = '';
+                    selectionRange = null;
+                }
+            });
+
+            // Hide button when clicking elsewhere
+            document.addEventListener('mousedown', (e) => {
+                if (!transcriptContent.contains(e.target) && !createEntityBtn.contains(e.target)) {
+                    createEntityBtn.classList.remove('show');
+                    selectedText = '';
+                    selectionRange = null;
+                }
+            });
+
+            // Hide button on scroll
+            wrapper.addEventListener('scroll', () => {
+                createEntityBtn.classList.remove('show');
+            });
+        }
+
+        // Handle messages from extension
         window.addEventListener('message', event => {
             const message = event.data;
             if (message.command === 'showUpdateIndicator') {
@@ -1697,6 +2797,13 @@ export class TranscriptDetailViewProvider {
                     } else {
                         indicator.classList.remove('show');
                     }
+                }
+            } else if (message.command === 'saveFailed') {
+                // Re-enable the save button if save failed
+                const saveBtn = document.querySelector('#transcript-content-edit .button');
+                if (saveBtn) {
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = 'Save';
                 }
             }
         });

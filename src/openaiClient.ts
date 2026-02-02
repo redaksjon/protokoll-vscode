@@ -266,14 +266,20 @@ export class OpenAIClient {
 
           if (toolCallDelta.function?.arguments) {
             const currentArgs = toolCalls[index].arguments;
+            const newArgsChunk = toolCallDelta.function.arguments;
+            
+            // Accumulate the argument string
+            const argsStr = (typeof currentArgs === 'string' ? currentArgs : '') + newArgsChunk;
+            
+            // Try to parse the accumulated string
             try {
-              // Parse accumulated arguments
-              const argsStr = (currentArgs as unknown as string || '') + toolCallDelta.function.arguments;
-              toolCalls[index].arguments = JSON.parse(argsStr);
+              const parsed = JSON.parse(argsStr);
+              toolCalls[index].arguments = parsed;
+              console.log(`Protokoll: [OPENAI] Successfully parsed arguments for tool ${toolCalls[index].name || 'unknown'}:`, JSON.stringify(parsed));
             } catch {
-              // Still accumulating
-              (toolCalls[index].arguments as unknown as string) = 
-                ((currentArgs as unknown as string) || '') + toolCallDelta.function.arguments;
+              // Still accumulating - keep as string for now
+              toolCalls[index].arguments = argsStr as unknown as Record<string, unknown>;
+              console.log(`Protokoll: [OPENAI] Accumulating arguments for tool ${toolCalls[index].name || 'unknown'} (length: ${argsStr.length})`);
             }
           }
         }
@@ -298,6 +304,7 @@ export class OpenAIClient {
           }
 
           console.log(`Protokoll: [OPENAI] Executing tool: ${toolCall.name}`);
+          console.log(`Protokoll: [OPENAI] Raw tool call arguments (type: ${typeof toolCall.arguments}):`, JSON.stringify(toolCall.arguments));
 
           if (onToolCall) {
             onToolCall(toolCall.name, toolCall.arguments);
@@ -308,12 +315,24 @@ export class OpenAIClient {
           if (typeof parsedArgs === 'string') {
             try {
               parsedArgs = JSON.parse(parsedArgs);
-              console.log(`Protokoll: [OPENAI] Parsed tool arguments for ${toolCall.name}`);
+              console.log(`Protokoll: [OPENAI] Parsed tool arguments for ${toolCall.name}:`, JSON.stringify(parsedArgs));
             } catch (parseError) {
               console.error(`Protokoll: [OPENAI] Failed to parse tool arguments for ${toolCall.name}:`, parseError);
+              console.error(`Protokoll: [OPENAI] Raw string that failed to parse:`, parsedArgs);
               // If parsing fails, use empty object
               parsedArgs = {};
             }
+          } else {
+            console.log(`Protokoll: [OPENAI] Tool arguments already parsed for ${toolCall.name}:`, JSON.stringify(parsedArgs));
+          }
+
+          // Validate that arguments are not empty (unless tool doesn't require them)
+          if (!parsedArgs || (typeof parsedArgs === 'object' && Object.keys(parsedArgs).length === 0)) {
+            console.error(`Protokoll: [OPENAI] ❌ CRITICAL: Tool ${toolCall.name} called with empty arguments!`);
+            console.error(`Protokoll: [OPENAI] Tool call details:`, JSON.stringify(toolCall, null, 2));
+            console.error(`Protokoll: [OPENAI] Raw arguments before parsing:`, JSON.stringify(toolCall.arguments));
+            console.error(`Protokoll: [OPENAI] Parsed arguments:`, JSON.stringify(parsedArgs));
+            console.error(`Protokoll: [OPENAI] This indicates a bug in argument accumulation/parsing. Will still attempt execution to get server-side error.`);
           }
 
           try {

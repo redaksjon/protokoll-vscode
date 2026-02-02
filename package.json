@@ -103,6 +103,24 @@
         "title": "Open Chat",
         "icon": "$(comment-discussion)",
         "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.refreshChats",
+        "title": "Refresh Chats",
+        "icon": "$(refresh)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.openChatPanel",
+        "title": "Open Chat Panel",
+        "icon": "$(comment-discussion)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.closeChatPanel",
+        "title": "Close Chat",
+        "icon": "$(close)",
+        "category": "Protokoll"
       }
     ],
     "views": {
@@ -110,6 +128,10 @@
         {
           "id": "protokollTranscripts",
           "name": "Transcripts"
+        },
+        {
+          "id": "protokollChats",
+          "name": "Chats"
         },
         {
           "id": "protokollConnectionStatus",
@@ -132,6 +154,11 @@
         {
           "command": "protokoll.startNewSession",
           "when": "view == protokollTranscripts",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.refreshChats",
+          "when": "view == protokollChats",
           "group": "navigation"
         }
       ],
@@ -182,6 +209,13 @@
         }
       ]
     },
+"keybindings": [
+      {
+        "command": "protokollTranscripts.focus",
+        "key": "ctrl+alt+p",
+        "mac": "cmd+alt+p"
+      }
+    ],
     "configuration": {
       "title": "Protokoll",
       "properties": {
