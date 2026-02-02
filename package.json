@@ -1,0 +1,221 @@
+{
+  "name": "@redaksjon/protokoll-vscode",
+  "displayName": "Protokoll",
+  "description": "VS Code extension for viewing Protokoll transcripts and entities via HTTP MCP server",
+  "version": "0.1.0-dev.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/redaksjon/protokoll-vscode.git"
+  },
+  "homepage": "https://github.com/redaksjon/protokoll-vscode",
+  "keywords": [
+    "protokoll",
+    "transcription",
+    "vscode",
+    "extension",
+    "mcp"
+  ],
+  "author": "Tim O'Brien <tobrien@discursive.com>",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.90.0",
+    "node": ">=24.0.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "protokoll.showTranscripts",
+        "title": "Show Transcripts",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.configureServer",
+        "title": "Configure Server URL",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.refreshTranscripts",
+        "title": "Refresh",
+        "icon": "$(refresh)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.filterByProject",
+        "title": "Filter by Project",
+        "icon": "$(filter)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.startNewSession",
+        "title": "Start New Session",
+        "icon": "$(add)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.renameTranscript",
+        "title": "Rename",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.moveToProject",
+        "title": "Move to Project",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.copyTranscript",
+        "title": "Copy",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.openTranscriptToSide",
+        "title": "Open to the Side",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.openTranscriptWith",
+        "title": "Open With...",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.copyTranscriptUrl",
+        "title": "Copy URL",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.openTranscriptInNewTab",
+        "title": "Open in New Tab",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.copySessionId",
+        "title": "Copy Session ID",
+        "category": "Protokoll"
+      }
+    ],
+    "views": {
+      "protokoll": [
+        {
+          "id": "protokollTranscripts",
+          "name": "Transcripts"
+        },
+        {
+          "id": "protokollConnectionStatus",
+          "name": "Connection Status"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "protokoll.refreshTranscripts",
+          "when": "view == protokollTranscripts",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.filterByProject",
+          "when": "view == protokollTranscripts",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.startNewSession",
+          "when": "view == protokollTranscripts",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "protokoll.openTranscriptToSide",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "1_open"
+        },
+        {
+          "command": "protokoll.openTranscriptInNewTab",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "1_open"
+        },
+        {
+          "command": "protokoll.openTranscriptWith",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "1_open"
+        },
+        {
+          "command": "protokoll.copyTranscript",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "9_cutcopypaste"
+        },
+        {
+          "command": "protokoll.copyTranscriptUrl",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "9_cutcopypaste"
+        },
+        {
+          "command": "protokoll.renameTranscript",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "z_commands"
+        },
+        {
+          "command": "protokoll.moveToProject",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "z_commands"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "protokoll",
+          "title": "Protokoll",
+          "icon": "$(book)"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Protokoll",
+      "properties": {
+        "protokoll.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:3001",
+          "description": "URL of the Protokoll HTTP MCP server",
+          "markdownDescription": "URL of the Protokoll HTTP MCP server (e.g., `http://127.0.0.1:3001`)"
+        },
+        "protokoll.transcriptsDirectory": {
+          "type": "string",
+          "default": "",
+          "description": "Default directory path for transcripts",
+          "markdownDescription": "Default directory path for transcripts (optional, will prompt if not set)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "lint:fix": "eslint src --ext ts --fix",
+    "test": "vitest run --coverage",
+    "test:watch": "vitest watch",
+    "build": "npm run lint && npm run compile",
+    "clean": "rm -rf out",
+    "precommit": "npm run lint && npm run build && npm run test",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "@vitest/coverage-v8": "^2.0.0",
+    "eslint": "^8.57.0",
+    "typescript": "^5.3.3",
+    "vitest": "^2.0.0"
+  },
+  "dependencies": {}
+}

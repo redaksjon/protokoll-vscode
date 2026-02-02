@@ -1,0 +1,49 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+coverage/
+node_modules/
+dist/tests/
+tests/
+.DS_Store
+
+# Development output directories
+output/
+input/
+processed/
+.kodrdriv*
+.maloomscan/
+
+# Build artifacts
+*.tsbuildinfo
+tsconfig (1).tsbuildinfo
+package.json~
+outdiff
+outlog
+*~
+
+# Development tools
+nodemon.json
+.cursor/
+.eslintrc.json
+babel.config.js
+cloudbuild.yaml
+jest.config.ts
+tsconfig.json
+yarn.lock
+.yarnrc.yml
+.npmignore
+.gitignore
+.github/
+.vscode/
+.yarn/
+src/
+.eslintrc
+.prettierrc
+jest.config.js
+tsconfig.json
+*.log
+.env
+.env.*
+.vscode-test/
+.vscode-test-web/
+.vscodeignore
+QUICKSTART.md
