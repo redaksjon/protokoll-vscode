@@ -3,9 +3,10 @@
  */
 
 import * as vscode from 'vscode';
+import * as fs from 'fs';
 import { McpClient } from './mcpClient';
 import { TranscriptsViewProvider, TranscriptItem } from './transcriptsView';
-import { TranscriptDetailViewProvider, getTranscriptContentProvider } from './transcriptDetailView';
+import { TranscriptDetailViewProvider, getTranscriptContentProvider, getEditableTranscriptFiles } from './transcriptDetailView';
 import { ConnectionStatusViewProvider } from './connectionStatusView';
 import { ChatViewProvider } from './chatView';
 import { ChatsViewProvider } from './chatsView';
@@ -127,6 +128,18 @@ export async function activate(context: vscode.ExtensionContext) {
               await transcriptsViewProvider.refresh();
             } else {
               console.warn('Protokoll: [EXTENSION] ⚠️ transcriptsViewProvider is null');
+            }
+            return;
+          }
+          
+          // Check if this is an entity URI
+          if (params.uri.startsWith('protokoll://entity/')) {
+            console.log('Protokoll: [EXTENSION] This is an entity URI, refreshing if open');
+            console.log(`Protokoll: [EXTENSION] Notification URI: ${params.uri}`);
+            if (transcriptDetailViewProvider) {
+              // Refresh the entity view if it's open
+              await transcriptDetailViewProvider.refreshEntity(params.uri);
+              console.log('Protokoll: [EXTENSION] ✅ Refreshed entity view');
             }
             return;
           }
@@ -288,15 +301,17 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // Create chatViewProvider BEFORE setting it on transcriptDetailViewProvider
   chatViewProvider = new ChatViewProvider(context.extensionUri);
-  if (mcpClient) {
+  if (mcpClient && chatViewProvider) {
     chatViewProvider.setClient(mcpClient);
   }
   
   // NOW set the chat provider on transcript detail view (after chatViewProvider is created)
-  transcriptDetailViewProvider.setChatProvider(chatViewProvider);
-  
-  // Set transcript detail provider reference for context fallback
-  chatViewProvider.setTranscriptDetailProvider(transcriptDetailViewProvider);
+  if (chatViewProvider) {
+    transcriptDetailViewProvider.setChatProvider(chatViewProvider);
+    
+    // Set transcript detail provider reference for context fallback
+    chatViewProvider.setTranscriptDetailProvider(transcriptDetailViewProvider);
+  }
 
   // Initialize chats view provider
   chatsViewProvider = new ChatsViewProvider();
@@ -311,11 +326,75 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.workspace.registerTextDocumentContentProvider('protokoll-transcript', transcriptContentProvider)
   );
 
+  // Register document save listener for edit-in-editor feature
+  // Syncs saves from temp files back to MCP server
+  const saveListener = vscode.workspace.onDidSaveTextDocument(async (document) => {
+    const editableFiles = getEditableTranscriptFiles();
+    const transcriptInfo = editableFiles.get(document.uri.fsPath);
+    
+    if (transcriptInfo && mcpClient) {
+      const editedBody = document.getText();
+      
+      // Only sync if body content actually changed
+      if (editedBody !== transcriptInfo.originalBody) {
+        try {
+          // Merge the preserved header with the edited body
+          const fullContent = transcriptInfo.header + editedBody;
+          
+          log(`Protokoll: Syncing edited transcript to server: ${transcriptInfo.transcriptPath}`);
+          await mcpClient.callTool('protokoll_update_transcript_content', {
+            transcriptPath: transcriptInfo.transcriptPath,
+            content: fullContent,
+          });
+          
+          // Update the original body to reflect the saved state
+          transcriptInfo.originalBody = editedBody;
+          transcriptInfo.originalContent = fullContent;
+          
+          vscode.window.showInformationMessage('Protokoll: Transcript saved to server');
+          
+          // Refresh the transcript detail view if open
+          if (transcriptDetailViewProvider) {
+            await transcriptDetailViewProvider.refreshTranscript(transcriptInfo.transcriptUri);
+          }
+        } catch (error) {
+          log(`Protokoll: Error syncing transcript to server: ${error}`);
+          vscode.window.showErrorMessage(
+            `Failed to save transcript to server: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      }
+    }
+  });
+  context.subscriptions.push(saveListener);
+
+  // Clean up temp files when documents are closed
+  const closeListener = vscode.workspace.onDidCloseTextDocument((document) => {
+    const editableFiles = getEditableTranscriptFiles();
+    if (editableFiles.has(document.uri.fsPath)) {
+      log(`Protokoll: Cleaning up temp file: ${document.uri.fsPath}`);
+      editableFiles.delete(document.uri.fsPath);
+      // Try to delete the temp file
+      try {
+        if (fs.existsSync(document.uri.fsPath)) {
+          fs.unlinkSync(document.uri.fsPath);
+        }
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+  });
+  context.subscriptions.push(closeListener);
+
   // Register tree views
   const transcriptsTreeView = vscode.window.createTreeView('protokollTranscripts', {
     treeDataProvider: transcriptsViewProvider,
     showCollapseAll: false,
+    canSelectMany: true, // Enable multi-selection
   });
+
+  // Set the tree view reference in the provider
+  transcriptsViewProvider.setTreeView(transcriptsTreeView);
 
   // Refresh transcripts when view becomes visible
   let hasRefreshedOnce = false;
@@ -607,27 +686,63 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
-  const startNewSessionCommand = vscode.commands.registerCommand(
-    'protokoll.startNewSession',
+  const sortTranscriptsCommand = vscode.commands.registerCommand(
+    'protokoll.sortTranscripts',
     async () => {
-      if (!mcpClient) {
-        vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
+      if (!transcriptsViewProvider) {
+        vscode.window.showErrorMessage('Transcripts view provider not initialized.');
         return;
       }
 
-      try {
-        await mcpClient.startNewSession();
-        vscode.window.showInformationMessage('Protokoll: Started new session');
-        
-        // Refresh transcripts after starting new session
-        if (transcriptsViewProvider) {
-          await transcriptsViewProvider.refresh();
-        }
-      } catch (error) {
-        vscode.window.showErrorMessage(
-          `Failed to start new session: ${error instanceof Error ? error.message : String(error)}`
-        );
+      const currentSort = transcriptsViewProvider.getSortOrder();
+      
+      const items: Array<vscode.QuickPickItem & { sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc' }> = [
+        {
+          label: '$(arrow-down) Date (Newest First)',
+          description: currentSort === 'date-desc' ? 'Currently selected' : 'Sort by date, newest first',
+          sortOrder: 'date-desc',
+        },
+        {
+          label: '$(arrow-up) Date (Oldest First)',
+          description: currentSort === 'date-asc' ? 'Currently selected' : 'Sort by date, oldest first',
+          sortOrder: 'date-asc',
+        },
+        {
+          label: '$(sort-alphabetically) Title (A-Z)',
+          description: currentSort === 'title-asc' ? 'Currently selected' : 'Sort by title, A to Z',
+          sortOrder: 'title-asc',
+        },
+        {
+          label: '$(sort-alphabetically) Title (Z-A)',
+          description: currentSort === 'title-desc' ? 'Currently selected' : 'Sort by title, Z to A',
+          sortOrder: 'title-desc',
+        },
+      ];
+
+      const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Select sort order for transcripts',
+      });
+
+      if (selected) {
+        transcriptsViewProvider.setSortOrder(selected.sortOrder);
+        /* eslint-disable @typescript-eslint/naming-convention */
+        const sortLabels: Record<string, string> = {
+          'date-desc': 'Date (Newest First)',
+          'date-asc': 'Date (Oldest First)',
+          'title-asc': 'Title (A-Z)',
+          'title-desc': 'Title (Z-A)',
+        };
+        /* eslint-enable @typescript-eslint/naming-convention */
+        vscode.window.showInformationMessage(`Protokoll: Sorting by ${sortLabels[selected.sortOrder]}`);
       }
+    }
+  );
+
+  const startNewSessionCommand = vscode.commands.registerCommand(
+    'protokoll.startNewSession',
+    async () => {
+      // Redirect to createNote command - "Start New Session" should create a new transcript
+      await vscode.commands.executeCommand('protokoll.createNote');
     }
   );
 
@@ -698,62 +813,111 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      try {
-        // List available projects
-        const projectsResult = await mcpClient.callTool('protokoll_list_projects', {}) as {
-          projects?: Array<{ id: string; name: string; active?: boolean }>;
-        };
-
-        if (!projectsResult.projects || projectsResult.projects.length === 0) {
-          vscode.window.showWarningMessage('No projects found. Please configure projects in your context directory.');
-          return;
-        }
-
-        // Filter to active projects only
-        const activeProjects = projectsResult.projects.filter(p => p.active !== false);
-
-        if (activeProjects.length === 0) {
-          vscode.window.showWarningMessage('No active projects found.');
-          return;
-        }
-
-        // Show quick pick to select project
-        const projectItems = activeProjects.map(p => ({
-          label: p.name,
-          description: p.id,
-          id: p.id,
-        }));
-
-        const selected = await vscode.window.showQuickPick(projectItems, {
-          placeHolder: 'Select a project to move this transcript to',
-        });
-
-        if (!selected) {
-          return; // User cancelled
-        }
-
-        // Extract transcript path from URI or use filename
-        const transcriptPath = item.transcript.path || item.transcript.filename;
-        
-        // Call the edit transcript tool with the new projectId
-        await mcpClient.callTool('protokoll_edit_transcript', {
-          transcriptPath: transcriptPath,
-          projectId: selected.id,
-        });
-
-        vscode.window.showInformationMessage(`Protokoll: Transcript moved to project "${selected.label}"`);
-        
-        // Refresh transcripts to show the updated project
-        if (transcriptsViewProvider) {
-          await transcriptsViewProvider.refresh();
-        }
-      } catch (error) {
-        vscode.window.showErrorMessage(
-          `Failed to move transcript: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
+      await moveTranscriptsToProject([item], mcpClient, transcriptsViewProvider);
     }
   );
+
+  const moveSelectedToProjectCommand = vscode.commands.registerCommand(
+    'protokoll.moveSelectedToProject',
+    async () => {
+      if (!mcpClient) {
+        vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
+        return;
+      }
+
+      if (!transcriptsViewProvider) {
+        vscode.window.showErrorMessage('Transcripts view provider not initialized.');
+        return;
+      }
+
+      const selectedItems = transcriptsViewProvider.getSelectedItems();
+      if (selectedItems.length === 0) {
+        vscode.window.showWarningMessage('No transcripts selected. Select one or more transcripts to move.');
+        return;
+      }
+
+      await moveTranscriptsToProject(selectedItems, mcpClient, transcriptsViewProvider);
+    }
+  );
+
+  // Helper function to move transcripts to a project
+  async function moveTranscriptsToProject(
+    items: TranscriptItem[],
+    client: McpClient,
+    provider: TranscriptsViewProvider | null
+  ): Promise<void> {
+    try {
+      // List available projects
+      const projectsResult = await client.callTool('protokoll_list_projects', {}) as {
+        projects?: Array<{ id: string; name: string; active?: boolean }>;
+      };
+
+      if (!projectsResult.projects || projectsResult.projects.length === 0) {
+        vscode.window.showWarningMessage('No projects found. Please configure projects in your context directory.');
+        return;
+      }
+
+      // Filter to active projects only
+      const activeProjects = projectsResult.projects.filter(p => p.active !== false);
+
+      if (activeProjects.length === 0) {
+        vscode.window.showWarningMessage('No active projects found.');
+        return;
+      }
+
+      // Show quick pick to select project
+      const projectItems = activeProjects.map(p => ({
+        label: p.name,
+        description: p.id,
+        id: p.id,
+      }));
+
+      const selected = await vscode.window.showQuickPick(projectItems, {
+        placeHolder: `Select a project to move ${items.length} transcript${items.length > 1 ? 's' : ''} to`,
+      });
+
+      if (!selected) {
+        return; // User cancelled
+      }
+
+      // Move all selected transcripts
+      const errors: string[] = [];
+      for (const item of items) {
+        if (!item.transcript) {
+          continue;
+        }
+        try {
+          const transcriptPath = item.transcript.path || item.transcript.filename;
+          await client.callTool('protokoll_edit_transcript', {
+            transcriptPath: transcriptPath,
+            projectId: selected.id,
+          });
+        } catch (error) {
+          const transcriptName = item.transcript.title || item.transcript.filename;
+          errors.push(`${transcriptName}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+
+      if (errors.length > 0) {
+        vscode.window.showWarningMessage(
+          `Moved ${items.length - errors.length} of ${items.length} transcript(s). Errors: ${errors.join('; ')}`
+        );
+      } else {
+        vscode.window.showInformationMessage(
+          `Protokoll: Moved ${items.length} transcript${items.length > 1 ? 's' : ''} to project "${selected.label}"`
+        );
+      }
+
+      // Refresh transcripts to show the updated project
+      if (provider) {
+        await provider.refresh();
+      }
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to move transcripts: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
 
   const copyTranscriptCommand = vscode.commands.registerCommand(
     'protokoll.copyTranscript',
@@ -912,6 +1076,115 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  const createNoteCommand = vscode.commands.registerCommand(
+    'protokoll.createNote',
+    async () => {
+      if (!mcpClient) {
+        vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
+        return;
+      }
+
+      try {
+        // Prompt for title
+        const title = await vscode.window.showInputBox({
+          prompt: 'Enter a title for the note',
+          placeHolder: 'Note title',
+          validateInput: (value) => {
+            if (!value || value.trim() === '') {
+              return 'Title cannot be empty';
+            }
+            return null;
+          },
+        });
+
+        if (!title) {
+          return; // User cancelled
+        }
+
+        // Prompt for project
+        let projectId: string | undefined;
+        try {
+          const projectsResult = await mcpClient.callTool('protokoll_list_projects', {}) as {
+            projects?: Array<{ id: string; name: string; active?: boolean }>;
+          };
+          
+          if (projectsResult.projects && projectsResult.projects.length > 0) {
+            const activeProjects = projectsResult.projects.filter(p => p.active !== false);
+            if (activeProjects.length > 0) {
+              const projectItems = activeProjects.map(p => ({
+                label: p.name,
+                description: p.id,
+                id: p.id,
+              }));
+              
+              // Add option to skip project selection
+              projectItems.unshift({
+                label: '$(circle-slash) No Project',
+                description: 'Create note without project assignment',
+                id: '',
+              });
+              
+              const selected = await vscode.window.showQuickPick(projectItems, {
+                placeHolder: 'Select a project for this note',
+              });
+              
+              if (selected === undefined) {
+                return; // User cancelled
+              }
+              
+              if (selected.id) {
+                projectId = selected.id;
+              }
+            }
+          }
+        } catch (error) {
+          // Ignore errors when fetching projects - project is optional
+          console.log('Could not fetch projects:', error);
+        }
+
+        // Call the MCP tool to create the note (no content - user will add via the view)
+        const result = await mcpClient.callTool('protokoll_create_note', {
+          title: title.trim(),
+          content: '',
+          projectId: projectId,
+        }) as {
+          success?: boolean;
+          filePath?: string;
+          filename?: string;
+          uri?: string;
+          message?: string;
+        };
+
+        if (result.success) {
+          // Refresh transcripts to show the new note
+          if (transcriptsViewProvider) {
+            await transcriptsViewProvider.refresh();
+          }
+
+          // Open the newly created note in the detail view
+          if (result.filePath && transcriptDetailViewProvider) {
+            // Construct a transcript object from the result
+            const newTranscript: Transcript = {
+              uri: result.uri || `protokoll://transcript/${result.filePath}`,
+              path: result.filePath,
+              filename: result.filename || result.filePath.split('/').pop() || '',
+              title: title.trim(),
+              date: new Date().toISOString(),
+            };
+            
+            await transcriptDetailViewProvider.showTranscript(newTranscript.uri, newTranscript);
+          }
+        } else {
+          vscode.window.showErrorMessage('Failed to create note: Unknown error');
+        }
+      } catch (error) {
+        vscode.window.showErrorMessage(
+          `Failed to create note: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+  );
+
   // Refresh transcripts when configuration changes
   const configWatcher = vscode.workspace.onDidChangeConfiguration(async (e) => {
     if (e.affectsConfiguration('protokoll.serverUrl')) {
@@ -982,6 +1255,31 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   }
 
+  // Add keyboard navigation handler for back arrow
+  // Note: VS Code already handles up/down arrow navigation by default
+  // The left arrow (back) will navigate to parent nodes
+  const backArrowHandler = vscode.commands.registerCommand(
+    'protokoll.navigateBack',
+    async () => {
+      if (transcriptsTreeView && transcriptsTreeView.visible) {
+        const selection = transcriptsTreeView.selection;
+        if (selection.length > 0) {
+          const currentItem = selection[0];
+          // Navigate to parent: transcript -> month -> year
+          if (currentItem.type === 'transcript' || currentItem.type === 'month') {
+            const parent = await transcriptsViewProvider?.getParent(currentItem);
+            if (parent) {
+              await transcriptsTreeView.reveal(parent, { focus: true, select: true });
+            }
+          } else if (currentItem.type === 'year') {
+            // At year level, just focus it (VS Code will handle collapsing)
+            await transcriptsTreeView.reveal(currentItem, { focus: true, select: true });
+          }
+        }
+      }
+    }
+  );
+
   context.subscriptions.push(
     showTranscriptsCommand,
     configureServerCommand,
@@ -989,9 +1287,11 @@ export async function activate(context: vscode.ExtensionContext) {
     openTranscriptInNewTabCommand,
     refreshTranscriptsCommand,
     filterByProjectCommand,
+    sortTranscriptsCommand,
     startNewSessionCommand,
     renameTranscriptCommand,
     moveToProjectCommand,
+    moveSelectedToProjectCommand,
     copyTranscriptCommand,
     openTranscriptToSideCommand,
     openTranscriptWithCommand,
@@ -1001,6 +1301,8 @@ export async function activate(context: vscode.ExtensionContext) {
     refreshChatsCommand,
     openChatPanelCommand,
     closeChatPanelCommand,
+    createNoteCommand,
+    backArrowHandler,
     configWatcher,
     transcriptsTreeView,
     chatsTreeView,

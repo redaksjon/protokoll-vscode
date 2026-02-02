@@ -53,8 +53,14 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.sortTranscripts",
+        "title": "Sort",
+        "icon": "$(sort-precedence)",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.startNewSession",
-        "title": "Start New Session",
+        "title": "New Transcript",
         "icon": "$(add)",
         "category": "Protokoll"
       },
@@ -66,6 +72,16 @@
       {
         "command": "protokoll.moveToProject",
         "title": "Move to Project",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.moveSelectedToProject",
+        "title": "Move Selected to Project",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.navigateBack",
+        "title": "Navigate Back",
         "category": "Protokoll"
       },
       {
@@ -121,6 +137,12 @@
         "title": "Close Chat",
         "icon": "$(close)",
         "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.createNote",
+        "title": "Create Note",
+        "icon": "$(file-add)",
+        "category": "Protokoll"
       }
     ],
     "views": {
@@ -148,6 +170,11 @@
         },
         {
           "command": "protokoll.filterByProject",
+          "when": "view == protokollTranscripts",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.sortTranscripts",
           "when": "view == protokollTranscripts",
           "group": "navigation"
         },
@@ -197,6 +224,11 @@
           "command": "protokoll.moveToProject",
           "when": "view == protokollTranscripts && viewItem == transcript",
           "group": "z_commands"
+        },
+        {
+          "command": "protokoll.moveSelectedToProject",
+          "when": "view == protokollTranscripts",
+          "group": "z_commands"
         }
       ]
     },
@@ -214,6 +246,11 @@
         "command": "protokollTranscripts.focus",
         "key": "ctrl+alt+p",
         "mac": "cmd+alt+p"
+      },
+      {
+        "command": "protokoll.navigateBack",
+        "key": "left",
+        "when": "view == protokollTranscripts && focus == protokollTranscripts"
       }
     ],
     "configuration": {

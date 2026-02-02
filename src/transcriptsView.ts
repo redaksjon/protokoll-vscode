@@ -22,8 +22,21 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   private transcripts: Transcript[] = [];
   private directory: string = '';
   private selectedProjectFilter: string | null = null; // Project ID to filter by
+  private sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc' = 'date-desc'; // Default: date descending
+  private treeView: vscode.TreeView<TranscriptItem> | null = null;
 
   constructor(private context: vscode.ExtensionContext) {}
+
+  setTreeView(treeView: vscode.TreeView<TranscriptItem>): void {
+    this.treeView = treeView;
+  }
+
+  getSelectedItems(): TranscriptItem[] {
+    if (!this.treeView) {
+      return [];
+    }
+    return this.treeView.selection.filter(item => item.type === 'transcript' && item.transcript);
+  }
 
   setClient(client: McpClient): void {
     log('TranscriptsViewProvider.setClient called', { hasClient: !!client });
@@ -50,6 +63,20 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
   getProjectFilter(): string | null {
     return this.selectedProjectFilter;
+  }
+
+  setSortOrder(sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc'): void {
+    this.sortOrder = sortOrder;
+    // Refresh the transcript list with the new sort order
+    this.refresh().catch(err => {
+      vscode.window.showErrorMessage(
+        `Failed to refresh transcripts: ${err instanceof Error ? err.message : String(err)}`
+      );
+    });
+  }
+
+  getSortOrder(): 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc' {
+    return this.sortOrder;
   }
 
   async refresh(directory?: string): Promise<void> {
@@ -143,6 +170,38 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     return element;
   }
 
+  getParent(element: TranscriptItem): vscode.ProviderResult<TranscriptItem> {
+    if (element.type === 'transcript') {
+      // Transcript's parent is the month
+      if (element.year && element.month) {
+        return new TranscriptItem(
+          this.getMonthName(element.month),
+          `year:${element.year}:month:${element.month}`,
+          vscode.TreeItemCollapsibleState.Expanded,
+          undefined,
+          undefined,
+          'month',
+          element.year,
+          element.month
+        );
+      }
+    } else if (element.type === 'month') {
+      // Month's parent is the year
+      if (element.year) {
+        return new TranscriptItem(
+          element.year,
+          `year:${element.year}`,
+          vscode.TreeItemCollapsibleState.Expanded,
+          undefined,
+          undefined,
+          'year'
+        );
+      }
+    }
+    // Year has no parent (it's root level)
+    return null;
+  }
+
   private _isLoading = false;
 
   async getChildren(element?: TranscriptItem): Promise<TranscriptItem[]> {
@@ -219,7 +278,10 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
       return transcripts.map(t => {
         const projectNames = t.entities?.projects?.map(p => p.name).join(', ') || '';
         const day = this.extractDay(t);
-        const dayPrefix = day !== null ? `${day}. ` : '';
+        const timeStr = this.formatTime(t.time);
+        const dayPrefix = day !== null 
+          ? (timeStr ? `${day}. (${timeStr}) ` : `${day}. `)
+          : '';
         const label = `${dayPrefix}${t.title || t.filename}`;
         
         return new TranscriptItem(
@@ -265,30 +327,39 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
       grouped[yearMonth.year][yearMonth.month].push(transcript);
     }
 
-    // Sort transcripts within each month by day ascending
+    // Sort transcripts within each month based on sortOrder
     for (const year in grouped) {
       for (const month in grouped[year]) {
         grouped[year][month].sort((a, b) => {
+          if (this.sortOrder === 'title-asc' || this.sortOrder === 'title-desc') {
+            const titleA = (a.title || a.filename || '').toLowerCase();
+            const titleB = (b.title || b.filename || '').toLowerCase();
+            const compare = titleA.localeCompare(titleB);
+            return this.sortOrder === 'title-asc' ? compare : -compare;
+          }
+          
+          // Date-based sorting (default)
           const dayA = this.extractDay(a);
           const dayB = this.extractDay(b);
           
-          // Compare by day number (ascending)
+          // Compare by day number (descending by default, ascending if date-asc)
           if (dayA !== null && dayB !== null) {
             const dayCompare = dayA - dayB;
             if (dayCompare !== 0) {
-              return dayCompare;
+              return this.sortOrder === 'date-asc' ? dayCompare : -dayCompare;
             }
           }
           
           // If day extraction failed, fall back to date string comparison
           const dateCompare = a.date.localeCompare(b.date);
           if (dateCompare !== 0) {
-            return dateCompare;
+            return this.sortOrder === 'date-asc' ? dateCompare : -dateCompare;
           }
           
-          // Then by time if available
+          // Then by time if available (descending by default, ascending if date-asc)
           if (a.time && b.time) {
-            return a.time.localeCompare(b.time);
+            const timeCompare = a.time.localeCompare(b.time);
+            return this.sortOrder === 'date-asc' ? timeCompare : -timeCompare;
           }
           return 0;
         });
@@ -390,6 +461,52 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
       } catch {
         // Date parsing failed
       }
+    }
+
+    return null;
+  }
+
+  private formatTime(timeStr: string | undefined): string | null {
+    if (!timeStr) {
+      return null;
+    }
+
+    try {
+      // Try to parse various time formats
+      // Format 1: HH:MM:SS or HH:MM (e.g., "20:30:00" or "20:30")
+      const timeMatch = timeStr.match(/^(\d{1,2}):(\d{2})(?::\d{2})?/);
+      if (timeMatch) {
+        let hours = parseInt(timeMatch[1]);
+        const minutes = parseInt(timeMatch[2]);
+        
+        // Convert to 12-hour format
+        const period = hours >= 12 ? 'PM' : 'AM';
+        hours = hours % 12 || 12;
+        
+        return `${hours}:${minutes.toString().padStart(2, '0')} ${period}`;
+      }
+
+      // Format 2: Already in 12-hour format (e.g., "8:30 PM")
+      // Just return as-is, but ensure minutes are padded
+      const existing12Hour = timeStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+      if (existing12Hour) {
+        const hours = existing12Hour[1];
+        const minutes = existing12Hour[2].padStart(2, '0');
+        const period = existing12Hour[3].toUpperCase();
+        return `${hours}:${minutes} ${period}`;
+      }
+
+      // Format 3: Try parsing as Date object
+      const dateObj = new Date(`2000-01-01T${timeStr}`);
+      if (!isNaN(dateObj.getTime())) {
+        let hours = dateObj.getHours();
+        const minutes = dateObj.getMinutes();
+        const period = hours >= 12 ? 'PM' : 'AM';
+        hours = hours % 12 || 12;
+        return `${hours}:${minutes.toString().padStart(2, '0')} ${period}`;
+      }
+    } catch {
+      // Time parsing failed
     }
 
     return null;

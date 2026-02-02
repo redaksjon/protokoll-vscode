@@ -37,14 +37,14 @@ export class ChatViewProvider {
   /**
    * Set reference to chats view provider for panel tracking
    */
-  setChatsViewProvider(provider: { registerChat: (id: string, title: string, transcriptUri?: string) => void; unregisterChat: (id: string) => void }): void {
+  public setChatsViewProvider(provider: { registerChat: (id: string, title: string, transcriptUri?: string) => void; unregisterChat: (id: string) => void }): void {
     this._chatsViewProvider = provider;
   }
 
   /**
    * Set reference to transcript detail provider for context fallback
    */
-  setTranscriptDetailProvider(provider: { 
+  public setTranscriptDetailProvider(provider: { 
     getCurrentTranscript: (uri: string) => { uri: string; transcript: Transcript } | undefined;
     getAllOpenTranscripts?: () => Array<{ uri: string; transcript: Transcript }>;
   }): void {

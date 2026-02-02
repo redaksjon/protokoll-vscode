@@ -4,9 +4,70 @@
  */
 
 import * as vscode from 'vscode';
+import * as os from 'os';
+import * as path from 'path';
+import * as fs from 'fs';
 import { McpClient } from './mcpClient';
 import { ChatViewProvider } from './chatView';
 import type { Transcript, TranscriptContent } from './types';
+
+/**
+ * Track temp files opened for editing, mapping file path -> transcript info
+ * Used by extension.ts to sync saves back to MCP
+ */
+export interface EditableTranscriptInfo {
+  transcriptPath: string;
+  transcriptUri: string;
+  originalContent: string;
+  /** The header/metadata section (everything before and including the --- separator) */
+  header: string;
+  /** The original body content (for change detection) */
+  originalBody: string;
+}
+
+/**
+ * Parse transcript content to separate header (metadata) from body.
+ * The header includes title, metadata block, and the --- separator.
+ * Returns { header, body } where header should be preserved and body is editable.
+ */
+function parseTranscriptContent(content: string): { header: string; body: string } {
+  // Look for the --- separator that ends the metadata section
+  // The format is typically:
+  // # Title
+  // ## Metadata
+  // **Date**: ...
+  // **Time**: ...
+  // ---
+  // Body content here
+  
+  const separatorIndex = content.indexOf('\n---\n');
+  if (separatorIndex !== -1) {
+    // Include the --- line in the header
+    const header = content.substring(0, separatorIndex + 5); // +5 for '\n---\n'
+    const body = content.substring(separatorIndex + 5).trim();
+    return { header, body };
+  }
+  
+  // Also try just '---' at start of a line (might be at end of file or different formatting)
+  const lines = content.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() === '---') {
+      const header = lines.slice(0, i + 1).join('\n') + '\n';
+      const body = lines.slice(i + 1).join('\n').trim();
+      return { header, body };
+    }
+  }
+  
+  // No separator found - treat everything as body (shouldn't happen for valid transcripts)
+  return { header: '', body: content };
+}
+
+// Global map of temp file paths -> transcript info for save syncing
+const editableTranscriptFiles: Map<string, EditableTranscriptInfo> = new Map();
+
+export function getEditableTranscriptFiles(): Map<string, EditableTranscriptInfo> {
+  return editableTranscriptFiles;
+}
 
 /**
  * Text Document Content Provider for transcript content
@@ -97,6 +158,8 @@ export class TranscriptDetailViewProvider {
   private _chatProvider: ChatViewProvider | null = null;
   private _currentTranscripts: Map<string, { uri: string; transcript: Transcript }> = new Map();
   private _updatingTranscripts: Set<string> = new Set(); // Track transcripts being updated
+  private _entityLastFetched: Map<string, Date> = new Map(); // Track when entities were last fetched
+  private _transcriptLastFetched: Map<string, Date> = new Map(); // Track when transcripts were last fetched
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
 
@@ -140,6 +203,9 @@ export class TranscriptDetailViewProvider {
       // Re-read the transcript to get updated data
       const content: TranscriptContent = await this._client.readTranscript(transcriptUri);
       
+      // Track when transcript was fetched
+      this._transcriptLastFetched.set(transcriptUri, new Date());
+      
       // Update the stored transcript with fresh data (may include updatedAt)
       const updatedTranscript = { ...currentTranscript.transcript };
       
@@ -156,7 +222,8 @@ export class TranscriptDetailViewProvider {
       });
       
       // Update the panel with fresh content
-      panel.webview.html = this.getWebviewContent(updatedTranscript, content);
+      const lastFetched = this._transcriptLastFetched.get(transcriptUri);
+      panel.webview.html = this.getWebviewContent(updatedTranscript, content, lastFetched);
     } catch (error) {
       console.error(`Protokoll: Error refreshing transcript ${transcriptUri}:`, error);
       
@@ -352,9 +419,20 @@ export class TranscriptDetailViewProvider {
           case 'openSource':
             await this.handleOpenSource(currentTranscript.transcript, message.transcriptPath, message.transcriptUri || transcriptUri);
             break;
+          case 'editInEditor':
+            await this.handleEditInEditor(currentTranscript.transcript, message.transcriptPath, message.transcriptUri || transcriptUri);
+            break;
           case 'createEntityFromSelection':
             await this.handleCreateEntityFromSelection(message.selectedText, message.transcriptUri || transcriptUri);
             break;
+          case 'refreshTranscript': {
+            await this.refreshTranscript(transcriptUri);
+            const refreshPanel = this._panels.get(transcriptUri);
+            if (refreshPanel) {
+              refreshPanel.webview.postMessage({ command: 'refreshComplete' });
+            }
+            break;
+          }
         }
       },
       null
@@ -392,18 +470,53 @@ export class TranscriptDetailViewProvider {
     try {
       const content: TranscriptContent = await this._client.readTranscript(transcriptUri);
       
+      // Track when transcript was fetched
+      this._transcriptLastFetched.set(transcriptUri, new Date());
+      
       // Debug: Log if content is empty
       if (!content.text || content.text.trim().length === 0) {
         console.warn(`Protokoll: Empty content for transcript ${transcriptUri}`);
       }
       
-      panel.webview.html = this.getWebviewContent(transcript, content);
+      const lastFetched = this._transcriptLastFetched.get(transcriptUri);
+      panel.webview.html = this.getWebviewContent(transcript, content, lastFetched);
     } catch (error) {
       console.error(`Protokoll: Error loading transcript ${transcriptUri}:`, error);
       panel.webview.html = this.getErrorContent(
         error instanceof Error ? error.message : String(error)
       );
     }
+  }
+
+  /**
+   * Convert an absolute path to a relative path for the server
+   * Extracts the relative portion after '/notes/' or returns the path as-is if already relative
+   */
+  private convertToRelativePath(absolutePath: string): string {
+    // If it's already a relative path (doesn't start with / and no drive letter), return as-is
+    if (!absolutePath.startsWith('/') && !absolutePath.match(/^[A-Za-z]:/)) {
+      return absolutePath;
+    }
+
+    // Try to extract the relative portion after '/notes/'
+    const notesIndex = absolutePath.indexOf('/notes/');
+    if (notesIndex >= 0) {
+      const relativePath = absolutePath.substring(notesIndex + '/notes/'.length);
+      // Remove leading slashes
+      return relativePath.replace(/^[/\\]+/, '');
+    }
+
+    // If no '/notes/' found, try to extract just the filename or last few path segments
+    // Look for patterns like "2026/2/file.md" in the path
+    const pathParts = absolutePath.split(/[/\\]/);
+    // Try to find a year pattern (4 digits) and extract from there
+    const yearIndex = pathParts.findIndex(part => /^\d{4}$/.test(part));
+    if (yearIndex >= 0 && yearIndex < pathParts.length - 1) {
+      return pathParts.slice(yearIndex).join('/');
+    }
+
+    // Fallback: return just the filename
+    return pathParts[pathParts.length - 1] || absolutePath;
   }
 
   private async handleChangeProject(transcript: Transcript, transcriptUri: string): Promise<void> {
@@ -446,8 +559,9 @@ export class TranscriptDetailViewProvider {
         return; // User cancelled
       }
 
-      // Update transcript
-      const transcriptPath = transcript.path || transcript.filename;
+      // Update transcript - convert absolute path to relative path
+      const rawPath = transcript.path || transcript.filename;
+      const transcriptPath = this.convertToRelativePath(rawPath);
       
       // Log for debugging
       console.log(`Protokoll: Updating transcript with path: ${transcriptPath}, projectId: ${selected.id}`);
@@ -533,7 +647,7 @@ export class TranscriptDetailViewProvider {
 
       // Use edit_transcript tool to add the tag
       await this._client.callTool('protokoll_edit_transcript', {
-        transcriptPath: transcriptPath,
+        transcriptPath: this.convertToRelativePath(transcriptPath),
         tagsToAdd: [newTag.trim()],
       });
 
@@ -565,7 +679,7 @@ export class TranscriptDetailViewProvider {
     try {
       // Use edit_transcript tool to remove the tag
       await this._client.callTool('protokoll_edit_transcript', {
-        transcriptPath: transcriptPath,
+        transcriptPath: this.convertToRelativePath(transcriptPath),
         tagsToRemove: [tag],
       });
 
@@ -596,7 +710,7 @@ export class TranscriptDetailViewProvider {
 
     try {
       const result = await this._client.callTool('protokoll_edit_transcript', {
-        transcriptPath: transcriptPath,
+        transcriptPath: this.convertToRelativePath(transcriptPath),
         title: newTitle.trim(),
       }) as {
         success?: boolean;
@@ -708,7 +822,7 @@ export class TranscriptDetailViewProvider {
     try {
       // Use the new update_transcript_content tool to directly update the content
       await this._client.callTool('protokoll_update_transcript_content', {
-        transcriptPath: transcriptPath,
+        transcriptPath: this.convertToRelativePath(transcriptPath),
         content: newContent,
       });
 
@@ -746,6 +860,9 @@ export class TranscriptDetailViewProvider {
       // Read the entity resource
       const content = await this._client.readResource(entityUri);
       
+      // Track when entity was fetched
+      this._entityLastFetched.set(entityUri, new Date());
+      
       // Parse entity content to extract name for title
       const entityData = this.parseEntityContent(content.text);
       const entityName = entityData.name || entityId;
@@ -762,8 +879,9 @@ export class TranscriptDetailViewProvider {
         }
       );
 
-      // Display entity content
-      panel.webview.html = this.getEntityContent(entityType, entityId, content.text, entityData);
+      // Display entity content with last fetched time
+      const lastFetched = this._entityLastFetched.get(entityUri);
+      panel.webview.html = this.getEntityContent(entityType, entityId, content.text, entityData, lastFetched);
 
       // Track entity panel
       this._entityPanels.set(entityUri, panel);
@@ -775,18 +893,89 @@ export class TranscriptDetailViewProvider {
             case 'startChatFromInputEntity':
               await this.handleStartChatFromInputEntity(entityType, entityId, entityUri, message.message);
               break;
+            case 'refreshEntity':
+              await this.refreshEntity(entityUri);
+              break;
           }
         },
         null
       );
 
       // Clean up on dispose
-      panel.onDidDispose(() => {
+      panel.onDidDispose(async () => {
         this._entityPanels.delete(entityUri);
+        // Unsubscribe from entity resource when panel is closed
+        if (this._client) {
+          try {
+            await this._client.unsubscribeFromResource(entityUri);
+            console.log(`Protokoll: [ENTITY VIEW] ✅ Unsubscribed from entity: ${entityUri}`);
+          } catch (error) {
+            console.warn(`Protokoll: [ENTITY VIEW] ⚠️ Failed to unsubscribe from entity:`, error);
+          }
+        }
       }, null);
+
+      // Subscribe to this entity for change notifications
+      console.log(`Protokoll: [ENTITY VIEW] Subscribing to entity for change notifications: ${entityUri}`);
+      try {
+        await this._client.subscribeToResource(entityUri);
+        console.log(`Protokoll: [ENTITY VIEW] ✅ Successfully subscribed to entity: ${entityUri}`);
+      } catch (error) {
+        console.warn(`Protokoll: [ENTITY VIEW] ⚠️ Failed to subscribe to entity ${entityUri}:`, error);
+        // Continue anyway - subscription failure shouldn't prevent viewing
+      }
     } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to open entity: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * Refresh a specific entity view (public method for external access)
+   */
+  public async refreshEntity(entityUri: string): Promise<void> {
+    if (!this._client) {
+      return;
+    }
+
+    const panel = this._entityPanels.get(entityUri);
+    if (!panel) {
+      return;
+    }
+
+    try {
+      // Extract entity type and ID from URI
+      const uriMatch = entityUri.match(/protokoll:\/\/entity\/([^/]+)\/(.+)$/);
+      if (!uriMatch) {
+        console.warn(`Protokoll: [ENTITY VIEW] Invalid entity URI: ${entityUri}`);
+        return;
+      }
+
+      const entityType = uriMatch[1];
+      const entityId = decodeURIComponent(uriMatch[2]);
+
+      // Read the entity resource
+      const content = await this._client.readResource(entityUri);
+      
+      // Update last fetched time
+      this._entityLastFetched.set(entityUri, new Date());
+      
+      // Parse entity content
+      const entityData = this.parseEntityContent(content.text);
+      
+      // Update panel HTML with fresh content
+      const lastFetched = this._entityLastFetched.get(entityUri);
+      panel.webview.html = this.getEntityContent(entityType, entityId, content.text, entityData, lastFetched);
+      
+      // Notify webview that refresh is complete
+      panel.webview.postMessage({ command: 'refreshComplete' });
+      
+      console.log(`Protokoll: [ENTITY VIEW] ✅ Refreshed entity: ${entityUri}`);
+    } catch (error) {
+      console.error(`Protokoll: [ENTITY VIEW] ❌ Failed to refresh entity ${entityUri}:`, error);
+      vscode.window.showErrorMessage(
+        `Failed to refresh entity: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
@@ -860,6 +1049,73 @@ export class TranscriptDetailViewProvider {
       console.error('Protokoll: Error opening transcript content:', error);
       vscode.window.showErrorMessage(
         `Failed to open transcript content: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * Open transcript in a real VS Code editor for editing.
+   * This enables VS Code Speech extension dictation support.
+   * Only the body content is shown - metadata is preserved separately.
+   * Saves are synced back to the MCP server.
+   */
+  private async handleEditInEditor(transcript: Transcript, transcriptPath: string, transcriptUri: string): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    try {
+      // Fetch transcript content from MCP server
+      const content: TranscriptContent = await this._client.readTranscript(transcriptUri);
+      
+      // Parse content to separate header (metadata) from body
+      const { header, body } = parseTranscriptContent(content.text);
+      
+      // Create a temp file with title in filename for clear tab title
+      const title = transcript.title || transcript.filename || 'Transcript';
+      const safeTitle = title.replace(/[^a-zA-Z0-9_ -]/g, '').substring(0, 50);
+      const tempDir = os.tmpdir();
+      const tempFilePath = path.join(tempDir, `Editing - ${safeTitle}.md`);
+      
+      // Write only the body content to temp file (not the metadata header)
+      fs.writeFileSync(tempFilePath, body, 'utf8');
+      
+      // Track this file for save syncing, storing header separately
+      editableTranscriptFiles.set(tempFilePath, {
+        transcriptPath: this.convertToRelativePath(transcriptPath),
+        transcriptUri: transcriptUri,
+        originalContent: content.text,
+        header: header,
+        originalBody: body,
+      });
+      
+      // Open the temp file in VS Code editor
+      const document = await vscode.workspace.openTextDocument(tempFilePath);
+      await vscode.window.showTextDocument(document, {
+        preview: false,
+        viewColumn: vscode.ViewColumn.Beside,
+        preserveFocus: false,
+      });
+      
+      // Show Save & Close action
+      vscode.window.showInformationMessage(
+        `Editing: ${title}`,
+        'Save & Close'
+      ).then(async (action) => {
+        if (action === 'Save & Close') {
+          // Save the document
+          await document.save();
+          // Close the editor
+          await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+        }
+      });
+      
+      console.log(`Protokoll: Opened transcript body for editing: ${tempFilePath}`);
+    } catch (error) {
+      console.error('Protokoll: Error opening transcript for editing:', error);
+      vscode.window.showErrorMessage(
+        `Failed to open transcript for editing: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
@@ -1104,7 +1360,7 @@ export class TranscriptDetailViewProvider {
           
           // Update transcript content
           await this._client.callTool('protokoll_update_transcript_content', {
-            transcriptPath: transcriptPath,
+            transcriptPath: this.convertToRelativePath(transcriptPath),
             content: updatedContent,
           });
         } catch (updateError) {
@@ -1433,7 +1689,7 @@ export class TranscriptDetailViewProvider {
     classification?: Record<string, unknown>;
     topics?: string[];
     [key: string]: unknown;
-  }): string {
+  }, lastFetched?: Date): string {
     // Parse entity data if not provided
     if (!entityData) {
       entityData = this.parseEntityContent(content);
@@ -1622,8 +1878,10 @@ export class TranscriptDetailViewProvider {
         }
         .inline-chat-container {
             margin-top: 24px;
-            padding-top: 16px;
+            margin-bottom: 24px;
+            padding: 16px 0;
             border-top: 1px solid var(--vscode-panel-border);
+            border-bottom: 1px solid var(--vscode-panel-border);
         }
         .inline-chat-input-wrapper {
             display: flex;
@@ -1673,12 +1931,52 @@ export class TranscriptDetailViewProvider {
             opacity: 0.3;
             cursor: not-allowed;
         }
+        .entity-header {
+            position: relative;
+        }
+        .refresh-button {
+            position: absolute;
+            top: 0;
+            right: 0;
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: background-color 0.2s;
+        }
+        .refresh-button:hover {
+            background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .refresh-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .last-fetched {
+            font-size: 0.85em;
+            color: var(--vscode-descriptionForeground);
+            margin-top: 8px;
+            font-style: italic;
+        }
     </style>
 </head>
 <body>
     <div class="entity-header">
+        <button class="refresh-button" id="refresh-button" title="Refresh entity data">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M8 2V6L10 4M8 14V10L6 12M2 8H6L4 10M14 8H10L12 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5" fill="none"/>
+            </svg>
+            Refresh
+        </button>
         <div class="entity-type">${this.escapeHtml(entityType)}</div>
         <h1>${this.escapeHtml(entityName)}</h1>
+        ${lastFetched ? `<div class="last-fetched">Last fetched: ${this.escapeHtml(this.formatDate(lastFetched.toISOString()))}</div>` : ''}
     </div>
     ${metadataRows.length > 0 ? `
     <div class="metadata">
@@ -1807,19 +2105,48 @@ export class TranscriptDetailViewProvider {
             }
         }
         
+        // Set up refresh button listener
+        function setupRefreshButton() {
+            const refreshButton = document.getElementById('refresh-button');
+            if (refreshButton) {
+                refreshButton.addEventListener('click', function() {
+                    console.log('Protokoll Entity: Refresh button clicked');
+                    refreshButton.disabled = true;
+                    vscode.postMessage({
+                        command: 'refreshEntity'
+                    });
+                });
+            }
+        }
+        
         // Run setup immediately (script is at end of body, DOM should be ready)
         setupInlineChatListeners();
+        setupRefreshButton();
         
         // Also run on DOMContentLoaded as backup
         if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', setupInlineChatListeners);
+            document.addEventListener('DOMContentLoaded', function() {
+                setupInlineChatListeners();
+                setupRefreshButton();
+            });
         }
+        
+        // Handle refresh completion message from extension
+        window.addEventListener('message', event => {
+            const message = event.data;
+            if (message.command === 'refreshComplete') {
+                const refreshButton = document.getElementById('refresh-button');
+                if (refreshButton) {
+                    refreshButton.disabled = false;
+                }
+            }
+        });
     </script>
 </body>
 </html>`;
   }
 
-  public getWebviewContent(transcript: Transcript, content: TranscriptContent): string {
+  public getWebviewContent(transcript: Transcript, content: TranscriptContent, lastFetched?: Date): string {
     const text = content.text;
     const metadata: Record<string, string> = {};
     let transcriptText = text;
@@ -2051,8 +2378,9 @@ export class TranscriptDetailViewProvider {
         .project-corner {
             position: absolute;
             top: 0;
-            right: 0;
+            right: 100px;
             text-align: right;
+            z-index: 5;
         }
         .project-corner .project-info {
             display: flex;
@@ -2330,8 +2658,10 @@ export class TranscriptDetailViewProvider {
         }
         .inline-chat-container {
             margin-top: 24px;
-            padding-top: 16px;
+            margin-bottom: 24px;
+            padding: 16px 0;
             border-top: 1px solid var(--vscode-panel-border);
+            border-bottom: 1px solid var(--vscode-panel-border);
         }
         .inline-chat-input-wrapper {
             display: flex;
@@ -2381,10 +2711,47 @@ export class TranscriptDetailViewProvider {
             opacity: 0.3;
             cursor: not-allowed;
         }
+        .refresh-button {
+            position: absolute;
+            top: 0;
+            right: 0;
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: background-color 0.2s;
+            z-index: 10;
+        }
+        .refresh-button:hover {
+            background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .refresh-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .last-fetched {
+            font-size: 0.85em;
+            color: var(--vscode-descriptionForeground);
+            margin-top: 8px;
+            font-style: italic;
+        }
     </style>
 </head>
 <body>
     <div class="header">
+        <button class="refresh-button" id="refresh-button" title="Refresh transcript data">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M8 2V6L10 4M8 14V10L6 12M2 8H6L4 10M14 8H10L12 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5" fill="none"/>
+            </svg>
+            Refresh
+        </button>
         <h1 class="title-header">
             <span class="editable-title" id="title-display" onclick="startEditTitle()">${this.escapeHtml(transcript.title || transcript.filename)}</span>
             <span id="update-indicator" class="update-indicator">
@@ -2392,6 +2759,7 @@ export class TranscriptDetailViewProvider {
                 <span>Updating...</span>
             </span>
         </h1>
+        ${lastFetched ? `<div class="last-fetched">Last fetched: ${this.escapeHtml(this.formatDate(lastFetched.toISOString()))}</div>` : ''}
         <div class="title-actions" id="title-actions" style="display: none;">
             <button class="button" onclick="saveTitle()">Save</button>
             <button class="button button-secondary" onclick="cancelEditTitle()">Cancel</button>
@@ -2446,39 +2814,30 @@ export class TranscriptDetailViewProvider {
         </div>
         `).join('')}
     </div>
+    <div class="inline-chat-container" id="inline-chat-container">
+        <div class="inline-chat-input-wrapper">
+            <textarea 
+                class="inline-chat-input" 
+                id="inline-chat-input" 
+                placeholder="Type a message to make changes... (e.g., Change the title to &quot;Hello World&quot;)"
+                rows="1"
+            ></textarea>
+            <button type="button" class="inline-chat-send" id="inline-chat-send">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M1.5 1.5L14.5 8L1.5 14.5L3.5 8L1.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+            </button>
+        </div>
+    </div>
     <div class="transcript-content-wrapper">
         <div style="display: flex; gap: 8px; margin-bottom: 16px;">
-            <button class="edit-button" onclick="startEditTranscript()" id="edit-transcript-btn">Edit Transcript</button>
-        </div>
-        <div class="inline-chat-container" id="inline-chat-container">
-            <div class="inline-chat-input-wrapper">
-                <textarea 
-                    class="inline-chat-input" 
-                    id="inline-chat-input" 
-                    placeholder="Type a message to make changes... (e.g., Change the title to &quot;Hello World&quot;)"
-                    rows="1"
-                ></textarea>
-                <button type="button" class="inline-chat-send" id="inline-chat-send">
-                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                        <path d="M1.5 1.5L14.5 8L1.5 14.5L3.5 8L1.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                    </svg>
-                </button>
-            </div>
+            <button class="edit-button" onclick="editInEditor()" id="edit-in-editor-btn" title="Edit in VS Code editor (supports voice dictation)">Edit in Editor</button>
+            <button class="edit-button" onclick="openSource()" id="open-source-btn" title="View source (read-only)" style="opacity: 0.7;">View Source</button>
         </div>
         <div class="transcript-content" id="transcript-content-display">
             ${this.markdownToHtml(transcriptText)}
         </div>
         <button class="create-entity-button" id="create-entity-btn" onclick="createEntityFromSelection()">Create Entity</button>
-        <div id="transcript-content-edit" style="display: none;">
-            <textarea id="transcript-textarea">${this.escapeHtml(transcriptText)}</textarea>
-            <div style="margin-top: 8px;">
-                <button class="button" onclick="saveTranscript()">Save</button>
-                <button class="button button-secondary" onclick="cancelEditTranscript()">Cancel</button>
-            </div>
-        </div>
-        <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--vscode-panel-border);">
-            <button class="edit-button" onclick="openSource()" id="open-source-btn">Source</button>
-        </div>
     </div>
     ${this.renderEntityReferences(entityReferences)}
     <script>
@@ -2564,48 +2923,12 @@ export class TranscriptDetailViewProvider {
             actions.style.display = 'none';
         }
 
-        function startEditTranscript() {
-            const display = document.getElementById('transcript-content-display');
-            const edit = document.getElementById('transcript-content-edit');
-            const editBtn = document.getElementById('edit-transcript-btn');
-            
-            display.style.display = 'none';
-            edit.style.display = 'block';
-            editBtn.style.display = 'none';
-            
-            const textarea = document.getElementById('transcript-textarea');
-            textarea.focus();
-        }
-
-        function saveTranscript() {
-            const textarea = document.getElementById('transcript-textarea');
-            const newContent = textarea.value;
-            
-            // Disable the save button while saving
-            const saveBtn = document.querySelector('#transcript-content-edit .button');
-            if (saveBtn) {
-                saveBtn.disabled = true;
-                saveBtn.textContent = 'Saving...';
-            }
-            
+        function editInEditor() {
             vscode.postMessage({
-                command: 'editTranscript',
+                command: 'editInEditor',
                 transcriptPath: transcriptPath,
-                newContent: newContent
+                transcriptUri: transcriptUri
             });
-        }
-
-        function cancelEditTranscript() {
-            const display = document.getElementById('transcript-content-display');
-            const edit = document.getElementById('transcript-content-edit');
-            const editBtn = document.getElementById('edit-transcript-btn');
-            
-            display.style.display = 'block';
-            edit.style.display = 'none';
-            editBtn.style.display = 'block';
-            
-            const textarea = document.getElementById('transcript-textarea');
-            textarea.value = originalTranscriptContent;
         }
 
         function openEntity(entityType, entityId) {
@@ -2791,6 +3114,43 @@ export class TranscriptDetailViewProvider {
                 if (saveBtn) {
                     saveBtn.disabled = false;
                     saveBtn.textContent = 'Save';
+                }
+            }
+        });
+
+        // Set up refresh button listener
+        function setupRefreshButton() {
+            const refreshButton = document.getElementById('refresh-button');
+            if (refreshButton) {
+                refreshButton.addEventListener('click', function() {
+                    console.log('Protokoll Transcript: Refresh button clicked');
+                    refreshButton.disabled = true;
+                    vscode.postMessage({
+                        command: 'refreshTranscript'
+                    });
+                });
+            }
+        }
+
+        // Auto-focus the chat input when the view loads
+        document.addEventListener('DOMContentLoaded', () => {
+            setupRefreshButton();
+            const chatInput = document.getElementById('inline-chat-input');
+            if (chatInput) {
+                // Small delay to ensure the webview is fully rendered
+                setTimeout(() => {
+                    chatInput.focus();
+                }, 100);
+            }
+        });
+        
+        // Handle refresh completion message from extension
+        window.addEventListener('message', event => {
+            const message = event.data;
+            if (message.command === 'refreshComplete') {
+                const refreshButton = document.getElementById('refresh-button');
+                if (refreshButton) {
+                    refreshButton.disabled = false;
                 }
             }
         });
