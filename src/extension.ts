@@ -7,12 +7,14 @@ import { McpClient } from './mcpClient';
 import { TranscriptsViewProvider, TranscriptItem } from './transcriptsView';
 import { TranscriptDetailViewProvider } from './transcriptDetailView';
 import { ConnectionStatusViewProvider } from './connectionStatusView';
+import { ChatViewProvider } from './chatView';
 import type { Transcript, TranscriptContent } from './types';
 
 let mcpClient: McpClient | null = null;
 let transcriptsViewProvider: TranscriptsViewProvider | null = null;
 let transcriptDetailViewProvider: TranscriptDetailViewProvider | null = null;
 let connectionStatusViewProvider: ConnectionStatusViewProvider | null = null;
+let chatViewProvider: ChatViewProvider | null = null;
 
 export async function activate(context: vscode.ExtensionContext) {
   console.log('Protokoll extension is now active');
@@ -192,6 +194,9 @@ export async function activate(context: vscode.ExtensionContext) {
   if (mcpClient) {
     transcriptDetailViewProvider.setClient(mcpClient);
   }
+  if (chatViewProvider) {
+    transcriptDetailViewProvider.setChatProvider(chatViewProvider);
+  }
 
   connectionStatusViewProvider = new ConnectionStatusViewProvider(context);
   if (mcpClient) {
@@ -199,6 +204,11 @@ export async function activate(context: vscode.ExtensionContext) {
     connectionStatusViewProvider.setConnectionStatus(serverConnected, mcpClient.getSessionId());
   } else {
     connectionStatusViewProvider.setServerUrl(serverUrl);
+  }
+
+  chatViewProvider = new ChatViewProvider(context.extensionUri);
+  if (mcpClient) {
+    chatViewProvider.setClient(mcpClient);
   }
 
   // Register tree views
@@ -274,6 +284,9 @@ export async function activate(context: vscode.ExtensionContext) {
               connectionStatusViewProvider.setServerUrl(input.trim());
               connectionStatusViewProvider.setConnectionStatus(true, sessionId);
             }
+            if (chatViewProvider) {
+              chatViewProvider.setClient(mcpClient);
+            }
             vscode.window.showInformationMessage(`Protokoll: Connected to ${input.trim()}`);
           } else {
             vscode.window.showWarningMessage('Protokoll: Server is not responding');
@@ -288,6 +301,9 @@ export async function activate(context: vscode.ExtensionContext) {
               connectionStatusViewProvider.setClient(mcpClient);
               connectionStatusViewProvider.setServerUrl(input.trim());
               connectionStatusViewProvider.setConnectionStatus(false, null);
+            }
+            if (chatViewProvider) {
+              chatViewProvider.setClient(mcpClient);
             }
           }
         } catch (error) {
@@ -655,6 +671,17 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  const openChatCommand = vscode.commands.registerCommand(
+    'protokoll.openChat',
+    async () => {
+      if (!chatViewProvider) {
+        vscode.window.showErrorMessage('Chat view provider not initialized');
+        return;
+      }
+      await chatViewProvider.showChat();
+    }
+  );
+
   // Refresh transcripts when configuration changes
   const configWatcher = vscode.workspace.onDidChangeConfiguration(async (e) => {
     if (e.affectsConfiguration('protokoll.serverUrl')) {
@@ -736,6 +763,7 @@ export async function activate(context: vscode.ExtensionContext) {
     openTranscriptWithCommand,
     copyTranscriptUrlCommand,
     copySessionIdCommand,
+    openChatCommand,
     configWatcher,
     transcriptsTreeView,
     connectionStatusTreeView

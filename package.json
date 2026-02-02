@@ -97,6 +97,12 @@
         "command": "protokoll.copySessionId",
         "title": "Copy Session ID",
         "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.openChat",
+        "title": "Open Chat",
+        "icon": "$(comment-discussion)",
+        "category": "Protokoll"
       }
     ],
     "views": {
@@ -217,5 +223,7 @@
     "typescript": "^5.3.3",
     "vitest": "^2.0.0"
   },
-  "dependencies": {}
+  "dependencies": {
+    "openai": "^4.67.0"
+  }
 }

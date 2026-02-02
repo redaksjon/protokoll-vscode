@@ -402,6 +402,43 @@ export class McpClient {
   }
 
   /**
+   * List available MCP tools
+   */
+  async listTools(): Promise<Array<{
+    name: string;
+    description: string;
+    inputSchema: {
+      type: string;
+      properties: Record<string, unknown>;
+      required?: string[];
+    };
+  }>> {
+    const request: JsonRpcRequest = {
+      jsonrpc: '2.0',
+      id: Date.now(),
+      method: 'tools/list',
+    };
+
+    const response = await this.sendRequest(request);
+    
+    if (response.error) {
+      throw new Error(`Failed to list tools: ${response.error.message}`);
+    }
+
+    const result = response.result as { tools?: Array<{
+      name: string;
+      description: string;
+      inputSchema: {
+        type: string;
+        properties: Record<string, unknown>;
+        required?: string[];
+      };
+    }> };
+    
+    return result.tools || [];
+  }
+
+  /**
    * Call an MCP tool
    */
   async callTool(toolName: string, args: Record<string, unknown>): Promise<unknown> {

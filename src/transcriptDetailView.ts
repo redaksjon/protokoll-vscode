@@ -5,6 +5,7 @@
 
 import * as vscode from 'vscode';
 import { McpClient } from './mcpClient';
+import { ChatViewProvider } from './chatView';
 import type { Transcript, TranscriptContent } from './types';
 
 export class TranscriptDetailViewProvider {
@@ -12,10 +13,15 @@ export class TranscriptDetailViewProvider {
 
   private _panels: Map<string, vscode.WebviewPanel> = new Map();
   private _client: McpClient | null = null;
+  private _chatProvider: ChatViewProvider | null = null;
   private _currentTranscripts: Map<string, { uri: string; transcript: Transcript }> = new Map();
   private _updatingTranscripts: Set<string> = new Set(); // Track transcripts being updated
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
+
+  setChatProvider(chatProvider: ChatViewProvider): void {
+    this._chatProvider = chatProvider;
+  }
 
   /**
    * Get current transcript for a URI (for external access)
@@ -185,6 +191,9 @@ export class TranscriptDetailViewProvider {
             break;
           case 'showUpdateIndicator':
             // This is handled by the webview itself, but we can acknowledge it
+            break;
+          case 'reviewTranscription':
+            await this.handleReviewTranscription(currentTranscript.transcript, message.transcriptUri || transcriptUri);
             break;
         }
       },
@@ -513,6 +522,37 @@ export class TranscriptDetailViewProvider {
     } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to open entity: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async handleReviewTranscription(transcript: Transcript, transcriptUri: string): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    try {
+      // Get transcript info for context
+      const transcriptPath = transcript.path || transcript.filename;
+      const transcriptTitle = transcript.title || transcript.filename;
+      
+      // Open chat directly with transcript context - no feedback prompt
+      if (this._chatProvider) {
+        await this._chatProvider.showChat(undefined, transcriptUri, {
+          title: transcriptTitle,
+          path: transcriptPath,
+          filename: transcript.filename,
+          uri: transcriptUri,
+        });
+      } else {
+        // Fallback: open chat command
+        await vscode.commands.executeCommand('protokoll.openChat');
+      }
+      
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to open chat: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
@@ -1494,7 +1534,10 @@ export class TranscriptDetailViewProvider {
         `).join('')}
     </div>
     <div class="transcript-content-wrapper">
-        <button class="edit-button" onclick="startEditTranscript()" id="edit-transcript-btn">Edit Transcript</button>
+        <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+            <button class="edit-button" onclick="startEditTranscript()" id="edit-transcript-btn">Edit Transcript</button>
+            <button class="edit-button" onclick="reviewTranscription()" id="review-transcript-btn">Review Transcription</button>
+        </div>
         <div class="transcript-content" id="transcript-content-display">
             ${this.markdownToHtml(transcriptText)}
         </div>
@@ -1510,6 +1553,7 @@ export class TranscriptDetailViewProvider {
     <script>
         const vscode = acquireVsCodeApi();
         const transcriptPath = ${JSON.stringify(transcriptPath)};
+        const transcriptUri = ${JSON.stringify(transcript.uri)};
         const projectId = ${JSON.stringify(projectId)};
         const currentTags = ${JSON.stringify(tags)};
         const originalTranscriptText = ${JSON.stringify(transcriptText)};
@@ -1631,6 +1675,14 @@ export class TranscriptDetailViewProvider {
                 command: 'openEntity',
                 entityType: entityType,
                 entityId: entityId
+            });
+        }
+
+        function reviewTranscription() {
+            vscode.postMessage({
+                command: 'reviewTranscription',
+                transcriptPath: transcriptPath,
+                transcriptUri: transcriptUri
             });
         }
 
