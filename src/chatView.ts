@@ -25,7 +25,7 @@ export class ChatViewProvider {
   private _messageHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
   private _openaiApiKey: string | null = null;
   private _currentTranscript: TranscriptContext | null = null;
-  private _chatsViewProvider: any | null = null; // ChatsViewProvider type
+  private _chatsViewProvider: { registerChat: (id: string, title: string, transcriptUri?: string) => void; unregisterChat: (id: string) => void } | null = null;
   private _transcriptDetailProvider: { 
     getCurrentTranscript: (uri: string) => { uri: string; transcript: Transcript } | undefined;
     getAllOpenTranscripts?: () => Array<{ uri: string; transcript: Transcript }>;
@@ -37,7 +37,7 @@ export class ChatViewProvider {
   /**
    * Set reference to chats view provider for panel tracking
    */
-  setChatsViewProvider(provider: any): void {
+  setChatsViewProvider(provider: { registerChat: (id: string, title: string, transcriptUri?: string) => void; unregisterChat: (id: string) => void }): void {
     this._chatsViewProvider = provider;
   }
 

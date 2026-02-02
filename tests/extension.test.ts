@@ -63,6 +63,7 @@ describe('extension', () => {
         (vscode.window.showQuickPick as any).mockResolvedValue(undefined);
         (vscode.window.createTreeView as any).mockReturnValue({
             onDidChangeSelection: vi.fn(() => ({ dispose: vi.fn() })),
+            onDidChangeVisibility: vi.fn(() => ({ dispose: vi.fn() })),
         });
     });
 

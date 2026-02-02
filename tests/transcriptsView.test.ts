@@ -229,7 +229,7 @@ describe('TranscriptsViewProvider', () => {
             });
 
             await provider.refresh('/test');
-            const children = provider.getChildren();
+            const children = await provider.getChildren();
             
             expect(children.length).toBeGreaterThan(0);
             expect(children[0].type).toBe('year');
@@ -279,11 +279,11 @@ describe('TranscriptsViewProvider', () => {
             });
 
             await provider.refresh('/test');
-            const yearItems = provider.getChildren();
+            const yearItems = await provider.getChildren();
             const yearItem = yearItems.find(item => item.uri === 'year:2026');
             
             if (yearItem) {
-                const monthItems = provider.getChildren(yearItem);
+                const monthItems = await provider.getChildren(yearItem);
                 expect(monthItems.length).toBeGreaterThan(0);
                 expect(monthItems[0].type).toBe('month');
             }
@@ -293,7 +293,8 @@ describe('TranscriptsViewProvider', () => {
             provider.setClient(mockClient);
             provider.setProjectFilter('project-1');
             
-            const mockResponse: TranscriptsListResponse = {
+            // Mock response for the initial refresh() call from setProjectFilter
+            const mockResponseAll: TranscriptsListResponse = {
                 directory: '/test',
                 transcripts: [
                     {
@@ -324,6 +325,43 @@ describe('TranscriptsViewProvider', () => {
                 filters: {},
             };
 
+            // Mock response for the filtered refresh('/test') call - server should filter by projectId
+            const mockResponseFiltered: TranscriptsListResponse = {
+                directory: '/test',
+                transcripts: [
+                    {
+                        uri: 'protokoll://transcript/test1.md',
+                        path: '/test/test1.md',
+                        filename: 'test1.md',
+                        date: '2026-01-31',
+                        entities: {
+                            projects: [{ id: 'project-1', name: 'Project 1' }],
+                        },
+                    },
+                ],
+                pagination: {
+                    total: 1,
+                    limit: 100,
+                    offset: 0,
+                    hasMore: false,
+                },
+                filters: {},
+            };
+
+            // Mock for listResources call (if refresh tries to discover directory)
+            mockHttpRequest({
+                statusCode: 200,
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    result: {
+                        resources: [],
+                    },
+                }),
+            });
+
+            // First call from setProjectFilter's refresh() - may not have directory, so might not call listTranscripts
+            // But if it does, it should return filtered results since filter is set
             mockHttpRequest({
                 statusCode: 200,
                 body: JSON.stringify({
@@ -333,20 +371,36 @@ describe('TranscriptsViewProvider', () => {
                         contents: [{
                             uri: 'protokoll://transcripts?directory=/test',
                             mimeType: 'application/json',
-                            text: JSON.stringify(mockResponse),
+                            text: JSON.stringify(mockResponseFiltered),
+                        }],
+                    },
+                }),
+            });
+
+            // Second call from refresh('/test') with project filter - server should return filtered results
+            mockHttpRequest({
+                statusCode: 200,
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    result: {
+                        contents: [{
+                            uri: 'protokoll://transcripts?directory=/test',
+                            mimeType: 'application/json',
+                            text: JSON.stringify(mockResponseFiltered),
                         }],
                     },
                 }),
             });
 
             await provider.refresh('/test');
-            const yearItems = provider.getChildren();
+            const yearItems = await provider.getChildren();
             const yearItem = yearItems.find(item => item.uri === 'year:2026');
             
             if (yearItem) {
-                const monthItems = provider.getChildren(yearItem);
+                const monthItems = await provider.getChildren(yearItem);
                 if (monthItems.length > 0) {
-                    const transcriptItems = provider.getChildren(monthItems[0]);
+                    const transcriptItems = await provider.getChildren(monthItems[0]);
                     // Should only show transcripts for project-1
                     expect(transcriptItems.length).toBe(1);
                 }

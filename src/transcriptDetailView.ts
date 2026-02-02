@@ -60,7 +60,7 @@ class TranscriptContentProvider implements vscode.TextDocumentContentProvider {
     
     // Try to extract transcript URI from path and look it up
     // URI format: protokoll-transcript://transcript/{encoded-transcript-uri}/{filename} (read only)
-    const pathMatch = uri.path.match(/^\/transcript\/([^\/]+)/);
+    const pathMatch = uri.path.match(/^\/transcript\/([^/]+)/);
     if (pathMatch) {
       const encodedUri = pathMatch[1];
       console.log(`Protokoll: [CONTENT PROVIDER] Extracted encoded URI: ${encodedUri}`);
@@ -803,19 +803,6 @@ export class TranscriptDetailViewProvider {
     }
 
     try {
-      // Read entity to get current data
-      const content = await this._client.readResource(entityUri);
-      const entityData = this.parseEntityContent(content.text);
-      const entityName = entityData.name || entityId;
-
-      // Create entity context similar to transcript context
-      const entityContext = {
-        type: entityType,
-        id: entityId,
-        name: entityName,
-        uri: entityUri,
-      };
-
       // Start a new chat with the message already sent
       // For entities, we'll need to adapt the chat provider to handle entity context
       // For now, let's use a simplified approach - open chat and send message
@@ -859,7 +846,7 @@ export class TranscriptDetailViewProvider {
       
       // Open the virtual document
       const document = await vscode.workspace.openTextDocument(virtualUri);
-      const editor = await vscode.window.showTextDocument(document, {
+      await vscode.window.showTextDocument(document, {
         preview: false,
         viewColumn: vscode.ViewColumn.Beside,
         preserveFocus: false,
@@ -1858,8 +1845,8 @@ export class TranscriptDetailViewProvider {
     // Parse tags from the content
     const tags = this.parseTags(text);
 
-    // Parse routing information from the content
-    const routing = this.parseRouting(text);
+    // Parse routing information from the content (reserved for future use)
+    this.parseRouting(text);
 
     // Parse entity references from the content
     const entityReferences = this.parseEntityReferences(text);

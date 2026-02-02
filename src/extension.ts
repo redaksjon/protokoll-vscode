@@ -137,7 +137,7 @@ export async function activate(context: vscode.ExtensionContext) {
             console.log(`Protokoll: [EXTENSION] Notification URI: ${params.uri}`);
             if (transcriptDetailViewProvider) {
               // Refresh the transcript view if it's open
-              let currentTranscript = transcriptDetailViewProvider.getCurrentTranscript(params.uri);
+              const currentTranscript = transcriptDetailViewProvider.getCurrentTranscript(params.uri);
               if (currentTranscript) {
                 console.log('Protokoll: [EXTENSION] ✅ Transcript is currently open, refreshing...');
                 console.log(`Protokoll: [EXTENSION] Stored URI: ${currentTranscript.uri}`);
@@ -154,7 +154,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 // Try to read the transcript to get its metadata and see if we can match it
                 try {
                   if (mcpClient) {
-                    const content = await mcpClient.readTranscript(params.uri);
+                    await mcpClient.readTranscript(params.uri);
                     // Extract filename from URI: protokoll://transcript/../2026/1/file.md -> file.md
                     const uriFilename = params.uri.split('/').pop() || '';
                     
@@ -162,7 +162,6 @@ export async function activate(context: vscode.ExtensionContext) {
                     // This is a heuristic - if the notification is for a transcript we don't recognize,
                     // it might be a renamed version of one we have open
                     for (const openTranscript of allOpenTranscripts) {
-                      const openFilename = openTranscript.transcript.filename || '';
                       // If the URIs are in similar paths (same year/month), it might be a rename
                       const uriPath = params.uri.replace('protokoll://transcript/', '');
                       const openPath = openTranscript.uri.replace('protokoll://transcript/', '');
