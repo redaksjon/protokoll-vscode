@@ -686,6 +686,56 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  const filterByStatusCommand = vscode.commands.registerCommand(
+    'protokoll.filterByStatus',
+    async () => {
+      if (!transcriptsViewProvider) {
+        vscode.window.showErrorMessage('Transcripts view provider not initialized.');
+        return;
+      }
+
+      // Get current filter
+      const currentFilter = transcriptsViewProvider.getStatusFilter();
+
+      // Define available statuses
+      const statuses = [
+        { id: 'initial', label: 'Initial', icon: '📝' },
+        { id: 'enhanced', label: 'Enhanced', icon: '✨' },
+        { id: 'reviewed', label: 'Reviewed', icon: '👀' },
+        { id: 'in_progress', label: 'In Progress', icon: '🔄' },
+        { id: 'closed', label: 'Closed', icon: '✅' },
+        { id: 'archived', label: 'Archived', icon: '📦' },
+      ];
+
+      // Build quick pick items
+      const items: Array<vscode.QuickPickItem & { id: string | null }> = [
+        {
+          label: '$(clear-all) Show All Statuses',
+          description: 'Remove status filter',
+          id: null,
+        },
+        ...statuses.map(status => ({
+          label: `${status.icon} ${status.label}`,
+          description: currentFilter === status.id ? '(currently selected)' : '',
+          id: status.id,
+        })),
+      ];
+
+      const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Filter transcripts by status',
+        title: 'Select Status Filter',
+      });
+
+      if (selected) {
+        transcriptsViewProvider.setStatusFilter(selected.id);
+        const message = selected.id
+          ? `Filtering transcripts by status: ${selected.label}`
+          : 'Showing all transcripts';
+        vscode.window.showInformationMessage(`Protokoll: ${message}`);
+      }
+    }
+  );
+
   const sortTranscriptsCommand = vscode.commands.registerCommand(
     'protokoll.sortTranscripts',
     async () => {
@@ -1287,6 +1337,7 @@ export async function activate(context: vscode.ExtensionContext) {
     openTranscriptInNewTabCommand,
     refreshTranscriptsCommand,
     filterByProjectCommand,
+    filterByStatusCommand,
     sortTranscriptsCommand,
     startNewSessionCommand,
     renameTranscriptCommand,

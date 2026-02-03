@@ -53,6 +53,12 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.filterByStatus",
+        "title": "Filter by Status",
+        "icon": "$(list-filter)",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.sortTranscripts",
         "title": "Sort",
         "icon": "$(sort-precedence)",
@@ -170,6 +176,11 @@
         },
         {
           "command": "protokoll.filterByProject",
+          "when": "view == protokollTranscripts",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.filterByStatus",
           "when": "view == protokollTranscripts",
           "group": "navigation"
         },

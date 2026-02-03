@@ -433,6 +433,18 @@ export class TranscriptDetailViewProvider {
             }
             break;
           }
+          case 'changeStatus':
+            await this.handleChangeStatus(currentTranscript.transcript, message.transcriptPath, transcriptUri);
+            break;
+          case 'addTask':
+            await this.handleAddTask(currentTranscript.transcript, message.transcriptPath, transcriptUri);
+            break;
+          case 'completeTask':
+            await this.handleCompleteTask(currentTranscript.transcript, message.transcriptPath, message.taskId, transcriptUri);
+            break;
+          case 'deleteTask':
+            await this.handleDeleteTask(currentTranscript.transcript, message.transcriptPath, message.taskId, transcriptUri);
+            break;
         }
       },
       null
@@ -698,6 +710,142 @@ export class TranscriptDetailViewProvider {
     } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to remove tag: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async handleChangeStatus(transcript: Transcript, transcriptPath: string, transcriptUri: string): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    const statuses = ['initial', 'enhanced', 'reviewed', 'in_progress', 'closed', 'archived'];
+    const statusLabels: Record<string, string> = {
+      initial: 'Initial',
+      enhanced: 'Enhanced',
+      reviewed: 'Reviewed',
+      in_progress: 'In Progress',
+      closed: 'Closed',
+      archived: 'Archived',
+    };
+
+    const selected = await vscode.window.showQuickPick(
+      statuses.map(s => ({ label: statusLabels[s], value: s })),
+      { placeHolder: 'Select new status' }
+    );
+
+    if (!selected) {
+      return;
+    }
+
+    try {
+      await this._client.callTool('protokoll_set_status', {
+        transcriptPath: this.convertToRelativePath(transcriptPath),
+        status: selected.value,
+      });
+
+      vscode.window.showInformationMessage(`Protokoll: Status changed to "${selected.label}"`);
+
+      // Refresh the transcript view
+      setTimeout(async () => {
+        await this.refreshTranscript(transcriptUri);
+      }, 500);
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to change status: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async handleAddTask(transcript: Transcript, transcriptPath: string, transcriptUri: string): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    const description = await vscode.window.showInputBox({
+      prompt: 'Enter task description',
+      placeHolder: 'Follow up on...',
+    });
+
+    if (!description || !description.trim()) {
+      return;
+    }
+
+    try {
+      await this._client.callTool('protokoll_create_task', {
+        transcriptPath: this.convertToRelativePath(transcriptPath),
+        description: description.trim(),
+      });
+
+      vscode.window.showInformationMessage('Protokoll: Task added');
+
+      // Refresh the transcript view
+      setTimeout(async () => {
+        await this.refreshTranscript(transcriptUri);
+      }, 500);
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to add task: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async handleCompleteTask(transcript: Transcript, transcriptPath: string, taskId: string, transcriptUri: string): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    try {
+      await this._client.callTool('protokoll_complete_task', {
+        transcriptPath: this.convertToRelativePath(transcriptPath),
+        taskId,
+      });
+
+      // Refresh the transcript view
+      setTimeout(async () => {
+        await this.refreshTranscript(transcriptUri);
+      }, 500);
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to complete task: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async handleDeleteTask(transcript: Transcript, transcriptPath: string, taskId: string, transcriptUri: string): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    const confirm = await vscode.window.showWarningMessage(
+      'Are you sure you want to delete this task?',
+      'Delete',
+      'Cancel'
+    );
+
+    if (confirm !== 'Delete') {
+      return;
+    }
+
+    try {
+      await this._client.callTool('protokoll_delete_task', {
+        transcriptPath: this.convertToRelativePath(transcriptPath),
+        taskId,
+      });
+
+      vscode.window.showInformationMessage('Protokoll: Task deleted');
+
+      // Refresh the transcript view
+      setTimeout(async () => {
+        await this.refreshTranscript(transcriptUri);
+      }, 500);
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to delete task: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
@@ -2267,6 +2415,11 @@ export class TranscriptDetailViewProvider {
     const createdAt = parsedMetadata.createdAt || transcript.createdAt;
     const updatedAt = parsedMetadata.updatedAt || transcript.updatedAt;
 
+    // Get status and tasks - prefer parsed metadata, fallback to transcript object
+    const status = parsedMetadata.status || transcript.status || 'reviewed';
+    const tasks = parsedMetadata.tasks || transcript.tasks || [];
+    const openTasks = tasks.filter((t: { status: string }) => t.status === 'open');
+
     // Get project info - prefer parsed metadata, fallback to transcript object
     const projectId = parsedMetadata.projectId || transcript.entities?.projects?.[0]?.id || '';
     const projectName = parsedMetadata.project || transcript.entities?.projects?.[0]?.name || '';
@@ -2549,6 +2702,99 @@ export class TranscriptDetailViewProvider {
             background-color: var(--vscode-button-hoverBackground);
             color: var(--vscode-button-foreground);
         }
+        /* Status badge styles */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: 500;
+            cursor: pointer;
+        }
+        .status-badge:hover {
+            opacity: 0.9;
+        }
+        .status-badge.initial { background-color: #6c757d; color: white; }
+        .status-badge.enhanced { background-color: #17a2b8; color: white; }
+        .status-badge.reviewed { background-color: #007bff; color: white; }
+        .status-badge.in_progress { background-color: #ffc107; color: #333; }
+        .status-badge.closed { background-color: #28a745; color: white; }
+        .status-badge.archived { background-color: #6c757d; color: white; }
+        /* Tasks section styles */
+        .tasks-section {
+            background-color: var(--vscode-editor-inactiveSelectionBackground);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 4px;
+            padding: 16px;
+            margin-bottom: 24px;
+        }
+        .tasks-section h3 {
+            margin-top: 0;
+            margin-bottom: 12px;
+            color: var(--vscode-textLink-foreground);
+            font-size: 1em;
+        }
+        .task-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            padding: 8px;
+            border-radius: 4px;
+            margin-bottom: 8px;
+            background-color: var(--vscode-editor-background);
+        }
+        .task-item:last-child {
+            margin-bottom: 0;
+        }
+        .task-item.done {
+            opacity: 0.7;
+        }
+        .task-item.done .task-description {
+            text-decoration: line-through;
+        }
+        .task-checkbox {
+            width: 18px;
+            height: 18px;
+            margin-top: 2px;
+            cursor: pointer;
+        }
+        .task-description {
+            flex: 1;
+            font-size: 0.95em;
+        }
+        .task-delete-btn {
+            background: none;
+            border: none;
+            color: var(--vscode-descriptionForeground);
+            cursor: pointer;
+            font-size: 1.2em;
+            padding: 0 4px;
+            opacity: 0.6;
+        }
+        .task-delete-btn:hover {
+            opacity: 1;
+            color: var(--vscode-errorForeground);
+        }
+        .task-add-btn {
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: none;
+            padding: 6px 12px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 0.9em;
+            margin-top: 8px;
+        }
+        .task-add-btn:hover {
+            background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .empty-tasks {
+            color: var(--vscode-descriptionForeground);
+            font-style: italic;
+            margin-bottom: 8px;
+        }
         .entity-type-label {
             font-weight: 600;
             color: var(--vscode-descriptionForeground);
@@ -2796,6 +3042,14 @@ export class TranscriptDetailViewProvider {
         </div>
         ` : ''}
         <div class="metadata-row">
+            <div class="metadata-label">Status:</div>
+            <div class="metadata-value">
+                <span class="status-badge ${this.escapeHtml(status)}" onclick="changeStatus()" title="Click to change status">
+                    ${this.getStatusIcon(status)} ${this.getStatusLabel(status)}
+                </span>
+            </div>
+        </div>
+        <div class="metadata-row">
             <div class="metadata-label">Tags:</div>
             <div class="metadata-value">
                 ${tags.map(tag => `
@@ -2813,6 +3067,20 @@ export class TranscriptDetailViewProvider {
             <div class="metadata-value">${this.escapeHtml(value)}</div>
         </div>
         `).join('')}
+    </div>
+    <div class="tasks-section">
+        <h3>Tasks ${openTasks.length > 0 ? `(${openTasks.length} open)` : ''}</h3>
+        ${tasks.length === 0 ? `
+            <div class="empty-tasks">No tasks</div>
+        ` : tasks.map((task: { id: string; description: string; status: string }) => `
+            <div class="task-item ${task.status}">
+                <input type="checkbox" class="task-checkbox" ${task.status === 'done' ? 'checked' : ''} 
+                    onchange="toggleTask('${this.escapeHtml(task.id)}')" />
+                <span class="task-description">${this.escapeHtml(task.description)}</span>
+                <button class="task-delete-btn" onclick="deleteTask('${this.escapeHtml(task.id)}')" title="Delete task">×</button>
+            </div>
+        `).join('')}
+        <button class="task-add-btn" onclick="addTask()">+ Add Task</button>
     </div>
     <div class="inline-chat-container" id="inline-chat-container">
         <div class="inline-chat-input-wrapper">
@@ -2871,6 +3139,36 @@ export class TranscriptDetailViewProvider {
                 command: 'removeTag',
                 transcriptPath: transcriptPath,
                 tag: tag
+            });
+        }
+
+        function changeStatus() {
+            vscode.postMessage({
+                command: 'changeStatus',
+                transcriptPath: transcriptPath
+            });
+        }
+
+        function addTask() {
+            vscode.postMessage({
+                command: 'addTask',
+                transcriptPath: transcriptPath
+            });
+        }
+
+        function toggleTask(taskId) {
+            vscode.postMessage({
+                command: 'completeTask',
+                transcriptPath: transcriptPath,
+                taskId: taskId
+            });
+        }
+
+        function deleteTask(taskId) {
+            vscode.postMessage({
+                command: 'deleteTask',
+                transcriptPath: transcriptPath,
+                taskId: taskId
             });
         }
 
@@ -3327,6 +3625,8 @@ export class TranscriptDetailViewProvider {
     projectId?: string;
     createdAt?: string;
     updatedAt?: string;
+    status?: string;
+    tasks?: Array<{ id: string; description: string; status: string; created: string; completed?: string }>;
   } {
     const metadata: {
       date?: string;
@@ -3335,7 +3635,55 @@ export class TranscriptDetailViewProvider {
       projectId?: string;
       createdAt?: string;
       updatedAt?: string;
+      status?: string;
+      tasks?: Array<{ id: string; description: string; status: string; created: string; completed?: string }>;
     } = {};
+
+    // Try to parse YAML frontmatter first for status and tasks
+    const frontmatterMatch = text.match(/^---\s*\n([\s\S]*?)\n---/);
+    if (frontmatterMatch) {
+      const frontmatter = frontmatterMatch[1];
+      
+      // Parse status from frontmatter
+      const statusMatch = frontmatter.match(/^status:\s*(\w+)/m);
+      if (statusMatch) {
+        metadata.status = statusMatch[1].trim();
+      }
+      
+      // Parse tasks array from frontmatter (simple YAML parsing)
+      const tasksMatch = frontmatter.match(/^tasks:\s*\n((?:\s+-[\s\S]*?(?=\n\w|\n---|\s*$))+)/m);
+      if (tasksMatch) {
+        const tasksYaml = tasksMatch[1];
+        const tasks: Array<{ id: string; description: string; status: string; created: string; completed?: string }> = [];
+        
+        // Split by task items (lines starting with "  - id:")
+        const taskBlocks = tasksYaml.split(/\n\s+-\s+id:/);
+        for (const block of taskBlocks) {
+          if (!block.trim()) continue;
+          const taskText = block.startsWith('id:') ? block : 'id:' + block;
+          
+          const idMatch = taskText.match(/id:\s*(\S+)/);
+          const descMatch = taskText.match(/description:\s*(.+?)(?:\n|$)/);
+          const statusMatch2 = taskText.match(/status:\s*(\w+)/);
+          const createdMatch = taskText.match(/created:\s*["']?([^"'\n]+)["']?/);
+          const completedMatch = taskText.match(/completed:\s*["']?([^"'\n]+)["']?/);
+          
+          if (idMatch && descMatch && statusMatch2 && createdMatch) {
+            tasks.push({
+              id: idMatch[1].trim(),
+              description: descMatch[1].trim().replace(/^["']|["']$/g, ''),
+              status: statusMatch2[1].trim(),
+              created: createdMatch[1].trim(),
+              completed: completedMatch ? completedMatch[1].trim() : undefined,
+            });
+          }
+        }
+        
+        if (tasks.length > 0) {
+          metadata.tasks = tasks;
+        }
+      }
+    }
 
     // Try to find metadata in the Metadata section
     const metadataSection = text.match(/## Metadata\s*\n([\s\S]*?)(?:\n##|$)/);
@@ -3380,6 +3728,30 @@ export class TranscriptDetailViewProvider {
     }
 
     return metadata;
+  }
+
+  private getStatusIcon(status: string): string {
+    const icons: Record<string, string> = {
+      initial: '📝',
+      enhanced: '✨',
+      reviewed: '👀',
+      in_progress: '🔄',
+      closed: '✅',
+      archived: '📦',
+    };
+    return icons[status] || '❓';
+  }
+
+  private getStatusLabel(status: string): string {
+    const labels: Record<string, string> = {
+      initial: 'Initial',
+      enhanced: 'Enhanced',
+      reviewed: 'Reviewed',
+      in_progress: 'In Progress',
+      closed: 'Closed',
+      archived: 'Archived',
+    };
+    return labels[status] || status;
   }
 
   private parseRouting(text: string): {

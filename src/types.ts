@@ -2,6 +2,32 @@
  * Type definitions for Protokoll MCP resources
  */
 
+/**
+ * Transcript lifecycle status
+ */
+export type TranscriptStatus = 'initial' | 'enhanced' | 'reviewed' | 'in_progress' | 'closed' | 'archived';
+
+/**
+ * Status transition record
+ */
+export interface StatusTransition {
+  from: TranscriptStatus;
+  to: TranscriptStatus;
+  at: string;
+}
+
+/**
+ * Task attached to a transcript
+ */
+export interface Task {
+  id: string;
+  description: string;
+  status: 'open' | 'done';
+  created: string;
+  changed?: string;
+  completed?: string;
+}
+
 export interface Transcript {
   uri: string;
   path: string;
@@ -12,6 +38,10 @@ export interface Transcript {
   hasRawTranscript?: boolean;
   createdAt?: string; // Date when transcript was added to the system
   updatedAt?: string; // Date when transcript content was last updated
+  // Lifecycle fields
+  status?: TranscriptStatus;
+  history?: StatusTransition[];
+  tasks?: Task[];
   entities?: {
     people?: Array<{ id: string; name: string }>;
     projects?: Array<{ id: string; name: string }>;

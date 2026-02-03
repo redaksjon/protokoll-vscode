@@ -22,6 +22,7 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   private transcripts: Transcript[] = [];
   private directory: string = '';
   private selectedProjectFilter: string | null = null; // Project ID to filter by
+  private selectedStatusFilter: string | null = null; // Status to filter by
   private sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc' = 'date-desc'; // Default: date descending
   private treeView: vscode.TreeView<TranscriptItem> | null = null;
 
@@ -63,6 +64,20 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
   getProjectFilter(): string | null {
     return this.selectedProjectFilter;
+  }
+
+  setStatusFilter(status: string | null): void {
+    this.selectedStatusFilter = status;
+    // Refresh the transcript list with the new filter
+    this.refresh().catch(err => {
+      vscode.window.showErrorMessage(
+        `Failed to refresh transcripts: ${err instanceof Error ? err.message : String(err)}`
+      );
+    });
+  }
+
+  getStatusFilter(): string | null {
+    return this.selectedStatusFilter;
   }
 
   setSortOrder(sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc'): void {
@@ -308,9 +323,18 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   private groupTranscriptsByYearMonth(): Record<string, Record<string, Transcript[]>> {
     const grouped: Record<string, Record<string, Transcript[]>> = {};
 
-    // Note: Filtering is now done server-side, but we keep this as a fallback
-    // The server should already have filtered by projectId if selectedProjectFilter is set
-    const filteredTranscripts = this.transcripts;
+    // Note: Project filtering is done server-side
+    // Status filtering is done client-side since status is in transcript content
+    let filteredTranscripts = this.transcripts;
+    
+    // Apply status filter if set
+    if (this.selectedStatusFilter) {
+      filteredTranscripts = filteredTranscripts.filter(t => {
+        // Default status is 'reviewed' if not set
+        const transcriptStatus = t.status || 'reviewed';
+        return transcriptStatus === this.selectedStatusFilter;
+      });
+    }
 
     for (const transcript of filteredTranscripts) {
       const yearMonth = this.extractYearMonth(transcript);
@@ -537,23 +561,61 @@ export class TranscriptItem extends vscode.TreeItem {
       this.tooltip = `${label} ${year}`;
     } else {
       this.contextValue = 'transcript';
-      // Show different icons for transcripts vs notes
-      // Transcripts have raw transcript data (audio transcriptions)
-      // Notes don't have raw transcript data (manually written)
-      if (transcript?.hasRawTranscript) {
+      
+      // Get status and use appropriate icon
+      const status = transcript?.status || 'reviewed';
+      
+      // Show different icons based on status (primary), then type (secondary)
+      if (status === 'in_progress') {
+        this.iconPath = new vscode.ThemeIcon('sync', new vscode.ThemeColor('charts.yellow'));
+      } else if (status === 'closed') {
+        this.iconPath = new vscode.ThemeIcon('check', new vscode.ThemeColor('charts.green'));
+      } else if (status === 'archived') {
+        this.iconPath = new vscode.ThemeIcon('archive', new vscode.ThemeColor('disabledForeground'));
+      } else if (transcript?.hasRawTranscript) {
         this.iconPath = new vscode.ThemeIcon('mic'); // Microphone icon for transcripts
       } else {
         this.iconPath = new vscode.ThemeIcon('note'); // Note icon for notes
       }
-      // Show project as description (secondary text/column)
-      if (project) {
-        this.description = project;
+      
+      // Build description: status indicator + project
+      const statusLabels: Record<string, string> = {
+        initial: '📝',
+        enhanced: '✨',
+        reviewed: '👀',
+        in_progress: '🔄',
+        closed: '✅',
+        archived: '📦',
+      };
+      const statusEmoji = statusLabels[status] || '';
+      const projectStr = project || '';
+      
+      // Show status emoji as prefix to project (or alone if no project)
+      if (projectStr) {
+        this.description = `${statusEmoji} ${projectStr}`;
+      } else if (statusEmoji && status !== 'reviewed') {
+        // Only show status emoji if not the default "reviewed" status
+        this.description = statusEmoji;
       }
+      
+      // Build detailed tooltip
       const projectNames = transcript?.entities?.projects?.map(p => p.name).join(', ') || project || '';
       const typeLabel = transcript?.hasRawTranscript ? 'Transcript' : 'Note';
+      const statusLabel = {
+        initial: 'Initial',
+        enhanced: 'Enhanced',
+        reviewed: 'Reviewed',
+        in_progress: 'In Progress',
+        closed: 'Closed',
+        archived: 'Archived',
+      }[status] || status;
+      
+      const openTasks = transcript?.tasks?.filter(t => t.status === 'open').length || 0;
+      const taskInfo = openTasks > 0 ? `\nOpen tasks: ${openTasks}` : '';
+      
       this.tooltip = projectNames 
-        ? `${transcript?.title || transcript?.filename} (${typeLabel})\nProject: ${projectNames}`
-        : `${transcript?.title || transcript?.filename} (${typeLabel})`;
+        ? `${transcript?.title || transcript?.filename} (${typeLabel})\nStatus: ${statusLabel}\nProject: ${projectNames}${taskInfo}`
+        : `${transcript?.title || transcript?.filename} (${typeLabel})\nStatus: ${statusLabel}${taskInfo}`;
     }
   }
 }
