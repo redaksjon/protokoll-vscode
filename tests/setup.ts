@@ -12,7 +12,20 @@ const mockVscode = {
     showErrorMessage: vi.fn(),
     showInputBox: vi.fn(),
     showQuickPick: vi.fn(),
-    createTreeView: vi.fn(),
+    createTreeView: vi.fn(() => ({
+      onDidChangeSelection: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeVisibility: vi.fn(() => ({ dispose: vi.fn() })),
+      reveal: vi.fn(),
+      dispose: vi.fn(),
+    })),
+    createOutputChannel: vi.fn(() => ({
+      append: vi.fn(),
+      appendLine: vi.fn(),
+      clear: vi.fn(),
+      show: vi.fn(),
+      hide: vi.fn(),
+      dispose: vi.fn(),
+    })),
     createWebviewPanel: vi.fn(() => ({
       webview: {
         html: '',
@@ -31,6 +44,15 @@ const mockVscode = {
       update: vi.fn(),
     })),
     onDidChangeConfiguration: vi.fn(() => ({
+      dispose: vi.fn(),
+    })),
+    onDidSaveTextDocument: vi.fn(() => ({
+      dispose: vi.fn(),
+    })),
+    onDidCloseTextDocument: vi.fn(() => ({
+      dispose: vi.fn(),
+    })),
+    registerTextDocumentContentProvider: vi.fn(() => ({
       dispose: vi.fn(),
     })),
     fs: {

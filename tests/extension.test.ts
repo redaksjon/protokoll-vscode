@@ -63,6 +63,7 @@ describe('extension', () => {
         (vscode.window.showQuickPick as any).mockResolvedValue(undefined);
         (vscode.window.createTreeView as any).mockReturnValue({
             onDidChangeSelection: vi.fn(() => ({ dispose: vi.fn() })),
+            onDidChangeVisibility: vi.fn(() => ({ dispose: vi.fn() })),
         });
     });
 
@@ -965,7 +966,7 @@ describe('extension', () => {
 
             (vscode.workspace.onDidChangeConfiguration as any).mockImplementation(
                 (handler: (e: any) => Promise<void>) => {
-                    configChangeHandler = handler;
+                    configChangeHandler = handler as (e: any) => Promise<void>;
                     return { dispose: vi.fn() };
                 }
             );
@@ -990,24 +991,25 @@ describe('extension', () => {
 
             await activate(mockContext);
 
-            if (configChangeHandler) {
-                const mockEvent = {
-                    affectsConfiguration: vi.fn((config: string) => config === 'protokoll.serverUrl'),
-                };
+            expect(configChangeHandler).toBeDefined();
+            if (!configChangeHandler) return;
+            
+            const mockEvent = {
+                affectsConfiguration: vi.fn((config: string) => config === 'protokoll.serverUrl'),
+            };
 
-                mockHttpRequest({
-                    statusCode: 200,
-                    headers: { 'mcp-session-id': 'new-session' },
-                    body: JSON.stringify({
-                        jsonrpc: '2.0',
-                        id: 1,
-                        result: {},
-                    }),
-                });
+            mockHttpRequest({
+                statusCode: 200,
+                headers: { 'mcp-session-id': 'new-session' },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    result: {},
+                }),
+            });
 
-                await configChangeHandler(mockEvent);
-                expect(mockEvent.affectsConfiguration).toHaveBeenCalled();
-            }
+            await (configChangeHandler as (e: any) => Promise<void>)(mockEvent);
+            expect(mockEvent.affectsConfiguration).toHaveBeenCalled();
         });
 
         it('should not reconnect when config change is not serverUrl', async () => {
@@ -1015,7 +1017,7 @@ describe('extension', () => {
 
             (vscode.workspace.onDidChangeConfiguration as any).mockImplementation(
                 (handler: (e: any) => Promise<void>) => {
-                    configChangeHandler = handler;
+                    configChangeHandler = handler as (e: any) => Promise<void>;
                     return { dispose: vi.fn() };
                 }
             );
@@ -1040,15 +1042,16 @@ describe('extension', () => {
 
             await activate(mockContext);
 
-            if (configChangeHandler) {
-                const mockEvent = {
-                    affectsConfiguration: vi.fn((config: string) => config === 'protokoll.otherSetting'),
-                };
+            expect(configChangeHandler).toBeDefined();
+            if (!configChangeHandler) return;
+            
+            const mockEvent = {
+                affectsConfiguration: vi.fn((config: string) => config === 'protokoll.otherSetting'),
+            };
 
-                await configChangeHandler(mockEvent);
-                // Should not attempt to reconnect
-                expect(mockEvent.affectsConfiguration).toHaveBeenCalled();
-            }
+            await (configChangeHandler as (e: any) => Promise<void>)(mockEvent);
+            // Should not attempt to reconnect
+            expect(mockEvent.affectsConfiguration).toHaveBeenCalled();
         });
     });
 

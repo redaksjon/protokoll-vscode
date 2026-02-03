@@ -318,16 +318,21 @@ export class McpClient {
 
   /**
    * List transcripts from a directory
+   * If directory is not provided, uses the server's configured outputDirectory
    */
-  async listTranscripts(directory: string, options?: {
+  async listTranscripts(directory?: string, options?: {
     startDate?: string;
     endDate?: string;
     limit?: number;
     offset?: number;
+    projectId?: string;
   }): Promise<TranscriptsListResponse> {
     // Build the transcripts list URI
     const params = new URLSearchParams();
-    params.set('directory', directory);
+    // Only include directory if provided (server will use configured outputDirectory as fallback)
+    if (directory) {
+      params.set('directory', directory);
+    }
     if (options?.startDate) {
       params.set('startDate', options.startDate);
     }
@@ -340,8 +345,12 @@ export class McpClient {
     if (options?.offset !== undefined) {
       params.set('offset', String(options.offset));
     }
+    if (options?.projectId) {
+      params.set('projectId', options.projectId);
+    }
 
-    const uri = `protokoll://transcripts?${params.toString()}`;
+    const queryString = params.toString();
+    const uri = queryString ? `protokoll://transcripts?${queryString}` : 'protokoll://transcripts';
     const resource = await this.readResource(uri);
     
     return JSON.parse(resource.text) as TranscriptsListResponse;
@@ -399,6 +408,43 @@ export class McpClient {
   async startNewSession(): Promise<void> {
     this.sessionId = null;
     await this.initialize();
+  }
+
+  /**
+   * List available MCP tools
+   */
+  async listTools(): Promise<Array<{
+    name: string;
+    description: string;
+    inputSchema: {
+      type: string;
+      properties: Record<string, unknown>;
+      required?: string[];
+    };
+  }>> {
+    const request: JsonRpcRequest = {
+      jsonrpc: '2.0',
+      id: Date.now(),
+      method: 'tools/list',
+    };
+
+    const response = await this.sendRequest(request);
+    
+    if (response.error) {
+      throw new Error(`Failed to list tools: ${response.error.message}`);
+    }
+
+    const result = response.result as { tools?: Array<{
+      name: string;
+      description: string;
+      inputSchema: {
+        type: string;
+        properties: Record<string, unknown>;
+        required?: string[];
+      };
+    }> };
+    
+    return result.tools || [];
   }
 
   /**
