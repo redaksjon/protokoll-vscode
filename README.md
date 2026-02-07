@@ -2,18 +2,41 @@
 
 A VS Code extension for viewing Protokoll transcripts and entities via the HTTP MCP server.
 
+**[📖 View Full Documentation](https://redaksjon.github.io/protokoll-vscode/)**
+
 ## Features
 
 - **View Transcripts**: Browse and view transcripts from your Protokoll server
 - **Transcript Details**: View full transcript content with metadata in a formatted view
+- **Filter & Sort**: Filter by project or status, sort by date, title, or duration
+- **Chat View**: Browse conversation transcripts separately
+- **Quick Actions**: Rename, move to project, copy URL, and more via context menus
 - **Server Configuration**: Easy configuration of the Protokoll HTTP MCP server URL
 
 ## Requirements
 
 - VS Code 1.90.0 or higher
+- Node.js 24.0.0 or higher
 - A running Protokoll HTTP MCP server (default: `http://127.0.0.1:3001`)
 
 ## Installation
+
+### For Users
+
+Download the latest `.vsix` file from the [GitHub Releases](https://github.com/redaksjon/protokoll-vscode/releases) page.
+
+**Install via VS Code UI:**
+1. Open VS Code
+2. Press `Cmd+Shift+P` (Mac) or `Ctrl+Shift+P` (Windows/Linux)
+3. Type "Extensions: Install from VSIX..."
+4. Select the downloaded `protokoll-vscode-*.vsix` file
+
+**Install via Command Line:**
+```bash
+code --install-extension protokoll-vscode-0.1.1-dev.0.vsix
+```
+
+### For Developers
 
 1. Clone this repository
 2. Run `npm install`
@@ -61,19 +84,63 @@ npm run watch
 npm run lint
 ```
 
-## Building
+## Building & Publishing
+
+### Building the Extension
 
 ```bash
 # Install dependencies
 npm install
 
-# Compile
-npm run compile
+# Build (lint + compile)
+npm run build
 
-# Package extension (requires vsce)
-npm install -g @vscode/vsce
-vsce package
+# Watch for changes during development
+npm run watch
 ```
+
+### Packaging for Distribution
+
+```bash
+# Package into .vsix file
+npm run package
+
+# Or build + package in one step
+npm run publish
+```
+
+This will create a `protokoll-vscode-<version>.vsix` file in the project root.
+
+### Publishing a Release
+
+The extension is distributed via GitHub Releases. To publish a new version:
+
+1. **Update version** in `package.json`
+2. **Build and package**:
+   ```bash
+   npm run publish
+   ```
+3. **Create a git tag**:
+   ```bash
+   git tag v0.1.1
+   git push origin v0.1.1
+   ```
+4. **Create a GitHub Release** and attach the `.vsix` file
+
+### Using kodrdriv
+
+If you're using the `kodrdriv` workflow:
+
+```bash
+# From the workspace root
+kodrdriv tree publish --sendit
+
+# Or for just this package
+cd protokoll-vscode
+kodrdriv publish --sendit
+```
+
+The `npm run publish` script will automatically run during the kodrdriv publish process.
 
 ## License
 

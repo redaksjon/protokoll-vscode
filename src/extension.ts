@@ -686,6 +686,56 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  const filterByStatusCommand = vscode.commands.registerCommand(
+    'protokoll.filterByStatus',
+    async () => {
+      if (!transcriptsViewProvider) {
+        vscode.window.showErrorMessage('Transcripts view provider not initialized.');
+        return;
+      }
+
+      // Get current filters
+      const currentFilters = transcriptsViewProvider.getStatusFilters();
+
+      // Define available statuses
+      const statuses = [
+        { id: 'initial', label: 'Initial', icon: '📝' },
+        { id: 'enhanced', label: 'Enhanced', icon: '✨' },
+        { id: 'reviewed', label: 'Reviewed', icon: '👀' },
+        { id: 'in_progress', label: 'In Progress', icon: '🔄' },
+        { id: 'closed', label: 'Closed', icon: '✅' },
+        { id: 'archived', label: 'Archived', icon: '📦' },
+      ];
+
+      // Build quick pick items with checkboxes
+      const items: Array<vscode.QuickPickItem & { id: string }> = statuses.map(status => ({
+        label: `${status.icon} ${status.label}`,
+        id: status.id,
+        picked: currentFilters.has(status.id),
+      }));
+
+      const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Select statuses to show (uncheck to hide)',
+        title: 'Filter transcripts by status',
+        canPickMany: true,
+      });
+
+      if (selected !== undefined) {
+        // Update the filter with selected statuses
+        const newFilters = new Set(selected.map(item => item.id));
+        transcriptsViewProvider.setStatusFilters(newFilters);
+        
+        const count = newFilters.size;
+        const message = count === statuses.length
+          ? 'Showing all statuses'
+          : count === 0
+          ? 'No statuses selected - no transcripts will be shown'
+          : `Showing ${count} status${count === 1 ? '' : 'es'}`;
+        vscode.window.showInformationMessage(`Protokoll: ${message}`);
+      }
+    }
+  );
+
   const sortTranscriptsCommand = vscode.commands.registerCommand(
     'protokoll.sortTranscripts',
     async () => {
@@ -1287,6 +1337,7 @@ export async function activate(context: vscode.ExtensionContext) {
     openTranscriptInNewTabCommand,
     refreshTranscriptsCommand,
     filterByProjectCommand,
+    filterByStatusCommand,
     sortTranscriptsCommand,
     startNewSessionCommand,
     renameTranscriptCommand,
