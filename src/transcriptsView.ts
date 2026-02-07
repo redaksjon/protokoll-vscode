@@ -260,17 +260,16 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
       const transcripts = dayGroups[dateKey] || [];
       
       return transcripts.map((t: Transcript) => {
-        // Debug logging to see what we're getting
-        if (t.uri.includes('Claude Skills')) {
-          log('TranscriptsViewProvider: Transcript data', {
-            uri: t.uri,
-            title: t.title,
-            hasEntities: !!t.entities,
-            entities: t.entities,
-            hasProjects: !!t.entities?.projects,
-            projectsLength: t.entities?.projects?.length
-          });
-        }
+        // Debug logging to see what we're getting - log ALL transcripts to diagnose title issue
+        log('TranscriptsViewProvider: Transcript data', {
+          uri: t.uri,
+          title: t.title,
+          filename: t.filename,
+          hasEntities: !!t.entities,
+          entities: t.entities,
+          hasProjects: !!t.entities?.projects,
+          projectsLength: t.entities?.projects?.length
+        });
         
         const projectNames = t.entities?.projects?.map((p: { id: string; name: string }) => p.name).join(', ') || '';
         const title = t.title || t.filename;
