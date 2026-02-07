@@ -22,7 +22,7 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   private transcripts: Transcript[] = [];
   private directory: string = '';
   private selectedProjectFilter: string | null = null; // Project ID to filter by
-  private selectedStatusFilter: string | null = null; // Status to filter by
+  private selectedStatusFilters: Set<string> = new Set(['initial', 'enhanced', 'reviewed', 'in_progress', 'closed']); // Statuses to show (archived excluded by default)
   private sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc' = 'date-desc'; // Default: date descending
   private treeView: vscode.TreeView<TranscriptItem> | null = null;
 
@@ -66,8 +66,8 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     return this.selectedProjectFilter;
   }
 
-  setStatusFilter(status: string | null): void {
-    this.selectedStatusFilter = status;
+  setStatusFilters(statuses: Set<string>): void {
+    this.selectedStatusFilters = statuses;
     // Refresh the transcript list with the new filter
     this.refresh().catch(err => {
       vscode.window.showErrorMessage(
@@ -76,8 +76,8 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     });
   }
 
-  getStatusFilter(): string | null {
-    return this.selectedStatusFilter;
+  getStatusFilters(): Set<string> {
+    return this.selectedStatusFilters;
   }
 
   setSortOrder(sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc'): void {
@@ -322,14 +322,12 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     // Status filtering is done client-side since status is in transcript content
     let filteredTranscripts = this.transcripts;
     
-    // Apply status filter if set
-    if (this.selectedStatusFilter) {
-      filteredTranscripts = filteredTranscripts.filter(t => {
-        // Default status is 'reviewed' if not set
-        const transcriptStatus = t.status || 'reviewed';
-        return transcriptStatus === this.selectedStatusFilter;
-      });
-    }
+    // Apply status filters - only show transcripts with selected statuses
+    filteredTranscripts = filteredTranscripts.filter(t => {
+      // Default status is 'reviewed' if not set
+      const transcriptStatus = t.status || 'reviewed';
+      return this.selectedStatusFilters.has(transcriptStatus);
+    });
 
     for (const transcript of filteredTranscripts) {
       const yearMonth = this.extractYearMonth(transcript);
@@ -568,15 +566,11 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   private groupTranscriptsByDay(): Record<string, Transcript[]> {
     const grouped: Record<string, Transcript[]> = {};
 
-    let filteredTranscripts = this.transcripts;
-    
-    // Apply status filter if set
-    if (this.selectedStatusFilter) {
-      filteredTranscripts = filteredTranscripts.filter(t => {
-        const transcriptStatus = t.status || 'reviewed';
-        return transcriptStatus === this.selectedStatusFilter;
-      });
-    }
+    // Apply status filters - only show transcripts with selected statuses
+    const filteredTranscripts = this.transcripts.filter(t => {
+      const transcriptStatus = t.status || 'reviewed';
+      return this.selectedStatusFilters.has(transcriptStatus);
+    });
 
     for (const transcript of filteredTranscripts) {
       const date = this.getTranscriptDate(transcript);
@@ -667,17 +661,24 @@ export class TranscriptItem extends vscode.TreeItem {
       // Get status and use appropriate icon
       const status = transcript?.status || 'reviewed';
       
-      // Show different icons based on status (primary), then type (secondary)
-      if (status === 'in_progress') {
-        this.iconPath = new vscode.ThemeIcon('sync', new vscode.ThemeColor('charts.yellow'));
+      // Show color-coded circles based on status (matching detail page colors)
+      // Detail page colors: initial=#6c757d, enhanced=#17a2b8, reviewed=#007bff, 
+      // in_progress=#ffc107, closed=#28a745, archived=#6c757d
+      if (status === 'initial') {
+        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
+      } else if (status === 'enhanced') {
+        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.blue')); // Cyan/teal closest to blue
+      } else if (status === 'reviewed') {
+        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.blue'));
+      } else if (status === 'in_progress') {
+        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.yellow'));
       } else if (status === 'closed') {
-        this.iconPath = new vscode.ThemeIcon('check', new vscode.ThemeColor('charts.green'));
+        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.green'));
       } else if (status === 'archived') {
-        this.iconPath = new vscode.ThemeIcon('archive', new vscode.ThemeColor('disabledForeground'));
-      } else if (transcript?.hasRawTranscript) {
-        this.iconPath = new vscode.ThemeIcon('mic'); // Microphone icon for transcripts
+        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
       } else {
-        this.iconPath = new vscode.ThemeIcon('note'); // Note icon for notes
+        // Fallback for unknown status
+        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
       }
       
       // Note: description is set by the caller in getChildren() to show project info

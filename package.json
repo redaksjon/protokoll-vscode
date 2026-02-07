@@ -1,5 +1,5 @@
 {
-  "name": "@redaksjon/protokoll-vscode",
+  "name": "protokoll-vscode",
   "displayName": "Protokoll",
   "description": "VS Code extension for viewing Protokoll transcripts and entities via HTTP MCP server",
   "version": "0.1.1-dev.0",
@@ -293,7 +293,12 @@
     "build": "npm run lint && npm run compile",
     "clean": "rm -rf out",
     "precommit": "npm run lint && npm run build && npm run test",
-    "prepublishOnly": "npm run clean && npm run build"
+    "prepublishOnly": "npm run clean && npm run build",
+    "package": "vsce package",
+    "publish": "npm run build && npm run package",
+    "docs:dev": "cd docs && npm run dev",
+    "docs:build": "cd docs && npm install && npm run build",
+    "docs:preview": "cd docs && npm run preview"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
@@ -301,6 +306,7 @@
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
     "@vitest/coverage-v8": "^2.0.0",
+    "@vscode/vsce": "^3.2.1",
     "eslint": "^8.57.0",
     "typescript": "^5.3.3",
     "vitest": "^2.0.0"

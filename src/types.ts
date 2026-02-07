@@ -40,6 +40,8 @@ export interface Transcript {
   updatedAt?: string; // Date when transcript content was last updated
   // Lifecycle fields
   status?: TranscriptStatus;
+  openTasksCount?: number;
+  contentSize?: number;
   history?: StatusTransition[];
   tasks?: Task[];
   entities?: {

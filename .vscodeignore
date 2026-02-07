@@ -1,11 +1,40 @@
-.vscode-test/
+# Build artifacts
 .vscode/**
-.vscode-test-web/**
+.vscode-test/**
 src/**
 .gitignore
 .yarnrc
-vscode/**
-tsconfig.json
+vsc-extension-quickstart.md
+**/tsconfig.json
+**/.eslintrc.json
 **/*.map
 **/*.ts
-!out/**/*.js
+
+# Test files
+tests/**
+coverage/**
+*.test.ts
+*.test.js
+vitest.config.js
+
+# Documentation website
+docs/**
+DEPLOYMENT_CHECKLIST.md
+GITHUB_PAGES_SETUP.md
+QUICKSTART.md
+
+# Output and temp files
+output/**
+.kodrdriv*
+
+# Development files
+.github/**
+.cursor/**
+plans/**
+*.vsix
+
+# Node modules (keep only production dependencies)
+node_modules/**/test/**
+node_modules/**/tests/**
+node_modules/**/*.md
+node_modules/**/.bin/**

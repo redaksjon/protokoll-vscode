@@ -464,6 +464,9 @@ export class TranscriptDetailViewProvider {
           case 'changeProject':
             await this.handleChangeProject(currentTranscript.transcript, transcriptUri);
             break;
+          case 'changeDate':
+            await this.handleChangeDate(currentTranscript.transcript, message.transcriptPath, transcriptUri);
+            break;
           case 'addTag':
             await this.handleAddTag(currentTranscript.transcript, message.transcriptPath, transcriptUri);
             break;
@@ -693,6 +696,92 @@ export class TranscriptDetailViewProvider {
     } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to change project: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async handleChangeDate(transcript: Transcript, transcriptPath: string, transcriptUri: string): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    try {
+      // Prompt user for new date
+      const dateInput = await vscode.window.showInputBox({
+        prompt: 'Enter new date for transcript (YYYY-MM-DD)',
+        placeHolder: '2026-01-15',
+        validateInput: (value) => {
+          if (!value) {
+            return 'Date is required';
+          }
+          // Validate date format
+          const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+          if (!dateRegex.test(value)) {
+            return 'Invalid date format. Use YYYY-MM-DD (e.g., 2026-01-15)';
+          }
+          // Validate it's a valid date
+          const date = new Date(value);
+          if (isNaN(date.getTime())) {
+            return 'Invalid date';
+          }
+          return null;
+        },
+      });
+
+      if (!dateInput) {
+        return; // User cancelled
+      }
+
+      // Convert absolute path to relative path
+      const rawPath = transcript.path || transcript.filename;
+      const relativePath = this.convertToRelativePath(rawPath);
+      
+      // Log for debugging
+      console.log(`Protokoll: Changing transcript date with path: ${relativePath}, newDate: ${dateInput}`);
+      
+      // Show progress
+      await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: 'Changing transcript date...',
+        cancellable: false,
+      }, async () => {
+        try {
+          const result = await this._client!.callTool('protokoll_change_transcript_date', {
+            transcriptPath: relativePath,
+            newDate: dateInput,
+          }) as { success?: boolean; moved?: boolean; outputPath?: string; message?: string };
+          
+          console.log(`Protokoll: Change date result:`, result);
+          
+          if (result.moved) {
+            vscode.window.showInformationMessage(
+              `Protokoll: Transcript moved to ${result.outputPath}. The transcript may no longer appear in the current view.`
+            );
+          } else {
+            vscode.window.showInformationMessage(
+              result.message || 'Transcript date updated'
+            );
+          }
+        } catch (toolError) {
+          console.error(`Protokoll: Error calling protokoll_change_transcript_date:`, toolError);
+          throw toolError;
+        }
+      });
+
+      // Refresh the transcripts list view
+      await vscode.commands.executeCommand('protokoll.refreshTranscripts');
+
+      // Close the current detail view since the transcript may have moved
+      const panel = this._panels.get(transcriptUri);
+      if (panel) {
+        panel.dispose();
+        this._panels.delete(transcriptUri);
+        this._currentTranscripts.delete(transcriptUri);
+      }
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to change transcript date: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
@@ -2536,16 +2625,48 @@ export class TranscriptDetailViewProvider {
             cursor: pointer;
             padding: 4px 8px;
             border-radius: 3px;
-            display: inline-block;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
             min-width: 200px;
         }
         .title-header .editable-title:hover {
             background-color: var(--vscode-list-hoverBackground);
         }
+        .title-header .editable-title:hover .edit-icon {
+            opacity: 0.5;
+        }
         .title-header .editable-title.editing {
             background-color: var(--vscode-input-background);
             border: 1px solid var(--vscode-input-border);
             padding: 4px 8px;
+        }
+        .edit-icon {
+            color: var(--vscode-descriptionForeground);
+            opacity: 0.3;
+            flex-shrink: 0;
+            transition: opacity 0.2s;
+        }
+        .edit-icon-small {
+            color: var(--vscode-descriptionForeground);
+            opacity: 0.3;
+            margin-left: 6px;
+            vertical-align: middle;
+            transition: opacity 0.2s;
+        }
+        .editable-date {
+            cursor: pointer;
+            padding: 2px 4px;
+            border-radius: 3px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .editable-date:hover {
+            background-color: var(--vscode-list-hoverBackground);
+        }
+        .editable-date:hover .edit-icon-small {
+            opacity: 0.6;
         }
         .title-header .title-input,
         #transcript-textarea {
@@ -2582,36 +2703,32 @@ export class TranscriptDetailViewProvider {
             min-height: 60px;
             display: block;
         }
-        .project-corner {
-            position: absolute;
-            top: 0;
-            right: 100px;
-            text-align: right;
-            z-index: 5;
+        .project-section {
+            margin-bottom: 8px;
+            margin-top: 4px;
         }
-        .project-corner .project-info {
+        .project-section .project-info {
             display: flex;
             align-items: center;
             gap: 8px;
             flex-wrap: wrap;
-            justify-content: flex-end;
         }
-        .project-corner .project-name {
+        .project-section .project-name {
             font-weight: 600;
-            font-size: 0.95em;
+            font-size: 0.85em;
+            color: var(--vscode-descriptionForeground);
         }
-        .project-corner .project-name.clickable {
+        .project-section .project-name.clickable {
             cursor: pointer;
             padding: 4px 8px;
             border-radius: 3px;
             display: inline-block;
         }
-        .project-corner .project-name.clickable:hover {
+        .project-section .project-name.clickable:hover {
             background-color: var(--vscode-list-hoverBackground);
         }
-        .project-corner .button {
+        .project-section .button {
             margin-left: 0;
-            margin-top: 4px;
         }
         .metadata {
             background-color: var(--vscode-editor-inactiveSelectionBackground);
@@ -2930,15 +3047,18 @@ export class TranscriptDetailViewProvider {
         }
         .kbd-hint {
             display: inline-block;
-            font-size: 0.75em;
-            padding: 2px 6px;
-            margin-left: 8px;
-            background-color: var(--vscode-input-background);
-            border: 1px solid var(--vscode-input-border);
-            border-radius: 3px;
-            font-family: monospace;
-            color: var(--vscode-descriptionForeground);
+            font-size: 0.65em;
+            padding: 1px 5px;
+            margin-left: 6px;
+            background-color: rgba(0, 0, 0, 0.15);
+            border: 1px solid rgba(0, 0, 0, 0.3);
+            border-radius: 2px;
+            font-family: var(--vscode-font-family);
+            font-weight: 600;
+            color: #000000;
             opacity: 0.7;
+            vertical-align: middle;
+            letter-spacing: 0.5px;
         }
         .button {
             background-color: var(--vscode-button-background);
@@ -3064,20 +3184,7 @@ export class TranscriptDetailViewProvider {
             </svg>
             Refresh
         </button>
-        <h1 class="title-header">
-            <span class="editable-title" id="title-display" onclick="startEditTitle()">${this.escapeHtml(transcript.title || transcript.filename)}</span>
-            <span class="kbd-hint">T</span>
-            <span id="update-indicator" class="update-indicator">
-                <span class="spinner"></span>
-                <span>Updating...</span>
-            </span>
-        </h1>
-        ${lastFetched ? `<div class="last-fetched">Last fetched: ${this.escapeHtml(this.formatDate(lastFetched.toISOString()))}</div>` : ''}
-        <div class="title-actions" id="title-actions" style="display: none;">
-            <button class="button" onclick="saveTitle()">Save (Ctrl+Enter)</button>
-            <button class="button button-secondary" onclick="cancelEditTitle()">Cancel (Esc)</button>
-        </div>
-        <div class="project-corner">
+        <div class="project-section">
             ${projectName ? `
                 <div class="project-info">
                     <span class="project-name clickable" onclick="changeProject()">${this.escapeHtml(projectName)}</span>
@@ -3090,12 +3197,39 @@ export class TranscriptDetailViewProvider {
                 </div>
             `}
         </div>
+        <h1 class="title-header">
+            <span class="editable-title" id="title-display" onclick="startEditTitle()">
+                ${this.escapeHtml(transcript.title || transcript.filename)}
+                <svg class="edit-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M11.5 1.5L14.5 4.5L5 14H2V11L11.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path d="M10 3L13 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span class="kbd-hint">T</span>
+            </span>
+            <span id="update-indicator" class="update-indicator">
+                <span class="spinner"></span>
+                <span>Updating...</span>
+            </span>
+        </h1>
+        ${lastFetched ? `<div class="last-fetched">Last fetched: ${this.escapeHtml(this.formatDate(lastFetched.toISOString()))}</div>` : ''}
+        <div class="title-actions" id="title-actions" style="display: none;">
+            <button class="button" onclick="saveTitle()">Save (Ctrl+Enter)</button>
+            <button class="button button-secondary" onclick="cancelEditTitle()">Cancel (Esc)</button>
+        </div>
     </div>
     <div class="metadata">
         <h2>Transcript Metadata</h2>
         <div class="metadata-row">
             <div class="metadata-label">Date/Time:</div>
-            <div class="metadata-value">${this.escapeHtml(dateTime)}</div>
+            <div class="metadata-value">
+                <span class="editable-date" onclick="changeDate()" title="Click to change transcript date">
+                    ${this.escapeHtml(dateTime)}
+                    <svg class="edit-icon-small" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M11.5 1.5L14.5 4.5L5 14H2V11L11.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M10 3L13 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </span>
+            </div>
         </div>
         ${createdAt ? `
         <div class="metadata-row">
@@ -3187,6 +3321,13 @@ export class TranscriptDetailViewProvider {
         function changeProject() {
             vscode.postMessage({
                 command: 'changeProject',
+                transcriptPath: transcriptPath
+            });
+        }
+
+        function changeDate() {
+            vscode.postMessage({
+                command: 'changeDate',
                 transcriptPath: transcriptPath
             });
         }

@@ -694,8 +694,8 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      // Get current filter
-      const currentFilter = transcriptsViewProvider.getStatusFilter();
+      // Get current filters
+      const currentFilters = transcriptsViewProvider.getStatusFilters();
 
       // Define available statuses
       const statuses = [
@@ -707,30 +707,30 @@ export async function activate(context: vscode.ExtensionContext) {
         { id: 'archived', label: 'Archived', icon: '📦' },
       ];
 
-      // Build quick pick items
-      const items: Array<vscode.QuickPickItem & { id: string | null }> = [
-        {
-          label: '$(clear-all) Show All Statuses',
-          description: 'Remove status filter',
-          id: null,
-        },
-        ...statuses.map(status => ({
-          label: `${status.icon} ${status.label}`,
-          description: currentFilter === status.id ? '(currently selected)' : '',
-          id: status.id,
-        })),
-      ];
+      // Build quick pick items with checkboxes
+      const items: Array<vscode.QuickPickItem & { id: string }> = statuses.map(status => ({
+        label: `${status.icon} ${status.label}`,
+        id: status.id,
+        picked: currentFilters.has(status.id),
+      }));
 
       const selected = await vscode.window.showQuickPick(items, {
-        placeHolder: 'Filter transcripts by status',
-        title: 'Select Status Filter',
+        placeHolder: 'Select statuses to show (uncheck to hide)',
+        title: 'Filter transcripts by status',
+        canPickMany: true,
       });
 
-      if (selected) {
-        transcriptsViewProvider.setStatusFilter(selected.id);
-        const message = selected.id
-          ? `Filtering transcripts by status: ${selected.label}`
-          : 'Showing all transcripts';
+      if (selected !== undefined) {
+        // Update the filter with selected statuses
+        const newFilters = new Set(selected.map(item => item.id));
+        transcriptsViewProvider.setStatusFilters(newFilters);
+        
+        const count = newFilters.size;
+        const message = count === statuses.length
+          ? 'Showing all statuses'
+          : count === 0
+          ? 'No statuses selected - no transcripts will be shown'
+          : `Showing ${count} status${count === 1 ? '' : 'es'}`;
         vscode.window.showInformationMessage(`Protokoll: ${message}`);
       }
     }
