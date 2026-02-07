@@ -185,7 +185,7 @@ describe('TranscriptsViewProvider', () => {
     });
 
     describe('getChildren', () => {
-        it('should return year items at root level', async () => {
+        it('should return day items at root level', async () => {
             provider.setClient(mockClient);
             
             const mockResponse: TranscriptsListResponse = {
@@ -232,10 +232,10 @@ describe('TranscriptsViewProvider', () => {
             const children = await provider.getChildren();
             
             expect(children.length).toBeGreaterThan(0);
-            expect(children[0].type).toBe('year');
+            expect(children[0].type).toBe('day');
         });
 
-        it('should return month items for year', async () => {
+        it('should return transcript items for day', async () => {
             provider.setClient(mockClient);
             
             const mockResponse: TranscriptsListResponse = {
@@ -251,7 +251,7 @@ describe('TranscriptsViewProvider', () => {
                         uri: 'protokoll://transcript/test2.md',
                         path: '/test/test2.md',
                         filename: 'test2.md',
-                        date: '2026-02-28',
+                        date: '2026-01-31',
                     },
                 ],
                 pagination: {
@@ -279,13 +279,13 @@ describe('TranscriptsViewProvider', () => {
             });
 
             await provider.refresh('/test');
-            const yearItems = await provider.getChildren();
-            const yearItem = yearItems.find(item => item.uri === 'year:2026');
+            const dayItems = await provider.getChildren();
+            const dayItem = dayItems.find(item => item.uri === 'day:2026-01-31');
             
-            if (yearItem) {
-                const monthItems = await provider.getChildren(yearItem);
-                expect(monthItems.length).toBeGreaterThan(0);
-                expect(monthItems[0].type).toBe('month');
+            if (dayItem) {
+                const transcriptItems = await provider.getChildren(dayItem);
+                expect(transcriptItems.length).toBeGreaterThan(0);
+                expect(transcriptItems[0].type).toBe('transcript');
             }
         });
 

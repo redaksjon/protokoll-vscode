@@ -169,7 +169,14 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
         projectId: this.selectedProjectFilter || undefined,
       });
 
-      log('TranscriptsViewProvider.refresh: Got response', { transcriptsCount: response.transcripts.length });
+      log('TranscriptsViewProvider.refresh: Got response', { 
+        transcriptsCount: response.transcripts.length,
+        sampleTranscript: response.transcripts[0] ? {
+          title: response.transcripts[0].title,
+          hasEntities: !!response.transcripts[0].entities,
+          entities: response.transcripts[0].entities
+        } : null
+      });
       this.transcripts = response.transcripts;
       this._onDidChangeTreeData.fire();
       log('TranscriptsViewProvider.refresh: Fired tree data change event');
@@ -185,35 +192,9 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     return element;
   }
 
-  getParent(element: TranscriptItem): vscode.ProviderResult<TranscriptItem> {
-    if (element.type === 'transcript') {
-      // Transcript's parent is the month
-      if (element.year && element.month) {
-        return new TranscriptItem(
-          this.getMonthName(element.month),
-          `year:${element.year}:month:${element.month}`,
-          vscode.TreeItemCollapsibleState.Expanded,
-          undefined,
-          undefined,
-          'month',
-          element.year,
-          element.month
-        );
-      }
-    } else if (element.type === 'month') {
-      // Month's parent is the year
-      if (element.year) {
-        return new TranscriptItem(
-          element.year,
-          `year:${element.year}`,
-          vscode.TreeItemCollapsibleState.Expanded,
-          undefined,
-          undefined,
-          'year'
-        );
-      }
-    }
-    // Year has no parent (it's root level)
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  getParent(_element: TranscriptItem): vscode.ProviderResult<TranscriptItem> {
+    // Flat list - no parent hierarchy
     return null;
   }
 
@@ -243,64 +224,65 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     }
 
     if (!element) {
-      // Root level - return year nodes
-      const yearMonths = this.groupTranscriptsByYearMonth();
-      log('TranscriptsViewProvider.getChildren: Returning root level', { yearCount: Object.keys(yearMonths).length });
-      return Object.keys(yearMonths)
-        .sort((a, b) => b.localeCompare(a)) // Sort years descending (newest first)
-        .map(year => {
+      // Root level - return day groups
+      const dayGroups = this.groupTranscriptsByDay();
+      log('TranscriptsViewProvider.getChildren: Returning root level', { dayCount: Object.keys(dayGroups).length });
+      
+      return Object.keys(dayGroups)
+        .sort((a, b) => b.localeCompare(a)) // Sort dates descending (newest first)
+        .map(dateKey => {
+          const transcripts = dayGroups[dateKey];
+          const date = this.getTranscriptDate(transcripts[0]);
+          const dayLabel = this.formatDayHeader(date);
+          
           return new TranscriptItem(
-            year,
-            `year:${year}`,
+            dayLabel,
+            `day:${dateKey}`,
             vscode.TreeItemCollapsibleState.Expanded,
             undefined,
             undefined,
-            'year'
+            'day',
+            undefined,
+            undefined,
+            undefined,
+            dateKey
           );
         });
     }
 
-    if (element.type === 'year') {
-      // Year level - return month nodes for this year
-      const year = element.uri.replace('year:', '');
-      const yearMonths = this.groupTranscriptsByYearMonth();
-      const months = yearMonths[year] || {};
+    if (element.type === 'day') {
+      // Day level - return transcript nodes for this day
+      const dateKey = element.dateKey;
+      if (!dateKey) {
+        return [];
+      }
+      const dayGroups = this.groupTranscriptsByDay();
+      const transcripts = dayGroups[dateKey] || [];
       
-      return Object.keys(months)
-        .sort((a, b) => parseInt(b) - parseInt(a)) // Sort months descending (newest first)
-        .map(month => {
-          return new TranscriptItem(
-            this.getMonthName(month),
-            `year:${year}:month:${month}`,
-            vscode.TreeItemCollapsibleState.Expanded,
-            undefined,
-            undefined,
-            'month',
-            year,
-            month
-          );
-        });
-    }
-
-    if (element.type === 'month') {
-      // Month level - return transcript nodes for this year/month
-      const parts = element.uri.split(':');
-      const year = parts[1];
-      const month = parts[3];
-      const yearMonths = this.groupTranscriptsByYearMonth();
-      const transcripts = yearMonths[year]?.[month] || [];
-      
-      return transcripts.map(t => {
-        const projectNames = t.entities?.projects?.map(p => p.name).join(', ') || '';
-        const day = this.extractDay(t);
-        const timeStr = this.formatTime(t.time);
-        const dayPrefix = day !== null 
-          ? (timeStr ? `${day}. (${timeStr}) ` : `${day}. `)
-          : '';
-        const label = `${dayPrefix}${t.title || t.filename}`;
+      return transcripts.map((t: Transcript) => {
+        // Debug logging to see what we're getting
+        if (t.uri.includes('Claude Skills')) {
+          log('TranscriptsViewProvider: Transcript data', {
+            uri: t.uri,
+            title: t.title,
+            hasEntities: !!t.entities,
+            entities: t.entities,
+            hasProjects: !!t.entities?.projects,
+            projectsLength: t.entities?.projects?.length
+          });
+        }
         
-        return new TranscriptItem(
-          label,
+        const projectNames = t.entities?.projects?.map((p: { id: string; name: string }) => p.name).join(', ') || '';
+        const title = t.title || t.filename;
+        
+        // Truncate title if too long (max 80 chars)
+        const truncatedTitle = title.length > 80 ? title.substring(0, 77) + '...' : title;
+        
+        // Use description field to show project
+        const description = projectNames || 'No project';
+        
+        const item = new TranscriptItem(
+          truncatedTitle,
           t.uri,
           vscode.TreeItemCollapsibleState.None,
           {
@@ -314,6 +296,20 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
           undefined,
           projectNames || undefined
         );
+        
+        // Set description to show project
+        item.description = description;
+        
+        // Debug: verify description is set
+        if (t.uri.includes('Claude Skills')) {
+          log('TranscriptsViewProvider: Item created', {
+            label: item.label,
+            description: item.description,
+            projectNames
+          });
+        }
+        
+        return item;
       });
     }
 
@@ -535,6 +531,108 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
     return null;
   }
+
+  private getTranscriptDate(transcript: Transcript): Date {
+    // Try to get date from various fields
+    if (transcript.date) {
+      const date = new Date(transcript.date);
+      if (!isNaN(date.getTime())) {
+        return date;
+      }
+    }
+    
+    if (transcript.createdAt) {
+      const date = new Date(transcript.createdAt);
+      if (!isNaN(date.getTime())) {
+        return date;
+      }
+    }
+    
+    // Fallback to epoch
+    return new Date(0);
+  }
+
+  private formatDateForTable(transcript: Transcript): string {
+    const date = this.getTranscriptDate(transcript);
+    if (date.getTime() === 0) {
+      return '—'.padEnd(12);
+    }
+    
+    // Format as YYYY-MM-DD
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    
+    return `${year}-${month}-${day}`;
+  }
+
+  private groupTranscriptsByDay(): Record<string, Transcript[]> {
+    const grouped: Record<string, Transcript[]> = {};
+
+    let filteredTranscripts = this.transcripts;
+    
+    // Apply status filter if set
+    if (this.selectedStatusFilter) {
+      filteredTranscripts = filteredTranscripts.filter(t => {
+        const transcriptStatus = t.status || 'reviewed';
+        return transcriptStatus === this.selectedStatusFilter;
+      });
+    }
+
+    for (const transcript of filteredTranscripts) {
+      const date = this.getTranscriptDate(transcript);
+      if (date.getTime() === 0) {
+        continue; // Skip transcripts without valid dates
+      }
+      
+      // Create date key as YYYY-MM-DD
+      const dateKey = this.formatDateForTable(transcript);
+      
+      if (!grouped[dateKey]) {
+        grouped[dateKey] = [];
+      }
+      grouped[dateKey].push(transcript);
+    }
+
+    // Sort transcripts within each day based on sortOrder
+    for (const dateKey in grouped) {
+      grouped[dateKey].sort((a, b) => {
+        if (this.sortOrder === 'title-asc' || this.sortOrder === 'title-desc') {
+          const titleA = (a.title || a.filename || '').toLowerCase();
+          const titleB = (b.title || b.filename || '').toLowerCase();
+          return this.sortOrder === 'title-asc' 
+            ? titleA.localeCompare(titleB)
+            : titleB.localeCompare(titleA);
+        } else {
+          // For date sorting within the same day, use time if available
+          const timeA = a.time || '';
+          const timeB = b.time || '';
+          return this.sortOrder === 'date-desc'
+            ? timeB.localeCompare(timeA)
+            : timeA.localeCompare(timeB);
+        }
+      });
+    }
+
+    return grouped;
+  }
+
+  private formatDayHeader(date: Date): string {
+    // Get day of week
+    const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const dayOfWeek = dayNames[date.getDay()];
+    
+    // Format date as "Month Day, Year"
+    const monthNames = [
+      'January', 'February', 'March', 'April', 'May', 'June',
+      'July', 'August', 'September', 'October', 'November', 'December'
+    ];
+    const month = monthNames[date.getMonth()];
+    const day = date.getDate();
+    const year = date.getFullYear();
+    
+    return `${dayOfWeek}, ${month} ${day}, ${year}`;
+  }
 }
 
 export class TranscriptItem extends vscode.TreeItem {
@@ -544,10 +642,11 @@ export class TranscriptItem extends vscode.TreeItem {
     public readonly collapsibleState: vscode.TreeItemCollapsibleState,
     public readonly command?: vscode.Command,
     public readonly transcript?: Transcript,
-    public readonly type: 'year' | 'month' | 'transcript' = 'transcript',
+    public readonly type: 'year' | 'month' | 'transcript' | 'day' = 'transcript',
     public readonly year?: string,
     public readonly month?: string,
-    public readonly project?: string
+    public readonly project?: string,
+    public readonly dateKey?: string
   ) {
     super(label, collapsibleState);
     
@@ -559,6 +658,10 @@ export class TranscriptItem extends vscode.TreeItem {
       this.contextValue = 'transcriptMonth';
       this.iconPath = new vscode.ThemeIcon('calendar');
       this.tooltip = `${label} ${year}`;
+    } else if (type === 'day') {
+      this.contextValue = 'transcriptDay';
+      this.iconPath = new vscode.ThemeIcon('calendar');
+      this.tooltip = label;
     } else {
       this.contextValue = 'transcript';
       
@@ -578,25 +681,8 @@ export class TranscriptItem extends vscode.TreeItem {
         this.iconPath = new vscode.ThemeIcon('note'); // Note icon for notes
       }
       
-      // Build description: status indicator + project
-      const statusLabels: Record<string, string> = {
-        initial: '📝',
-        enhanced: '✨',
-        reviewed: '👀',
-        in_progress: '🔄',
-        closed: '✅',
-        archived: '📦',
-      };
-      const statusEmoji = statusLabels[status] || '';
-      const projectStr = project || '';
-      
-      // Show status emoji as prefix to project (or alone if no project)
-      if (projectStr) {
-        this.description = `${statusEmoji} ${projectStr}`;
-      } else if (statusEmoji && status !== 'reviewed') {
-        // Only show status emoji if not the default "reviewed" status
-        this.description = statusEmoji;
-      }
+      // Note: description is set by the caller in getChildren() to show project info
+      // Don't override it here
       
       // Build detailed tooltip
       const projectNames = transcript?.entities?.projects?.map(p => p.name).join(', ') || project || '';
@@ -605,7 +691,7 @@ export class TranscriptItem extends vscode.TreeItem {
         initial: 'Initial',
         enhanced: 'Enhanced',
         reviewed: 'Reviewed',
-        in_progress: 'In Progress',
+        'in_progress': 'In Progress',
         closed: 'Closed',
         archived: 'Archived',
       }[status] || status;

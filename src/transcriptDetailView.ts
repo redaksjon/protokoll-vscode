@@ -27,11 +27,54 @@ export interface EditableTranscriptInfo {
 
 /**
  * Parse transcript content to separate header (metadata) from body.
- * The header includes title, metadata block, and the --- separator.
+ * The header includes the YAML front matter or markdown metadata, and the --- separator.
  * Returns { header, body } where header should be preserved and body is editable.
+ * 
+ * Supports two formats:
+ * 1. YAML front matter (new format):
+ *    ---
+ *    status: closed
+ *    entities: ...
+ *    ---
+ *    # Title
+ *    Body content here
+ * 
+ * 2. Markdown metadata (legacy format):
+ *    # Title
+ *    ## Metadata
+ *    **Date**: ...
+ *    ---
+ *    Body content here
  */
 function parseTranscriptContent(content: string): { header: string; body: string } {
-  // Look for the --- separator that ends the metadata section
+  // Check if content starts with YAML front matter (new format)
+  if (content.trimStart().startsWith('---')) {
+    // Find the closing --- delimiter
+    const lines = content.split('\n');
+    let firstDelimiterIndex = -1;
+    let secondDelimiterIndex = -1;
+    
+    // Find first --- (should be at or near the start)
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trim() === '---') {
+        if (firstDelimiterIndex === -1) {
+          firstDelimiterIndex = i;
+        } else {
+          secondDelimiterIndex = i;
+          break;
+        }
+      }
+    }
+    
+    // If we found both delimiters, split there
+    if (firstDelimiterIndex !== -1 && secondDelimiterIndex !== -1) {
+      const header = lines.slice(0, secondDelimiterIndex + 1).join('\n') + '\n';
+      const body = lines.slice(secondDelimiterIndex + 1).join('\n').trim();
+      return { header, body };
+    }
+  }
+  
+  // Legacy format: Look for the --- separator that ends the metadata section
   // The format is typically:
   // # Title
   // ## Metadata
@@ -195,6 +238,18 @@ export class TranscriptDetailViewProvider {
       return;
     }
 
+    // Check if panel is disposed
+    try {
+      // Try to access the panel - this will throw if disposed
+      panel.title;
+    } catch (error) {
+      // Panel is disposed, clean up and return
+      console.log(`Protokoll: Panel for ${transcriptUri} is disposed during refresh, cleaning up`);
+      this._panels.delete(transcriptUri);
+      this._currentTranscripts.delete(transcriptUri);
+      return;
+    }
+
     // Show update indicator
     this._updatingTranscripts.add(transcriptUri);
     this.showUpdateIndicator(panel, true);
@@ -206,13 +261,21 @@ export class TranscriptDetailViewProvider {
       // Track when transcript was fetched
       this._transcriptLastFetched.set(transcriptUri, new Date());
       
-      // Update the stored transcript with fresh data (may include updatedAt)
+      // Update the stored transcript with fresh data (may include updatedAt and entities)
       const updatedTranscript = { ...currentTranscript.transcript };
       
-      // Parse updatedAt from content if available
+      // Parse metadata from content (including entities from YAML frontmatter)
       const parsedMetadata = this.parseMetadata(content.text);
       if (parsedMetadata.updatedAt) {
         updatedTranscript.updatedAt = parsedMetadata.updatedAt;
+      }
+      
+      // Update entities from parsed metadata if available
+      if (parsedMetadata.entities) {
+        updatedTranscript.entities = {
+          ...updatedTranscript.entities,
+          ...parsedMetadata.entities,
+        };
       }
       
       // Update stored transcript
@@ -341,21 +404,30 @@ export class TranscriptDetailViewProvider {
     // Check if a panel already exists for this transcript
     let panel = this._panels.get(transcriptUri);
 
-    // If panel exists and we're not forcing a new tab, just reveal it
+    // Check if panel exists and is not disposed
     if (panel && !openInNewTab) {
-      panel.title = transcript.title || transcript.filename;
-      panel.reveal(targetColumn);
-      // Refresh the content in case it changed
       try {
-        const content: TranscriptContent = await this._client.readTranscript(transcriptUri);
-        panel.webview.html = this.getWebviewContent(transcript, content);
+        // Try to access the panel - this will throw if disposed
+        panel.title = transcript.title || transcript.filename;
+        panel.reveal(targetColumn);
+        // Refresh the content in case it changed
+        try {
+          const content: TranscriptContent = await this._client.readTranscript(transcriptUri);
+          panel.webview.html = this.getWebviewContent(transcript, content);
+        } catch (error) {
+          console.error(`Protokoll: Error refreshing transcript ${transcriptUri}:`, error);
+          panel.webview.html = this.getErrorContent(
+            error instanceof Error ? error.message : String(error)
+          );
+        }
+        return;
       } catch (error) {
-        console.error(`Protokoll: Error refreshing transcript ${transcriptUri}:`, error);
-        panel.webview.html = this.getErrorContent(
-          error instanceof Error ? error.message : String(error)
-        );
+        // Panel is disposed, remove it from the map and create a new one
+        console.log(`Protokoll: Panel for ${transcriptUri} is disposed, creating new one`);
+        this._panels.delete(transcriptUri);
+        this._currentTranscripts.delete(transcriptUri);
+        panel = undefined;
       }
-      return;
     }
 
     // Create a new panel (either because one doesn't exist or openInNewTab is true)
@@ -725,7 +797,7 @@ export class TranscriptDetailViewProvider {
       initial: 'Initial',
       enhanced: 'Enhanced',
       reviewed: 'Reviewed',
-      in_progress: 'In Progress',
+      'in_progress': 'In Progress',
       closed: 'Closed',
       archived: 'Archived',
     };
@@ -1496,21 +1568,29 @@ export class TranscriptDetailViewProvider {
       if (currentTranscript) {
         const transcriptPath = currentTranscript.transcript.path || currentTranscript.transcript.filename;
         
-        // Read transcript content to add entity reference
+        // Add entity reference using MCP tool
         try {
-          const transcriptContent: TranscriptContent = await this._client.readTranscript(transcriptUri);
-          const updatedContent = this.addEntityReferenceToTranscript(
-            transcriptContent.text,
-            selected.value,
-            entityId,
-            entityNameFromServer
-          );
+          // Build updated entities object from current transcript metadata
+          const entities = currentTranscript.transcript.entities || { people: [], projects: [], terms: [], companies: [] };
+          const typePlural = selected.value === 'person' ? 'people' : 
+                            selected.value === 'company' ? 'companies' :
+                            selected.value === 'term' ? 'terms' :
+                            selected.value === 'project' ? 'projects' : selected.value;
           
-          // Update transcript content
-          await this._client.callTool('protokoll_update_transcript_content', {
-            transcriptPath: this.convertToRelativePath(transcriptPath),
-            content: updatedContent,
-          });
+          // Add new entity if not already present
+          const entityList = entities[typePlural as keyof typeof entities] || [];
+          const entityExists = entityList.some((e: { id: string }) => e.id === entityId);
+          
+          if (!entityExists) {
+            const newEntity = { id: entityId, name: entityNameFromServer };
+            entities[typePlural as keyof typeof entities] = [...entityList, newEntity];
+            
+            // Update transcript entities using MCP tool
+            await this._client.callTool('protokoll_update_transcript_entity_references', {
+              transcriptPath: this.convertToRelativePath(transcriptPath),
+              entities: entities,
+            });
+          }
         } catch (updateError) {
           console.warn('Protokoll: Could not update transcript with entity reference:', updateError);
           // Continue anyway - we'll still open the entity view
@@ -1544,89 +1624,6 @@ export class TranscriptDetailViewProvider {
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/--+/g, '-')
       .replace(/^-|-$/g, '');
-  }
-
-  private addEntityReferenceToTranscript(
-    transcriptText: string,
-    entityType: string,
-    entityId: string,
-    entityName: string
-  ): string {
-    // Check if Entity References section exists
-    const entityRefsMatch = transcriptText.match(/^([\s\S]*?##\s+Entity\s+References\s*\n)([\s\S]*?)(\n##|$)/i);
-    
-    if (entityRefsMatch) {
-      // Entity References section exists
-      const beforeSection = entityRefsMatch[1];
-      const sectionContent = entityRefsMatch[2];
-      const afterSection = entityRefsMatch[3] || '';
-      
-      // Check if this entity type subsection exists
-      const typePlural = entityType === 'person' ? 'people' : 
-                        entityType === 'company' ? 'companies' :
-                        entityType === 'term' ? 'terms' :
-                        entityType === 'project' ? 'projects' : entityType;
-      const typeSubsectionMatch = sectionContent.match(new RegExp(`(###\\s+${typePlural}\\s*\\n)([\\s\\S]*?)(\\n###|\\n##|$)`, 'i'));
-      
-      if (typeSubsectionMatch) {
-        // Subsection exists - check if entity already listed
-        const subsectionHeader = typeSubsectionMatch[1];
-        const subsectionContent = typeSubsectionMatch[2];
-        const afterSubsection = typeSubsectionMatch[3] || '';
-        
-        // Check if entity ID already exists
-        if (subsectionContent.includes(`\`${entityId}\``)) {
-          // Already exists, return original
-          return transcriptText;
-        }
-        
-        // Add entity reference
-        const newEntityLine = `- \`${entityId}\`: ${entityName}\n`;
-        const updatedSubsection = subsectionHeader + subsectionContent + newEntityLine;
-        const updatedSection = beforeSection + updatedSubsection + afterSubsection + afterSection;
-        
-        return transcriptText.replace(
-          /^([\s\S]*?##\s+Entity\s+References\s*\n)([\s\S]*?)(\n##|$)/i,
-          updatedSection
-        );
-      } else {
-        // Subsection doesn't exist - add it
-        const newSubsection = `### ${typePlural.charAt(0).toUpperCase() + typePlural.slice(1)}\n- \`${entityId}\`: ${entityName}\n\n`;
-        const updatedSection = beforeSection + sectionContent + (sectionContent.trim() ? '\n' : '') + newSubsection;
-        
-        return transcriptText.replace(
-          /^([\s\S]*?##\s+Entity\s+References\s*\n)([\s\S]*?)(\n##|$)/i,
-          updatedSection + afterSection
-        );
-      }
-    } else {
-      // Entity References section doesn't exist - add it before the content delimiter
-      const contentDelimiterMatch = transcriptText.match(/^([\s\S]*?)(\n---\s*\n[\s\S]*)$/);
-      
-      if (contentDelimiterMatch) {
-        const beforeDelimiter = contentDelimiterMatch[1];
-        const afterDelimiter = contentDelimiterMatch[2];
-        
-        const typePlural = entityType === 'person' ? 'people' : 
-                          entityType === 'company' ? 'companies' :
-                          entityType === 'term' ? 'terms' :
-                          entityType === 'project' ? 'projects' : entityType;
-        
-        const newSection = `## Entity References\n\n### ${typePlural.charAt(0).toUpperCase() + typePlural.slice(1)}\n- \`${entityId}\`: ${entityName}\n\n`;
-        
-        return beforeDelimiter + '\n' + newSection + afterDelimiter;
-      } else {
-        // No delimiter - append at the end
-        const typePlural = entityType === 'person' ? 'people' : 
-                          entityType === 'company' ? 'companies' :
-                          entityType === 'term' ? 'terms' :
-                          entityType === 'project' ? 'projects' : entityType;
-        
-        const newSection = `\n\n## Entity References\n\n### ${typePlural.charAt(0).toUpperCase() + typePlural.slice(1)}\n- \`${entityId}\`: ${entityName}\n`;
-        
-        return transcriptText + newSection;
-      }
-    }
   }
 
   private parseEntityContent(content: string): {
@@ -2326,7 +2323,7 @@ export class TranscriptDetailViewProvider {
     // Parse entity references from the content
     const entityReferences = this.parseEntityReferences(text);
     
-    // Add project from parsed metadata if available and not already in entity references
+    // Add project from parsed metadata if available and not already in entity references (legacy format)
     if (parsedMetadata.projectId && parsedMetadata.project) {
       if (!entityReferences.projects) {
         entityReferences.projects = [];
@@ -2338,6 +2335,47 @@ export class TranscriptDetailViewProvider {
           id: parsedMetadata.projectId,
           name: parsedMetadata.project,
         });
+      }
+    }
+    
+    // Merge with entities from parsed metadata (YAML frontmatter)
+    if (parsedMetadata.entities) {
+      if (parsedMetadata.entities.projects) {
+        entityReferences.projects = [
+          ...(entityReferences.projects || []),
+          ...parsedMetadata.entities.projects.map(p => ({ id: p.id, name: p.name }))
+        ];
+        // Remove duplicates
+        entityReferences.projects = entityReferences.projects.filter((p, index, self) =>
+          index === self.findIndex((t) => t.id === p.id)
+        );
+      }
+      if (parsedMetadata.entities.people) {
+        entityReferences.people = [
+          ...(entityReferences.people || []),
+          ...parsedMetadata.entities.people.map(p => ({ id: p.id, name: p.name }))
+        ];
+        entityReferences.people = entityReferences.people.filter((p, index, self) =>
+          index === self.findIndex((t) => t.id === p.id)
+        );
+      }
+      if (parsedMetadata.entities.terms) {
+        entityReferences.terms = [
+          ...(entityReferences.terms || []),
+          ...parsedMetadata.entities.terms.map(t => ({ id: t.id, name: t.name }))
+        ];
+        entityReferences.terms = entityReferences.terms.filter((t, index, self) =>
+          index === self.findIndex((e) => e.id === t.id)
+        );
+      }
+      if (parsedMetadata.entities.companies) {
+        entityReferences.companies = [
+          ...(entityReferences.companies || []),
+          ...parsedMetadata.entities.companies.map(c => ({ id: c.id, name: c.name }))
+        ];
+        entityReferences.companies = entityReferences.companies.filter((c, index, self) =>
+          index === self.findIndex((e) => e.id === c.id)
+        );
       }
     }
     
@@ -2382,18 +2420,28 @@ export class TranscriptDetailViewProvider {
       }
     }
 
-    // Extract content between two --- delimiters (the body of the transcript)
-    // Pattern: ... ---\n[content]\n---
-    const bodyMatch = transcriptText.match(/---\s*\n([\s\S]*?)\n---/);
-    if (bodyMatch) {
-      // Found content between two --- delimiters
-      transcriptText = bodyMatch[1].trim();
+    // Extract content after the YAML frontmatter (if present)
+    // Look for the pattern: ---\n(yaml content)\n---\n(actual content)
+    // We want to extract everything after the last closing --- delimiter
+    const yamlFrontmatterMatch = transcriptText.match(/---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/);
+    if (yamlFrontmatterMatch) {
+      // Found YAML frontmatter with content after it
+      transcriptText = yamlFrontmatterMatch[1].trim();
     } else {
-      // Fallback: if no --- delimiters found, try to find content after the first ---
-      // (in case there's only one delimiter)
-      const singleDelimiterMatch = transcriptText.match(/---\s*\n([\s\S]*)$/);
-      if (singleDelimiterMatch) {
-        transcriptText = singleDelimiterMatch[1].trim();
+      // No YAML frontmatter pattern found, try legacy format
+      // Look for content after a single --- delimiter (legacy metadata format)
+      const legacyDelimiterMatch = transcriptText.match(/---\s*\n([\s\S]*)$/);
+      if (legacyDelimiterMatch) {
+        transcriptText = legacyDelimiterMatch[1].trim();
+        
+        // If the content starts with another ---, it might be YAML frontmatter
+        // In that case, look for content after the closing ---
+        if (transcriptText.startsWith('---')) {
+          const afterYamlMatch = transcriptText.match(/^---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/);
+          if (afterYamlMatch) {
+            transcriptText = afterYamlMatch[1].trim();
+          }
+        }
       } else {
         // No delimiters found, use the old method to remove redundant sections
         transcriptText = this.removeRedundantSections(transcriptText);
@@ -2420,9 +2468,9 @@ export class TranscriptDetailViewProvider {
     const tasks = parsedMetadata.tasks || transcript.tasks || [];
     const openTasks = tasks.filter((t: { status: string }) => t.status === 'open');
 
-    // Get project info - prefer parsed metadata, fallback to transcript object
-    const projectId = parsedMetadata.projectId || transcript.entities?.projects?.[0]?.id || '';
-    const projectName = parsedMetadata.project || transcript.entities?.projects?.[0]?.name || '';
+    // Get project info - prefer parsed metadata entities, then legacy metadata fields, fallback to transcript object
+    const projectId = parsedMetadata.entities?.projects?.[0]?.id || parsedMetadata.projectId || transcript.entities?.projects?.[0]?.id || '';
+    const projectName = parsedMetadata.entities?.projects?.[0]?.name || parsedMetadata.project || transcript.entities?.projects?.[0]?.name || '';
     const transcriptPath = transcript.path || transcript.filename;
 
     return `<!DOCTYPE html>
@@ -2521,12 +2569,18 @@ export class TranscriptDetailViewProvider {
             overflow-y: auto;
         }
         .title-header .title-input {
-            padding: 4px 8px;
-            border-radius: 3px;
+            padding: 8px 12px;
+            border-radius: 4px;
             font-size: inherit;
+            font-weight: 600;
             font-family: inherit;
-            width: 100%;
-            min-width: 300px;
+            width: calc(100% - 220px);
+            min-width: 700px;
+            line-height: 1.2;
+            resize: vertical;
+            overflow: hidden;
+            min-height: 60px;
+            display: block;
         }
         .project-corner {
             position: absolute;
@@ -2874,6 +2928,18 @@ export class TranscriptDetailViewProvider {
             color: var(--vscode-textLink-foreground);
             font-weight: 600;
         }
+        .kbd-hint {
+            display: inline-block;
+            font-size: 0.75em;
+            padding: 2px 6px;
+            margin-left: 8px;
+            background-color: var(--vscode-input-background);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 3px;
+            font-family: monospace;
+            color: var(--vscode-descriptionForeground);
+            opacity: 0.7;
+        }
         .button {
             background-color: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
@@ -3000,6 +3066,7 @@ export class TranscriptDetailViewProvider {
         </button>
         <h1 class="title-header">
             <span class="editable-title" id="title-display" onclick="startEditTitle()">${this.escapeHtml(transcript.title || transcript.filename)}</span>
+            <span class="kbd-hint">T</span>
             <span id="update-indicator" class="update-indicator">
                 <span class="spinner"></span>
                 <span>Updating...</span>
@@ -3007,18 +3074,19 @@ export class TranscriptDetailViewProvider {
         </h1>
         ${lastFetched ? `<div class="last-fetched">Last fetched: ${this.escapeHtml(this.formatDate(lastFetched.toISOString()))}</div>` : ''}
         <div class="title-actions" id="title-actions" style="display: none;">
-            <button class="button" onclick="saveTitle()">Save</button>
-            <button class="button button-secondary" onclick="cancelEditTitle()">Cancel</button>
+            <button class="button" onclick="saveTitle()">Save (Ctrl+Enter)</button>
+            <button class="button button-secondary" onclick="cancelEditTitle()">Cancel (Esc)</button>
         </div>
         <div class="project-corner">
             ${projectName ? `
                 <div class="project-info">
                     <span class="project-name clickable" onclick="changeProject()">${this.escapeHtml(projectName)}</span>
+                    <span class="kbd-hint">P</span>
                 </div>
             ` : `
                 <div class="project-info">
                     <span style="color: var(--vscode-descriptionForeground); font-style: italic;">No project assigned</span>
-                    <button class="button button-secondary" onclick="changeProject()">Assign Project</button>
+                    <button class="button button-secondary" onclick="changeProject()">Assign Project <span class="kbd-hint">P</span></button>
                 </div>
             `}
         </div>
@@ -3058,7 +3126,7 @@ export class TranscriptDetailViewProvider {
                         <button class="tag-remove" onclick="event.stopPropagation(); removeTag('${this.escapeHtml(tag)}'); return false;" title="Remove tag">×</button>
                     </span>
                 `).join('')}
-                <button class="tag-add" onclick="addTag()" title="Add tag">+ Add Tag</button>
+                <button class="tag-add" onclick="addTag()" title="Add tag">+ Add Tag <span class="kbd-hint">G</span></button>
             </div>
         </div>
         ${Object.entries(metadata).map(([key, value]) => `
@@ -3080,14 +3148,14 @@ export class TranscriptDetailViewProvider {
                 <button class="task-delete-btn" onclick="deleteTask('${this.escapeHtml(task.id)}')" title="Delete task">×</button>
             </div>
         `).join('')}
-        <button class="task-add-btn" onclick="addTask()">+ Add Task</button>
+        <button class="task-add-btn" onclick="addTask()">+ Add Task <span class="kbd-hint">K</span></button>
     </div>
     <div class="inline-chat-container" id="inline-chat-container">
         <div class="inline-chat-input-wrapper">
             <textarea 
                 class="inline-chat-input" 
                 id="inline-chat-input" 
-                placeholder="Type a message to make changes... (e.g., Change the title to &quot;Hello World&quot;)"
+                placeholder="Type a message to make changes... (e.g., Change the title to &quot;Hello World&quot;) Press C to focus"
                 rows="1"
             ></textarea>
             <button type="button" class="inline-chat-send" id="inline-chat-send">
@@ -3099,8 +3167,8 @@ export class TranscriptDetailViewProvider {
     </div>
     <div class="transcript-content-wrapper">
         <div style="display: flex; gap: 8px; margin-bottom: 16px;">
-            <button class="edit-button" onclick="editInEditor()" id="edit-in-editor-btn" title="Edit in VS Code editor (supports voice dictation)">Edit in Editor</button>
-            <button class="edit-button" onclick="openSource()" id="open-source-btn" title="View source (read-only)" style="opacity: 0.7;">View Source</button>
+            <button class="edit-button" onclick="editInEditor()" id="edit-in-editor-btn" title="Edit in VS Code editor (supports voice dictation)">Edit in Editor <span class="kbd-hint">E</span></button>
+            <button class="edit-button" onclick="openSource()" id="open-source-btn" title="View source (read-only)" style="opacity: 0.7;">View Source <span class="kbd-hint">S</span></button>
         </div>
         <div class="transcript-content" id="transcript-content-display">
             ${this.markdownToHtml(transcriptText)}
@@ -3178,18 +3246,40 @@ export class TranscriptDetailViewProvider {
         function startEditTitle() {
             const display = document.getElementById('title-display');
             const actions = document.getElementById('title-actions');
+            
+            // Check if already editing to prevent re-creating the textarea
+            if (display.classList.contains('editing')) {
+                return;
+            }
+            
             const currentText = display.textContent;
             
-            display.innerHTML = \`<input type="text" id="title-input" class="title-input" value="\${currentText}">\`;
+            // Use textarea for multi-line support
+            const textarea = document.createElement('textarea');
+            textarea.id = 'title-input';
+            textarea.className = 'title-input';
+            textarea.value = currentText;
+            
+            display.innerHTML = '';
+            display.appendChild(textarea);
             display.classList.add('editing');
             actions.style.display = 'inline-flex';
             
-            const input = document.getElementById('title-input');
-            input.focus();
-            input.select();
+            textarea.focus();
+            textarea.select();
             
-            input.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') {
+            // Auto-resize textarea to fit content
+            function autoResize() {
+                textarea.style.height = 'auto';
+                textarea.style.height = textarea.scrollHeight + 'px';
+            }
+            autoResize();
+            textarea.addEventListener('input', autoResize);
+            
+            textarea.addEventListener('keydown', (e) => {
+                // Save on Ctrl+Enter or Cmd+Enter
+                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                    e.preventDefault();
                     saveTitle();
                 } else if (e.key === 'Escape') {
                     cancelEditTitle();
@@ -3433,13 +3523,7 @@ export class TranscriptDetailViewProvider {
         // Auto-focus the chat input when the view loads
         document.addEventListener('DOMContentLoaded', () => {
             setupRefreshButton();
-            const chatInput = document.getElementById('inline-chat-input');
-            if (chatInput) {
-                // Small delay to ensure the webview is fully rendered
-                setTimeout(() => {
-                    chatInput.focus();
-                }, 100);
-            }
+            // Don't auto-focus on chat input - let users press 'C' to focus
         });
         
         // Handle refresh completion message from extension
@@ -3450,6 +3534,59 @@ export class TranscriptDetailViewProvider {
                 if (refreshButton) {
                     refreshButton.disabled = false;
                 }
+            }
+        });
+
+        // Function to focus on chat input
+        function focusChat() {
+            const chatInput = document.getElementById('inline-chat-input');
+            if (chatInput) {
+                chatInput.focus();
+            }
+        }
+
+        // Global keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            // Only trigger if not in an input, textarea, or contenteditable element
+            const target = e.target;
+            if (target.tagName === 'INPUT' || 
+                target.tagName === 'TEXTAREA' || 
+                target.isContentEditable) {
+                return;
+            }
+
+            // Check for keyboard shortcuts (case-insensitive)
+            const key = e.key.toLowerCase();
+            
+            switch(key) {
+                case 'c':
+                    e.preventDefault();
+                    focusChat();
+                    break;
+                case 'p':
+                    e.preventDefault();
+                    changeProject();
+                    break;
+                case 't':
+                    e.preventDefault();
+                    startEditTitle();
+                    break;
+                case 'g':
+                    e.preventDefault();
+                    addTag();
+                    break;
+                case 'k':
+                    e.preventDefault();
+                    addTask();
+                    break;
+                case 'e':
+                    e.preventDefault();
+                    editInEditor();
+                    break;
+                case 's':
+                    e.preventDefault();
+                    openSource();
+                    break;
             }
         });
     </script>
@@ -3627,6 +3764,12 @@ export class TranscriptDetailViewProvider {
     updatedAt?: string;
     status?: string;
     tasks?: Array<{ id: string; description: string; status: string; created: string; completed?: string }>;
+    entities?: {
+      people?: Array<{ id: string; name: string }>;
+      projects?: Array<{ id: string; name: string }>;
+      terms?: Array<{ id: string; name: string }>;
+      companies?: Array<{ id: string; name: string }>;
+    };
   } {
     const metadata: {
       date?: string;
@@ -3637,9 +3780,15 @@ export class TranscriptDetailViewProvider {
       updatedAt?: string;
       status?: string;
       tasks?: Array<{ id: string; description: string; status: string; created: string; completed?: string }>;
+      entities?: {
+        people?: Array<{ id: string; name: string }>;
+        projects?: Array<{ id: string; name: string }>;
+        terms?: Array<{ id: string; name: string }>;
+        companies?: Array<{ id: string; name: string }>;
+      };
     } = {};
 
-    // Try to parse YAML frontmatter first for status and tasks
+    // Try to parse YAML frontmatter first for status, tasks, and entities
     const frontmatterMatch = text.match(/^---\s*\n([\s\S]*?)\n---/);
     if (frontmatterMatch) {
       const frontmatter = frontmatterMatch[1];
@@ -3651,36 +3800,147 @@ export class TranscriptDetailViewProvider {
       }
       
       // Parse tasks array from frontmatter (simple YAML parsing)
-      const tasksMatch = frontmatter.match(/^tasks:\s*\n((?:\s+-[\s\S]*?(?=\n\w|\n---|\s*$))+)/m);
+      // Match all indented lines under tasks: until we hit a non-indented line
+      const tasksMatch = frontmatter.match(/^tasks:\s*\n((?:[ \t]+.*\n?)*)/m);
       if (tasksMatch) {
         const tasksYaml = tasksMatch[1];
         const tasks: Array<{ id: string; description: string; status: string; created: string; completed?: string }> = [];
         
-        // Split by task items (lines starting with "  - id:")
-        const taskBlocks = tasksYaml.split(/\n\s+-\s+id:/);
-        for (const block of taskBlocks) {
-          if (!block.trim()) continue;
-          const taskText = block.startsWith('id:') ? block : 'id:' + block;
-          
-          const idMatch = taskText.match(/id:\s*(\S+)/);
-          const descMatch = taskText.match(/description:\s*(.+?)(?:\n|$)/);
-          const statusMatch2 = taskText.match(/status:\s*(\w+)/);
-          const createdMatch = taskText.match(/created:\s*["']?([^"'\n]+)["']?/);
-          const completedMatch = taskText.match(/completed:\s*["']?([^"'\n]+)["']?/);
-          
-          if (idMatch && descMatch && statusMatch2 && createdMatch) {
-            tasks.push({
-              id: idMatch[1].trim(),
-              description: descMatch[1].trim().replace(/^["']|["']$/g, ''),
-              status: statusMatch2[1].trim(),
-              created: createdMatch[1].trim(),
-              completed: completedMatch ? completedMatch[1].trim() : undefined,
-            });
+        // Match each task block (lines starting with "  - id:" and their indented properties)
+        const taskBlocks = tasksYaml.match(/\s+-\s+id:[^\n]*(?:\n\s{4,}[^\n]*)*\n?/g);
+        if (taskBlocks) {
+          for (const block of taskBlocks) {
+            if (!block.trim()) {
+              continue;
+            }
+            
+            const idMatch = block.match(/id:\s*(\S+)/);
+            const descMatch = block.match(/description:\s*(.+?)(?:\n|$)/);
+            const statusMatch2 = block.match(/status:\s*(\w+)/);
+            const createdMatch = block.match(/created:\s*["']?([^"'\n]+)["']?/);
+            const completedMatch = block.match(/completed:\s*["']?([^"'\n]+)["']?/);
+            
+            if (idMatch && descMatch && statusMatch2 && createdMatch) {
+              tasks.push({
+                id: idMatch[1].trim(),
+                description: descMatch[1].trim().replace(/^["']|["']$/g, ''),
+                status: statusMatch2[1].trim(),
+                created: createdMatch[1].trim(),
+                completed: completedMatch ? completedMatch[1].trim() : undefined,
+              });
+            }
           }
         }
         
         if (tasks.length > 0) {
           metadata.tasks = tasks;
+        }
+      }
+      
+      // Parse entities from frontmatter (projects, people, terms, companies)
+      const entitiesMatch = frontmatter.match(/^entities:\s*\n((?:\s+\w+:[\s\S]*?(?=\n\w|\n---|\s*$))+)/m);
+      if (entitiesMatch) {
+        const entitiesYaml = entitiesMatch[1];
+        metadata.entities = {};
+        
+        // Parse projects
+        const projectsMatch = entitiesYaml.match(/projects:\s*\n((?:\s+-[\s\S]*?(?=\n\s+\w+:|\s*$))+)/);
+        if (projectsMatch) {
+          const projectsYaml = projectsMatch[1];
+          const projects: Array<{ id: string; name: string }> = [];
+          const projectBlocks = projectsYaml.split(/\n\s+-\s+id:/);
+          for (const block of projectBlocks) {
+            if (!block.trim()) {
+              continue;
+            }
+            const projectText = block.startsWith('id:') ? block : 'id:' + block;
+            const idMatch = projectText.match(/id:\s*(\S+)/);
+            const nameMatch = projectText.match(/name:\s*(.+?)(?:\n|$)/);
+            if (idMatch && nameMatch) {
+              projects.push({
+                id: idMatch[1].trim(),
+                name: nameMatch[1].trim().replace(/^["']|["']$/g, ''),
+              });
+            }
+          }
+          if (projects.length > 0) {
+            metadata.entities.projects = projects;
+          }
+        }
+        
+        // Parse people
+        const peopleMatch = entitiesYaml.match(/people:\s*\n((?:\s+-[\s\S]*?(?=\n\s+\w+:|\s*$))+)/);
+        if (peopleMatch) {
+          const peopleYaml = peopleMatch[1];
+          const people: Array<{ id: string; name: string }> = [];
+          const peopleBlocks = peopleYaml.split(/\n\s+-\s+id:/);
+          for (const block of peopleBlocks) {
+            if (!block.trim()) {
+              continue;
+            }
+            const personText = block.startsWith('id:') ? block : 'id:' + block;
+            const idMatch = personText.match(/id:\s*(\S+)/);
+            const nameMatch = personText.match(/name:\s*(.+?)(?:\n|$)/);
+            if (idMatch && nameMatch) {
+              people.push({
+                id: idMatch[1].trim(),
+                name: nameMatch[1].trim().replace(/^["']|["']$/g, ''),
+              });
+            }
+          }
+          if (people.length > 0) {
+            metadata.entities.people = people;
+          }
+        }
+        
+        // Parse terms
+        const termsMatch = entitiesYaml.match(/terms:\s*\n((?:\s+-[\s\S]*?(?=\n\s+\w+:|\s*$))+)/);
+        if (termsMatch) {
+          const termsYaml = termsMatch[1];
+          const terms: Array<{ id: string; name: string }> = [];
+          const termsBlocks = termsYaml.split(/\n\s+-\s+id:/);
+          for (const block of termsBlocks) {
+            if (!block.trim()) {
+              continue;
+            }
+            const termText = block.startsWith('id:') ? block : 'id:' + block;
+            const idMatch = termText.match(/id:\s*(\S+)/);
+            const nameMatch = termText.match(/name:\s*(.+?)(?:\n|$)/);
+            if (idMatch && nameMatch) {
+              terms.push({
+                id: idMatch[1].trim(),
+                name: nameMatch[1].trim().replace(/^["']|["']$/g, ''),
+              });
+            }
+          }
+          if (terms.length > 0) {
+            metadata.entities.terms = terms;
+          }
+        }
+        
+        // Parse companies
+        const companiesMatch = entitiesYaml.match(/companies:\s*\n((?:\s+-[\s\S]*?(?=\n\s+\w+:|\s*$))+)/);
+        if (companiesMatch) {
+          const companiesYaml = companiesMatch[1];
+          const companies: Array<{ id: string; name: string }> = [];
+          const companiesBlocks = companiesYaml.split(/\n\s+-\s+id:/);
+          for (const block of companiesBlocks) {
+            if (!block.trim()) {
+              continue;
+            }
+            const companyText = block.startsWith('id:') ? block : 'id:' + block;
+            const idMatch = companyText.match(/id:\s*(\S+)/);
+            const nameMatch = companyText.match(/name:\s*(.+?)(?:\n|$)/);
+            if (idMatch && nameMatch) {
+              companies.push({
+                id: idMatch[1].trim(),
+                name: nameMatch[1].trim().replace(/^["']|["']$/g, ''),
+              });
+            }
+          }
+          if (companies.length > 0) {
+            metadata.entities.companies = companies;
+          }
         }
       }
     }
@@ -3735,7 +3995,7 @@ export class TranscriptDetailViewProvider {
       initial: '📝',
       enhanced: '✨',
       reviewed: '👀',
-      in_progress: '🔄',
+      'in_progress': '🔄',
       closed: '✅',
       archived: '📦',
     };
@@ -3747,7 +4007,7 @@ export class TranscriptDetailViewProvider {
       initial: 'Initial',
       enhanced: 'Enhanced',
       reviewed: 'Reviewed',
-      in_progress: 'In Progress',
+      'in_progress': 'In Progress',
       closed: 'Closed',
       archived: 'Archived',
     };
