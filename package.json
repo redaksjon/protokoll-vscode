@@ -2,7 +2,7 @@
   "name": "protokoll-vscode",
   "displayName": "Protokoll",
   "description": "VS Code extension for viewing Protokoll transcripts and entities via HTTP MCP server",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/redaksjon/protokoll-vscode.git"
