@@ -58,6 +58,136 @@ describe('TranscriptsViewProvider', () => {
         });
     });
 
+    describe('workspace settings persistence', () => {
+        it('should save project filter to workspace state', async () => {
+            provider.setClient(mockClient);
+            
+            // Mock the HTTP request that will be triggered by refresh()
+            mockHttpRequest({
+                statusCode: 200,
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    result: {
+                        contents: [{
+                            uri: 'protokoll://transcripts',
+                            mimeType: 'application/json',
+                            text: JSON.stringify({
+                                directory: '/test',
+                                transcripts: [],
+                                pagination: { total: 0, limit: 100, offset: 0, hasMore: false },
+                                filters: {},
+                            }),
+                        }],
+                    },
+                }),
+            });
+            
+            provider.setProjectFilter('test-project');
+            
+            // Wait for async save to complete
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            // Verify it was saved to workspace state
+            const saved = mockContext.workspaceState.get('protokoll.projectFilter');
+            expect(saved).toBe('test-project');
+        });
+
+        it('should load project filter from workspace state on initialization', () => {
+            // Set up workspace state before creating provider
+            mockContext.workspaceState.update('protokoll.projectFilter', 'saved-project');
+            
+            const newProvider = new TranscriptsViewProvider(mockContext);
+            expect(newProvider.getProjectFilter()).toBe('saved-project');
+        });
+
+        it('should save status filters to workspace state', async () => {
+            provider.setClient(mockClient);
+            
+            // Mock the HTTP request
+            mockHttpRequest({
+                statusCode: 200,
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    result: {
+                        contents: [{
+                            uri: 'protokoll://transcripts',
+                            mimeType: 'application/json',
+                            text: JSON.stringify({
+                                directory: '/test',
+                                transcripts: [],
+                                pagination: { total: 0, limit: 100, offset: 0, hasMore: false },
+                                filters: {},
+                            }),
+                        }],
+                    },
+                }),
+            });
+            
+            const newFilters = new Set(['initial', 'reviewed']);
+            provider.setStatusFilters(newFilters);
+            
+            // Wait for async save to complete
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            // Verify it was saved to workspace state
+            const saved = mockContext.workspaceState.get('protokoll.statusFilters');
+            expect(saved).toEqual(['initial', 'reviewed']);
+        });
+
+        it('should load status filters from workspace state on initialization', () => {
+            // Set up workspace state before creating provider
+            mockContext.workspaceState.update('protokoll.statusFilters', ['closed', 'archived']);
+            
+            const newProvider = new TranscriptsViewProvider(mockContext);
+            const filters = newProvider.getStatusFilters();
+            expect(filters).toEqual(new Set(['closed', 'archived']));
+        });
+
+        it('should save sort order to workspace state', async () => {
+            provider.setClient(mockClient);
+            
+            // Mock the HTTP request
+            mockHttpRequest({
+                statusCode: 200,
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    result: {
+                        contents: [{
+                            uri: 'protokoll://transcripts',
+                            mimeType: 'application/json',
+                            text: JSON.stringify({
+                                directory: '/test',
+                                transcripts: [],
+                                pagination: { total: 0, limit: 100, offset: 0, hasMore: false },
+                                filters: {},
+                            }),
+                        }],
+                    },
+                }),
+            });
+            
+            provider.setSortOrder('title-asc');
+            
+            // Wait for async save to complete
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            // Verify it was saved to workspace state
+            const saved = mockContext.workspaceState.get('protokoll.sortOrder');
+            expect(saved).toBe('title-asc');
+        });
+
+        it('should load sort order from workspace state on initialization', () => {
+            // Set up workspace state before creating provider
+            mockContext.workspaceState.update('protokoll.sortOrder', 'date-asc');
+            
+            const newProvider = new TranscriptsViewProvider(mockContext);
+            expect(newProvider.getSortOrder()).toBe('date-asc');
+        });
+    });
+
     describe('getTreeItem', () => {
         it('should return the element as tree item', () => {
             const item = new TranscriptItem(

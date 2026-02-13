@@ -23,6 +23,10 @@ describe('extension', () => {
                 }),
                 update: vi.fn(),
             },
+            workspaceState: {
+                get: vi.fn((key: string, defaultValue?: unknown) => defaultValue),
+                update: vi.fn(),
+            },
             subscriptions: [],
             extensionUri: vscode.Uri.parse('file:///test/extension'),
         } as unknown as vscode.ExtensionContext;
@@ -194,6 +198,24 @@ describe('extension', () => {
                 }),
             });
 
+            // Mock protokoll_info response for server mode detection
+            mockHttpRequest({
+                statusCode: 200,
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 2,
+                    result: {
+                        content: [{
+                            type: 'text',
+                            text: JSON.stringify({
+                                mode: 'local',
+                                acceptsDirectoryParameters: true,
+                            }),
+                        }],
+                    },
+                }),
+            });
+
             await activate(mockContext);
         });
 
@@ -304,11 +326,30 @@ describe('extension', () => {
             const handler = registeredCommands.get('protokoll.filterByProject');
             expect(handler).toBeDefined();
 
+            // Mock protokoll_info for server mode detection
             mockHttpRequest({
                 statusCode: 200,
                 body: JSON.stringify({
                     jsonrpc: '2.0',
                     id: 1,
+                    result: {
+                        content: [{
+                            type: 'text',
+                            text: JSON.stringify({
+                                mode: 'local',
+                                acceptsDirectoryParameters: true,
+                            }),
+                        }],
+                    },
+                }),
+            });
+
+            // Mock protokoll_list_projects
+            mockHttpRequest({
+                statusCode: 200,
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 2,
                     result: {
                         content: [{
                             type: 'text',
@@ -419,11 +460,30 @@ describe('extension', () => {
                 },
             };
 
+            // Mock protokoll_info for server mode detection
             mockHttpRequest({
                 statusCode: 200,
                 body: JSON.stringify({
                     jsonrpc: '2.0',
                     id: 1,
+                    result: {
+                        content: [{
+                            type: 'text',
+                            text: JSON.stringify({
+                                mode: 'local',
+                                acceptsDirectoryParameters: true,
+                            }),
+                        }],
+                    },
+                }),
+            });
+
+            // Mock protokoll_list_projects
+            mockHttpRequest({
+                statusCode: 200,
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 2,
                     result: {
                         content: [{
                             type: 'text',

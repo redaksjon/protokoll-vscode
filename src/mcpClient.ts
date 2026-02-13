@@ -22,7 +22,8 @@ export class McpClient {
   private onSessionRecoveredCallbacks: Array<() => void | Promise<void>> = []; // Callbacks to run after session recovery
 
   constructor(serverUrl: string) {
-    this.serverUrl = serverUrl;
+    // Remove trailing slash to ensure consistent URL handling
+    this.serverUrl = serverUrl.replace(/\/+$/, '');
   }
 
   /**
@@ -519,6 +520,25 @@ export class McpClient {
       const req = httpModule.request(options, (res) => {
         if (res.statusCode !== 200) {
           console.error(`Protokoll: [SSE] Connection failed with status ${res.statusCode}`);
+          
+          // Read error response body
+          let errorBody = '';
+          res.on('data', (chunk) => {
+            errorBody += chunk.toString();
+          });
+          res.on('end', () => {
+            console.error(`Protokoll: [SSE] Error response: ${errorBody}`);
+            
+            // If we get a 404, the session might be invalid
+            // Try to recover the session
+            if (res.statusCode === 404 && !this.recoveringSession) {
+              console.warn('Protokoll: [SSE] 404 error - session may be invalid, attempting recovery...');
+              this.recoverSession().catch((error) => {
+                console.error('Protokoll: [SSE] Failed to recover session:', error);
+              });
+            }
+          });
+          
           return;
         }
 

@@ -10,6 +10,7 @@ import * as fs from 'fs';
 import { McpClient } from './mcpClient';
 import { ChatViewProvider } from './chatView';
 import type { Transcript, TranscriptContent } from './types';
+import { shouldPassContextDirectory } from './serverMode';
 
 /**
  * Track temp files opened for editing, mapping file path -> transcript info
@@ -620,7 +621,9 @@ export class TranscriptDetailViewProvider {
 
     try {
       // List available projects
-      const contextDirectory = this.getDefaultContextDirectory();
+      // Only pass contextDirectory if server is in local mode
+      const shouldPass = await shouldPassContextDirectory(this._client);
+      const contextDirectory = shouldPass ? this.getDefaultContextDirectory() : undefined;
       const projectsResult = await this._client.callTool(
         'protokoll_list_projects',
         contextDirectory ? { contextDirectory } : {}

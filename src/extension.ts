@@ -12,6 +12,7 @@ import { ChatViewProvider } from './chatView';
 import { ChatsViewProvider } from './chatsView';
 import type { Transcript, TranscriptContent } from './types';
 import { log, initLogger } from './logger';
+import { shouldPassContextDirectory, clearServerModeCache } from './serverMode';
 
 let mcpClient: McpClient | null = null;
 let transcriptsViewProvider: TranscriptsViewProvider | null = null;
@@ -35,7 +36,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // Initialize MCP client
   const config = vscode.workspace.getConfiguration('protokoll');
-  const serverUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3001');
+  const rawServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3001');
+  // Remove trailing slashes to ensure consistent URL handling
+  const serverUrl = rawServerUrl.replace(/\/+$/, '');
   const hasConfiguredUrl = context.globalState.get<boolean>('protokoll.hasConfiguredUrl', false);
 
   // Check if server URL is configured or if we should prompt
@@ -58,6 +61,7 @@ export async function activate(context: vscode.ExtensionContext) {
   
   try {
     mcpClient = new McpClient(serverUrl);
+    clearServerModeCache(); // Clear cached server mode on new connection
     
     // Check server health
     const isHealthy = await mcpClient.healthCheck();
@@ -539,16 +543,19 @@ export async function activate(context: vscode.ExtensionContext) {
       });
 
       if (input) {
-        await config.update('serverUrl', input.trim(), true);
+        // Remove trailing slashes to ensure consistent URL handling
+        const cleanUrl = input.trim().replace(/\/+$/, '');
+        await config.update('serverUrl', cleanUrl, true);
         
         // Mark that user has configured the URL
         await context.globalState.update('protokoll.hasConfiguredUrl', true);
         
-        vscode.window.showInformationMessage(`Protokoll: Server URL updated to ${input.trim()}`);
+        vscode.window.showInformationMessage(`Protokoll: Server URL updated to ${cleanUrl}`);
         
         // Reinitialize client
         try {
-          mcpClient = new McpClient(input.trim());
+          mcpClient = new McpClient(cleanUrl);
+          clearServerModeCache(); // Clear cached server mode on new connection
           const isHealthy = await mcpClient.healthCheck();
           if (isHealthy) {
             await mcpClient.initialize();
@@ -642,7 +649,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
       try {
         // List available projects
-        const contextDirectory = getDefaultContextDirectory();
+        // Only pass contextDirectory if server is in local mode
+        const shouldPass = await shouldPassContextDirectory(mcpClient);
+        const contextDirectory = shouldPass ? getDefaultContextDirectory() : undefined;
         const projectsResult = await mcpClient.callTool(
           'protokoll_list_projects',
           contextDirectory ? { contextDirectory } : {}
@@ -906,7 +915,9 @@ export async function activate(context: vscode.ExtensionContext) {
   ): Promise<void> {
     try {
       // List available projects
-      const contextDirectory = getDefaultContextDirectory();
+      // Only pass contextDirectory if server is in local mode
+      const shouldPass = await shouldPassContextDirectory(client);
+      const contextDirectory = shouldPass ? getDefaultContextDirectory() : undefined;
       const projectsResult = await client.callTool(
         'protokoll_list_projects',
         contextDirectory ? { contextDirectory } : {}
@@ -1166,7 +1177,9 @@ export async function activate(context: vscode.ExtensionContext) {
         // Prompt for project
         let projectId: string | undefined;
         try {
-          const contextDirectory = getDefaultContextDirectory();
+          // Only pass contextDirectory if server is in local mode
+          const shouldPass = await shouldPassContextDirectory(mcpClient);
+          const contextDirectory = shouldPass ? getDefaultContextDirectory() : undefined;
           const projectsResult = await mcpClient.callTool(
             'protokoll_list_projects',
             contextDirectory ? { contextDirectory } : {}
@@ -1255,7 +1268,9 @@ export async function activate(context: vscode.ExtensionContext) {
   const configWatcher = vscode.workspace.onDidChangeConfiguration(async (e) => {
     if (e.affectsConfiguration('protokoll.serverUrl')) {
       const config = vscode.workspace.getConfiguration('protokoll');
-      const serverUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3000');
+      const rawServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3000');
+      // Remove trailing slashes to ensure consistent URL handling
+      const serverUrl = rawServerUrl.replace(/\/+$/, '');
       
       if (connectionStatusViewProvider) {
         connectionStatusViewProvider.setServerUrl(serverUrl);
@@ -1264,6 +1279,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (serverUrl && serverUrl !== '') {
         try {
           mcpClient = new McpClient(serverUrl);
+          clearServerModeCache(); // Clear cached server mode on new connection
           await mcpClient.initialize();
           const sessionId = mcpClient.getSessionId();
           if (transcriptsViewProvider) {

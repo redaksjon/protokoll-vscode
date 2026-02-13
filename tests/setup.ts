@@ -95,11 +95,42 @@ const mockVscode = {
     Three: 3,
   },
   ExtensionContext: class {
-    globalState = {
-      get: vi.fn(),
-      update: vi.fn(),
+    private _globalStateData: Map<string, unknown> = new Map();
+    private _workspaceStateData: Map<string, unknown> = new Map();
+    
+    globalState: {
+      get: (key: string, defaultValue?: unknown) => unknown;
+      update: (key: string, value: unknown) => Promise<void>;
     };
+    
+    workspaceState: {
+      get: (key: string, defaultValue?: unknown) => unknown;
+      update: (key: string, value: unknown) => Promise<void>;
+    };
+    
     subscriptions = [];
+    
+    constructor() {
+      this.globalState = {
+        get: (key: string, defaultValue?: unknown) => {
+          return this._globalStateData.has(key) ? this._globalStateData.get(key) : defaultValue;
+        },
+        update: (key: string, value: unknown) => {
+          this._globalStateData.set(key, value);
+          return Promise.resolve();
+        },
+      };
+      
+      this.workspaceState = {
+        get: (key: string, defaultValue?: unknown) => {
+          return this._workspaceStateData.has(key) ? this._workspaceStateData.get(key) : defaultValue;
+        },
+        update: (key: string, value: unknown) => {
+          this._workspaceStateData.set(key, value);
+          return Promise.resolve();
+        },
+      };
+    }
   },
   TreeItem: class {
     constructor(public label: string, public collapsibleState: number) {}

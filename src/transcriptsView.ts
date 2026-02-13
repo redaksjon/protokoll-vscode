@@ -26,7 +26,52 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   private sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc' = 'date-desc'; // Default: date descending
   private treeView: vscode.TreeView<TranscriptItem> | null = null;
 
-  constructor(private context: vscode.ExtensionContext) {}
+  constructor(private context: vscode.ExtensionContext) {
+    // Load workspace-specific filter settings
+    this.loadWorkspaceSettings();
+  }
+
+  /**
+   * Load filter settings from workspace state
+   */
+  private loadWorkspaceSettings(): void {
+    // Load project filter (workspace-specific)
+    const savedProjectFilter = this.context.workspaceState.get<string | null>('protokoll.projectFilter');
+    this.selectedProjectFilter = savedProjectFilter ?? null;
+    
+    // Load status filters (workspace-specific)
+    const savedStatusFilters = this.context.workspaceState.get<string[]>('protokoll.statusFilters');
+    if (savedStatusFilters) {
+      this.selectedStatusFilters = new Set(savedStatusFilters);
+    }
+    
+    // Load sort order (workspace-specific)
+    const savedSortOrder = this.context.workspaceState.get<'date-desc' | 'date-asc' | 'title-asc' | 'title-desc'>('protokoll.sortOrder');
+    if (savedSortOrder) {
+      this.sortOrder = savedSortOrder;
+    }
+    
+    log('TranscriptsViewProvider: Loaded workspace settings', {
+      projectFilter: this.selectedProjectFilter,
+      statusFilters: Array.from(this.selectedStatusFilters),
+      sortOrder: this.sortOrder
+    });
+  }
+
+  /**
+   * Save filter settings to workspace state
+   */
+  private async saveWorkspaceSettings(): Promise<void> {
+    await this.context.workspaceState.update('protokoll.projectFilter', this.selectedProjectFilter);
+    await this.context.workspaceState.update('protokoll.statusFilters', Array.from(this.selectedStatusFilters));
+    await this.context.workspaceState.update('protokoll.sortOrder', this.sortOrder);
+    
+    log('TranscriptsViewProvider: Saved workspace settings', {
+      projectFilter: this.selectedProjectFilter,
+      statusFilters: Array.from(this.selectedStatusFilters),
+      sortOrder: this.sortOrder
+    });
+  }
 
   setTreeView(treeView: vscode.TreeView<TranscriptItem>): void {
     this.treeView = treeView;
@@ -54,6 +99,10 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
   setProjectFilter(projectId: string | null): void {
     this.selectedProjectFilter = projectId;
+    // Save to workspace state
+    this.saveWorkspaceSettings().catch(err => {
+      log('Failed to save project filter to workspace state', err);
+    });
     // Refresh the transcript list with the new filter
     this.refresh().catch(err => {
       vscode.window.showErrorMessage(
@@ -68,6 +117,10 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
   setStatusFilters(statuses: Set<string>): void {
     this.selectedStatusFilters = statuses;
+    // Save to workspace state
+    this.saveWorkspaceSettings().catch(err => {
+      log('Failed to save status filters to workspace state', err);
+    });
     // Refresh the transcript list with the new filter
     this.refresh().catch(err => {
       vscode.window.showErrorMessage(
@@ -82,6 +135,10 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
   setSortOrder(sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc'): void {
     this.sortOrder = sortOrder;
+    // Save to workspace state
+    this.saveWorkspaceSettings().catch(err => {
+      log('Failed to save sort order to workspace state', err);
+    });
     // Refresh the transcript list with the new sort order
     this.refresh().catch(err => {
       vscode.window.showErrorMessage(

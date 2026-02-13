@@ -266,6 +266,8 @@ Content here.`;
         });
 
         it('should handle changeProject message', async () => {
+            vi.useFakeTimers();
+            
             provider.setClient(mockClient);
             
             const transcript: Transcript = {
@@ -282,7 +284,19 @@ Content here.`;
             };
 
             vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
-            vi.spyOn(mockClient, 'callTool').mockResolvedValue({});
+            
+            // Mock callTool to handle both protokoll_info and protokoll_list_projects
+            const callToolSpy = vi.spyOn(mockClient, 'callTool').mockImplementation(async (toolName: string) => {
+                if (toolName === 'protokoll_info') {
+                    return { mode: 'local', acceptsDirectoryParameters: true };
+                } else if (toolName === 'protokoll_list_projects') {
+                    return { projects: [{ id: 'project-1', name: 'Project 1', active: true }] };
+                } else if (toolName === 'protokoll_edit_transcript') {
+                    return {};
+                }
+                return {};
+            });
+            
             (vscode.window.showQuickPick as any).mockResolvedValue({ id: 'project-1', label: 'Project 1' });
             (vscode.commands.executeCommand as any).mockResolvedValue(undefined);
 
@@ -292,9 +306,14 @@ Content here.`;
                 await messageHandler({
                     command: 'changeProject',
                 });
+                
+                // Run all timers to execute the setTimeout callback
+                await vi.runAllTimersAsync();
             }
 
-            expect(mockClient.callTool).toHaveBeenCalled();
+            expect(callToolSpy).toHaveBeenCalled();
+            
+            vi.useRealTimers();
         });
 
         it('should handle addTag message', async () => {
