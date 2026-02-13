@@ -33,6 +33,7 @@ initLogger(outputChannel);
 
 export async function activate(context: vscode.ExtensionContext) {
   log('Protokoll extension is now active');
+  console.log('Protokoll: [ACTIVATION] Extension activate() called');
 
   // Initialize MCP client
   const config = vscode.workspace.getConfiguration('protokoll');
@@ -80,14 +81,10 @@ export async function activate(context: vscode.ExtensionContext) {
       try {
         await mcpClient.initialize();
         serverConnected = true;
-        const sessionId = mcpClient.getSessionId();
         vscode.window.showInformationMessage(`Protokoll: Connected to ${serverUrl}`);
         
-        // Update connection status view
-        if (connectionStatusViewProvider) {
-          connectionStatusViewProvider.setClient(mcpClient);
-          connectionStatusViewProvider.setConnectionStatus(true, sessionId);
-        }
+        // Note: connectionStatusViewProvider is not yet initialized at this point
+        // It will be set up later after view providers are created
         
         // Subscribe to resource list change notifications (for transcript list)
         console.log('Protokoll: [EXTENSION] Registering notification handler for resources_changed');
@@ -395,31 +392,40 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(closeListener);
 
   // Register tree views
+  log('Protokoll: Creating transcripts tree view...');
   const transcriptsTreeView = vscode.window.createTreeView('protokollTranscripts', {
     treeDataProvider: transcriptsViewProvider,
     showCollapseAll: false,
     canSelectMany: true, // Enable multi-selection
   });
+  log('Protokoll: Transcripts tree view created', { visible: transcriptsTreeView.visible });
 
   // Set the tree view reference in the provider
   transcriptsViewProvider.setTreeView(transcriptsTreeView);
 
   // Refresh transcripts when view becomes visible
-  let hasRefreshedOnce = false;
+  // Note: We don't use hasRefreshedOnce anymore because it caused race conditions
+  // where visibility fired before connection completed, blocking subsequent refreshes
   transcriptsTreeView.onDidChangeVisibility(async (e) => {
-    log('Protokoll: onDidChangeVisibility fired', { visible: e.visible, hasRefreshedOnce });
-    if (e.visible && !hasRefreshedOnce && transcriptsViewProvider) {
-      log('Protokoll: Transcripts view became visible, refreshing...');
-      hasRefreshedOnce = true;
-      await transcriptsViewProvider.refresh();
-      log('Protokoll: Auto-refresh on visibility completed');
-      
-      // VS Code sometimes doesn't render the tree immediately after visibility change
-      // Fire the change event again after a short delay to ensure rendering
-      setTimeout(() => {
-        log('Protokoll: Firing delayed tree refresh');
-        transcriptsViewProvider?.fireTreeDataChange();
-      }, 100);
+    log('Protokoll: onDidChangeVisibility fired', { visible: e.visible, hasClient: !!mcpClient, hasTranscripts: transcriptsViewProvider?.hasTranscripts() });
+    if (e.visible && transcriptsViewProvider && mcpClient) {
+      // Only refresh if we don't have data yet (avoids unnecessary API calls)
+      if (!transcriptsViewProvider.hasTranscripts()) {
+        log('Protokoll: Transcripts view became visible with no data, refreshing...');
+        await transcriptsViewProvider.refresh();
+        log('Protokoll: Auto-refresh on visibility completed');
+        
+        // VS Code sometimes doesn't render the tree immediately after visibility change
+        // Fire the change event again after a short delay to ensure rendering
+        setTimeout(() => {
+          log('Protokoll: Firing delayed tree refresh');
+          transcriptsViewProvider?.fireTreeDataChange();
+        }, 100);
+      } else {
+        log('Protokoll: Transcripts view visible but already has data, skipping refresh');
+      }
+    } else if (e.visible && !mcpClient) {
+      log('Protokoll: Transcripts view visible but no client yet, will refresh when connected');
     }
   });
 

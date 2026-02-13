@@ -86,7 +86,22 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
   setClient(client: McpClient): void {
     log('TranscriptsViewProvider.setClient called', { hasClient: !!client });
+    const hadClient = !!this.client;
     this.client = client;
+    
+    // If we just got a client and the tree view is visible, fire a change event
+    // to trigger getChildren which will auto-load data
+    if (!hadClient && client && this.treeView?.visible) {
+      log('TranscriptsViewProvider.setClient: Client set while view visible, firing change event');
+      this._onDidChangeTreeData.fire();
+    }
+  }
+
+  /**
+   * Check if transcripts have been loaded
+   */
+  hasTranscripts(): boolean {
+    return this.transcripts.length > 0;
   }
 
   /**
