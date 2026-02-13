@@ -20,6 +20,10 @@ let connectionStatusViewProvider: ConnectionStatusViewProvider | null = null;
 let chatViewProvider: ChatViewProvider | null = null;
 let chatsViewProvider: ChatsViewProvider | null = null;
 
+function getDefaultContextDirectory(): string | undefined {
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+}
+
 // Create an output channel for debugging
 const outputChannel = vscode.window.createOutputChannel('Protokoll Debug');
 
@@ -638,7 +642,11 @@ export async function activate(context: vscode.ExtensionContext) {
 
       try {
         // List available projects
-        const projectsResult = await mcpClient.callTool('protokoll_list_projects', {}) as {
+        const contextDirectory = getDefaultContextDirectory();
+        const projectsResult = await mcpClient.callTool(
+          'protokoll_list_projects',
+          contextDirectory ? { contextDirectory } : {}
+        ) as {
           projects?: Array<{ id: string; name: string; active?: boolean }>;
         };
 
@@ -898,7 +906,11 @@ export async function activate(context: vscode.ExtensionContext) {
   ): Promise<void> {
     try {
       // List available projects
-      const projectsResult = await client.callTool('protokoll_list_projects', {}) as {
+      const contextDirectory = getDefaultContextDirectory();
+      const projectsResult = await client.callTool(
+        'protokoll_list_projects',
+        contextDirectory ? { contextDirectory } : {}
+      ) as {
         projects?: Array<{ id: string; name: string; active?: boolean }>;
       };
 
@@ -1154,7 +1166,11 @@ export async function activate(context: vscode.ExtensionContext) {
         // Prompt for project
         let projectId: string | undefined;
         try {
-          const projectsResult = await mcpClient.callTool('protokoll_list_projects', {}) as {
+          const contextDirectory = getDefaultContextDirectory();
+          const projectsResult = await mcpClient.callTool(
+            'protokoll_list_projects',
+            contextDirectory ? { contextDirectory } : {}
+          ) as {
             projects?: Array<{ id: string; name: string; active?: boolean }>;
           };
           

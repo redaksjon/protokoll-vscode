@@ -198,6 +198,9 @@ export class TranscriptDetailViewProvider {
   private _panels: Map<string, vscode.WebviewPanel> = new Map();
   private _entityPanels: Map<string, vscode.WebviewPanel> = new Map(); // Track entity panels
   private _client: McpClient | null = null;
+  private getDefaultContextDirectory(): string | undefined {
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  }
   private _chatProvider: ChatViewProvider | null = null;
   private _currentTranscripts: Map<string, { uri: string; transcript: Transcript }> = new Map();
   private _updatingTranscripts: Set<string> = new Set(); // Track transcripts being updated
@@ -462,7 +465,10 @@ export class TranscriptDetailViewProvider {
 
         switch (message.command) {
           case 'changeProject':
-            await this.handleChangeProject(currentTranscript.transcript, transcriptUri);
+            // Defer to next tick so QuickPick can receive focus (webview focus workaround)
+            setTimeout(() => {
+              this.handleChangeProject(currentTranscript.transcript, transcriptUri);
+            }, 0);
             break;
           case 'changeDate':
             await this.handleChangeDate(currentTranscript.transcript, message.transcriptPath, transcriptUri);
@@ -614,36 +620,107 @@ export class TranscriptDetailViewProvider {
 
     try {
       // List available projects
-      const projectsResult = await this._client.callTool('protokoll_list_projects', {}) as {
+      const contextDirectory = this.getDefaultContextDirectory();
+      const projectsResult = await this._client.callTool(
+        'protokoll_list_projects',
+        contextDirectory ? { contextDirectory } : {}
+      ) as {
         projects?: Array<{ id: string; name: string; active?: boolean }>;
       };
 
-      if (!projectsResult.projects || projectsResult.projects.length === 0) {
-        vscode.window.showWarningMessage('No projects found.');
-        return;
-      }
+      const allProjects = projectsResult.projects || [];
 
-      // Filter to active projects only
-      const activeProjects = projectsResult.projects.filter(p => p.active !== false);
+      // In the detail view "Assign Project" flow, show ALL projects (active + inactive).
+      // Users may still want to assign to an inactive project, and hiding them makes it
+      // look like the server isn't returning projects at all.
+      const createDescription =
+        allProjects.length === 0
+          ? 'No projects returned from server — create one and assign this transcript'
+          : 'Add a new project and assign this transcript to it';
 
-      if (activeProjects.length === 0) {
-        vscode.window.showWarningMessage('No active projects found.');
-        return;
-      }
-
-      // Show quick pick to select project
-      const projectItems = activeProjects.map(p => ({
-        label: p.name,
-        description: p.id,
-        id: p.id,
-      }));
+      // Build quick pick items - always include "Create new project" option
+      const projectItems: Array<vscode.QuickPickItem & { id: string | null; isCreateNew?: boolean; active?: boolean }> = [
+        {
+          label: '$(add) Create new project...',
+          description: createDescription,
+          id: '',
+          isCreateNew: true,
+        },
+        ...(allProjects.length > 0
+          ? ([
+              {
+                label: '',
+                kind: vscode.QuickPickItemKind.Separator,
+                id: null,
+                isCreateNew: false,
+              },
+            ] as Array<vscode.QuickPickItem & { id: string | null; isCreateNew?: boolean; active?: boolean }>)
+          : []),
+        ...allProjects.map(p => ({
+          label: p.active === false ? `$(circle-slash) ${p.name}` : p.name,
+          description: p.active === false ? `${p.id} (inactive)` : p.id,
+          id: p.id,
+          isCreateNew: false,
+          active: p.active,
+        })),
+      ];
 
       const selected = await vscode.window.showQuickPick(projectItems, {
         placeHolder: 'Select a project for this transcript',
+        title: 'Assign Project',
+        ignoreFocusOut: true,
+        matchOnDescription: true,
       });
 
       if (!selected) {
         return; // User cancelled
+      }
+
+      let projectId: string;
+      let projectName: string;
+
+      if (selected.isCreateNew) {
+        // Create new project
+        const projectNameInput = await vscode.window.showInputBox({
+          prompt: 'Enter name for the new project',
+          placeHolder: 'Project name',
+          title: 'Create Project',
+          ignoreFocusOut: true,
+          validateInput: (value) => {
+            if (!value || value.trim() === '') {
+              return 'Project name cannot be empty';
+            }
+            return null;
+          },
+        });
+
+        if (!projectNameInput || !projectNameInput.trim()) {
+          return;
+        }
+
+        const addResult = await this._client.callTool('protokoll_add_project', {
+          name: projectNameInput.trim(),
+        }) as { id?: string; name?: string; entity?: { id: string; name: string } };
+
+        // Support both { id, name } and { entity: { id, name } } response formats
+        const createdId = addResult.entity?.id ?? addResult.id;
+        const createdName = addResult.entity?.name ?? addResult.name ?? projectNameInput.trim();
+
+        if (!createdId) {
+          vscode.window.showErrorMessage('Failed to create project: No ID returned');
+          return;
+        }
+
+        projectId = createdId;
+        projectName = createdName;
+      } else {
+        projectId = selected.id ?? '';
+        projectName = selected.label;
+      }
+
+      if (!projectId) {
+        vscode.window.showErrorMessage('No project selected');
+        return;
       }
 
       // Update transcript - convert absolute path to relative path
@@ -651,16 +728,16 @@ export class TranscriptDetailViewProvider {
       const transcriptPath = this.convertToRelativePath(rawPath);
       
       // Log for debugging
-      console.log(`Protokoll: Updating transcript with path: ${transcriptPath}, projectId: ${selected.id}`);
+      console.log(`Protokoll: Updating transcript with path: ${transcriptPath}, projectId: ${projectId}`);
       
       try {
         const result = await this._client.callTool('protokoll_edit_transcript', {
           transcriptPath: transcriptPath,
-          projectId: selected.id,
+          projectId: projectId,
         });
         
         console.log(`Protokoll: Edit transcript result:`, result);
-        vscode.window.showInformationMessage(`Protokoll: Transcript assigned to project "${selected.label}"`);
+        vscode.window.showInformationMessage(`Protokoll: Transcript assigned to project "${projectName}"`);
       } catch (toolError) {
         console.error(`Protokoll: Error calling protokoll_edit_transcript:`, toolError);
         throw toolError; // Re-throw to be caught by outer catch
@@ -678,8 +755,8 @@ export class TranscriptDetailViewProvider {
           entities: {
             ...currentTranscript.transcript.entities,
             projects: [{
-              id: selected.id,
-              name: selected.label,
+              id: projectId,
+              name: projectName,
             }],
           },
         };
@@ -3193,7 +3270,7 @@ export class TranscriptDetailViewProvider {
             ` : `
                 <div class="project-info">
                     <span style="color: var(--vscode-descriptionForeground); font-style: italic;">No project assigned</span>
-                    <button class="button button-secondary" onclick="changeProject()">Assign Project <span class="kbd-hint">P</span></button>
+                    <button type="button" class="button button-secondary" onclick="changeProject()">Assign Project <span class="kbd-hint">P</span></button>
                 </div>
             `}
         </div>
