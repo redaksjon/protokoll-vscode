@@ -106,6 +106,12 @@ export interface TranscriptContent {
     };
   };
   content: string;
+  rawTranscript?: {
+    text: string;
+    model?: string;
+    duration?: number;
+    transcribedAt?: string;
+  };
 }
 
 export interface JsonRpcRequest {

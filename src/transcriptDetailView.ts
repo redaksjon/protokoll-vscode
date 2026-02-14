@@ -2637,26 +2637,50 @@ export class TranscriptDetailViewProvider {
             background-color: var(--vscode-editor-inactiveSelectionBackground);
             border: 1px solid var(--vscode-panel-border);
             border-radius: 4px;
-            padding: 16px;
-            margin-bottom: 24px;
+            padding: 12px 16px;
+            margin-bottom: 16px;
         }
         .metadata h2 {
-            margin-top: 0;
+            margin: 0 0 8px 0;
             color: var(--vscode-textLink-foreground);
+            font-size: 0.95em;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .metadata h2:hover {
+            opacity: 0.8;
+        }
+        .metadata-toggle-icon {
+            font-size: 0.8em;
+            transition: transform 0.2s;
+        }
+        .metadata.collapsed .metadata-toggle-icon {
+            transform: rotate(-90deg);
+        }
+        .metadata-content {
+            margin-top: 8px;
+        }
+        .metadata.collapsed .metadata-content {
+            display: none;
         }
         .metadata-row {
             display: flex;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
             align-items: flex-start;
         }
         .metadata-label {
             font-weight: 600;
-            min-width: 120px;
+            min-width: 100px;
             color: var(--vscode-descriptionForeground);
+            font-size: 0.9em;
         }
         .metadata-value {
             flex: 1;
             color: var(--vscode-foreground);
+            font-size: 0.9em;
         }
         .metadata-value-with-actions {
             flex: 1;
@@ -2721,8 +2745,43 @@ export class TranscriptDetailViewProvider {
             margin: 0;
         }
         .transcript-content-wrapper {
-            margin-top: 24px;
+            margin-top: 16px;
             position: relative;
+        }
+        .content-tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 12px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        .content-tab {
+            background: transparent;
+            border: none;
+            padding: 8px 16px;
+            cursor: pointer;
+            color: var(--vscode-descriptionForeground);
+            font-size: 0.95em;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+        .content-tab:hover {
+            color: var(--vscode-foreground);
+            background-color: var(--vscode-list-hoverBackground);
+        }
+        .content-tab.active {
+            color: var(--vscode-textLink-foreground);
+            border-bottom-color: var(--vscode-textLink-foreground);
+            font-weight: 600;
+        }
+        .content-tab.disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
         }
         .edit-button {
             background-color: var(--vscode-button-background);
@@ -2801,14 +2860,34 @@ export class TranscriptDetailViewProvider {
             background-color: var(--vscode-editor-inactiveSelectionBackground);
             border: 1px solid var(--vscode-panel-border);
             border-radius: 4px;
-            padding: 16px;
-            margin-bottom: 24px;
+            padding: 12px 16px;
+            margin-bottom: 16px;
         }
         .tasks-section h3 {
-            margin-top: 0;
-            margin-bottom: 12px;
+            margin: 0 0 8px 0;
             color: var(--vscode-textLink-foreground);
-            font-size: 1em;
+            font-size: 0.95em;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .tasks-section h3:hover {
+            opacity: 0.8;
+        }
+        .tasks-toggle-icon {
+            font-size: 0.8em;
+            transition: transform 0.2s;
+        }
+        .tasks-section.collapsed .tasks-toggle-icon {
+            transform: rotate(-90deg);
+        }
+        .tasks-content {
+            margin-top: 8px;
+        }
+        .tasks-section.collapsed .tasks-content {
+            display: none;
         }
         .task-item {
             display: flex;
@@ -3120,66 +3199,76 @@ export class TranscriptDetailViewProvider {
             <button class="button button-secondary" onclick="cancelEditTitle()">Cancel (Esc)</button>
         </div>
     </div>
-    <div class="metadata">
-        <h2>Transcript Metadata</h2>
-        <div class="metadata-row">
-            <div class="metadata-label">Date/Time:</div>
-            <div class="metadata-value">
-                <span class="editable-date" onclick="changeDate()" title="Click to change transcript date">
-                    ${this.escapeHtml(dateTime)}
-                    <svg class="edit-icon-small" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                        <path d="M11.5 1.5L14.5 4.5L5 14H2V11L11.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                        <path d="M10 3L13 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                    </svg>
-                </span>
-            </div>
-        </div>
-        ${createdAt ? `
-        <div class="metadata-row">
-            <div class="metadata-label">Created At:</div>
-            <div class="metadata-value">${this.escapeHtml(this.formatDate(createdAt))}</div>
-        </div>
-        ` : ''}
-        ${updatedAt ? `
-        <div class="metadata-row">
-            <div class="metadata-label">Updated At:</div>
-            <div class="metadata-value">${this.escapeHtml(this.formatDate(updatedAt))}</div>
-        </div>
-        ` : ''}
-        <div class="metadata-row">
-            <div class="metadata-label">Status:</div>
-            <div class="metadata-value">
-                <span class="status-badge ${this.escapeHtml(status)}" onclick="changeStatus()" title="Click to change status">
-                    ${this.getStatusIcon(status)} ${this.getStatusLabel(status)}
-                </span>
-            </div>
-        </div>
-        <div class="metadata-row">
-            <div class="metadata-label">Tags:</div>
-            <div class="metadata-value">
-                ${tags.map(tag => `
-                    <span class="tag">
-                        ${this.escapeHtml(tag)}
-                        <button class="tag-remove" onclick="event.stopPropagation(); removeTag('${this.escapeHtml(tag)}'); return false;" title="Remove tag">×</button>
+    <div class="metadata collapsed" id="metadata-section">
+        <h2 onclick="toggleMetadata()">
+            <span class="metadata-toggle-icon">▼</span>
+            Metadata
+        </h2>
+        <div class="metadata-content">
+            <div class="metadata-row">
+                <div class="metadata-label">Date/Time:</div>
+                <div class="metadata-value">
+                    <span class="editable-date" onclick="changeDate()" title="Click to change transcript date">
+                        ${this.escapeHtml(dateTime)}
+                        <svg class="edit-icon-small" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M11.5 1.5L14.5 4.5L5 14H2V11L11.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            <path d="M10 3L13 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
                     </span>
-                `).join('')}
-                <button class="tag-add" onclick="addTag()" title="Add tag">+ Add Tag <span class="kbd-hint">G</span></button>
+                </div>
+            </div>
+            ${createdAt ? `
+            <div class="metadata-row">
+                <div class="metadata-label">Created:</div>
+                <div class="metadata-value">${this.escapeHtml(this.formatDate(createdAt))}</div>
+            </div>
+            ` : ''}
+            ${updatedAt ? `
+            <div class="metadata-row">
+                <div class="metadata-label">Updated:</div>
+                <div class="metadata-value">${this.escapeHtml(this.formatDate(updatedAt))}</div>
+            </div>
+            ` : ''}
+            <div class="metadata-row">
+                <div class="metadata-label">Status:</div>
+                <div class="metadata-value">
+                    <span class="status-badge ${this.escapeHtml(status)}" onclick="changeStatus()" title="Click to change status">
+                        ${this.getStatusIcon(status)} ${this.getStatusLabel(status)}
+                    </span>
+                </div>
+            </div>
+            <div class="metadata-row">
+                <div class="metadata-label">Tags:</div>
+                <div class="metadata-value">
+                    ${tags.map(tag => `
+                        <span class="tag">
+                            ${this.escapeHtml(tag)}
+                            <button class="tag-remove" onclick="event.stopPropagation(); removeTag('${this.escapeHtml(tag)}'); return false;" title="Remove tag">×</button>
+                        </span>
+                    `).join('')}
+                    <button class="tag-add" onclick="addTag()" title="Add tag">+ Add Tag <span class="kbd-hint">G</span></button>
+                </div>
             </div>
         </div>
     </div>
-    <div class="tasks-section">
-        <h3>Tasks ${openTasks.length > 0 ? `(${openTasks.length} open)` : ''}</h3>
-        ${tasks.length === 0 ? `
-            <div class="empty-tasks">No tasks</div>
-        ` : tasks.map((task: { id: string; description: string; status: string }) => `
-            <div class="task-item ${task.status}">
-                <input type="checkbox" class="task-checkbox" ${task.status === 'done' ? 'checked' : ''} 
-                    onchange="toggleTask('${this.escapeHtml(task.id)}')" />
-                <span class="task-description">${this.escapeHtml(task.description)}</span>
-                <button class="task-delete-btn" onclick="deleteTask('${this.escapeHtml(task.id)}')" title="Delete task">×</button>
-            </div>
-        `).join('')}
-        <button class="task-add-btn" onclick="addTask()">+ Add Task <span class="kbd-hint">K</span></button>
+    <div class="tasks-section collapsed" id="tasks-section">
+        <h3 onclick="toggleTasks()">
+            <span class="tasks-toggle-icon">▼</span>
+            Tasks ${openTasks.length > 0 ? `(${openTasks.length} open)` : ''}
+        </h3>
+        <div class="tasks-content">
+            ${tasks.length === 0 ? `
+                <div class="empty-tasks">No tasks</div>
+            ` : tasks.map((task: { id: string; description: string; status: string }) => `
+                <div class="task-item ${task.status}">
+                    <input type="checkbox" class="task-checkbox" ${task.status === 'done' ? 'checked' : ''} 
+                        onchange="toggleTask('${this.escapeHtml(task.id)}')" />
+                    <span class="task-description">${this.escapeHtml(task.description)}</span>
+                    <button class="task-delete-btn" onclick="deleteTask('${this.escapeHtml(task.id)}')" title="Delete task">×</button>
+                </div>
+            `).join('')}
+            <button class="task-add-btn" onclick="addTask()">+ Add Task <span class="kbd-hint">K</span></button>
+        </div>
     </div>
     <div class="inline-chat-container" id="inline-chat-container">
         <div class="inline-chat-input-wrapper">
@@ -3197,14 +3286,34 @@ export class TranscriptDetailViewProvider {
         </div>
     </div>
     <div class="transcript-content-wrapper">
-        <div style="display: flex; gap: 8px; margin-bottom: 16px;">
-            <button class="edit-button" onclick="editInEditor()" id="edit-in-editor-btn" title="Edit in VS Code editor (supports voice dictation)">Edit in Editor <span class="kbd-hint">E</span></button>
-            <button class="edit-button" onclick="openSource()" id="open-source-btn" title="View source (read-only)" style="opacity: 0.7;">View Source <span class="kbd-hint">S</span></button>
+        <div class="content-tabs">
+            <button class="content-tab active" id="enhanced-tab" onclick="switchTab('enhanced')">Enhanced</button>
+            <button class="content-tab ${content.rawTranscript ? '' : 'disabled'}" id="raw-tab" onclick="switchTab('raw')" ${content.rawTranscript ? '' : 'disabled'}>Original</button>
         </div>
-        <div class="transcript-content" id="transcript-content-display">
-            ${this.markdownToHtml(transcriptText)}
+        <div class="tab-content active" id="enhanced-content">
+            <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+                <button class="edit-button" onclick="editInEditor()" id="edit-in-editor-btn" title="Edit in VS Code editor (supports voice dictation)">Edit in Editor <span class="kbd-hint">E</span></button>
+                <button class="edit-button" onclick="openSource()" id="open-source-btn" title="View source (read-only)" style="opacity: 0.7;">View Source <span class="kbd-hint">S</span></button>
+            </div>
+            <div class="transcript-content" id="transcript-content-display">
+                ${this.markdownToHtml(transcriptText)}
+            </div>
+            <button class="create-entity-button" id="create-entity-btn" onclick="createEntityFromSelection()">Create Entity</button>
         </div>
-        <button class="create-entity-button" id="create-entity-btn" onclick="createEntityFromSelection()">Create Entity</button>
+        ${content.rawTranscript ? `
+        <div class="tab-content" id="raw-content">
+            <div class="transcript-content" style="white-space: pre-wrap; font-family: var(--vscode-editor-font-family);">
+                ${this.escapeHtml(content.rawTranscript.text)}
+            </div>
+            ${content.rawTranscript.model || content.rawTranscript.transcribedAt ? `
+            <div style="margin-top: 16px; padding: 12px; background-color: var(--vscode-editor-inactiveSelectionBackground); border-radius: 4px; font-size: 0.85em; color: var(--vscode-descriptionForeground);">
+                ${content.rawTranscript.model ? `Model: ${this.escapeHtml(content.rawTranscript.model)}` : ''}
+                ${content.rawTranscript.model && content.rawTranscript.transcribedAt ? ' • ' : ''}
+                ${content.rawTranscript.transcribedAt ? `Transcribed: ${this.escapeHtml(this.formatDate(content.rawTranscript.transcribedAt))}` : ''}
+            </div>
+            ` : ''}
+        </div>
+        ` : ''}
     </div>
     ${this.renderEntityReferences(entityReferences)}
     <script>
@@ -3214,6 +3323,40 @@ export class TranscriptDetailViewProvider {
         const projectId = ${JSON.stringify(projectId)};
         const currentTags = ${JSON.stringify(tags)};
         const originalTranscriptText = ${JSON.stringify(transcriptText)};
+
+        function toggleMetadata() {
+            const section = document.getElementById('metadata-section');
+            if (section) {
+                section.classList.toggle('collapsed');
+            }
+        }
+
+        function toggleTasks() {
+            const section = document.getElementById('tasks-section');
+            if (section) {
+                section.classList.toggle('collapsed');
+            }
+        }
+
+        function switchTab(tabName) {
+            // Update tab buttons
+            document.querySelectorAll('.content-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            const activeTab = document.getElementById(tabName + '-tab');
+            if (activeTab && !activeTab.disabled) {
+                activeTab.classList.add('active');
+            }
+
+            // Update tab content
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.remove('active');
+            });
+            const activeContent = document.getElementById(tabName + '-content');
+            if (activeContent) {
+                activeContent.classList.add('active');
+            }
+        }
 
         function changeProject() {
             vscode.postMessage({
