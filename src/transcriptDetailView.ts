@@ -3261,7 +3261,7 @@ export class TranscriptDetailViewProvider {
                 </div>
             </div>
         </div>
-        <div class="tasks-section collapsed" id="tasks-section">
+        <div class="tasks-section" id="tasks-section">
             <h3 onclick="toggleTasks()">
                 <span class="tasks-toggle-icon">▼</span>
                 Tasks ${openTasks.length > 0 ? `(${openTasks.length} open)` : ''}
