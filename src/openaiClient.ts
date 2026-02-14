@@ -160,6 +160,58 @@ export class OpenAIClient {
           required: ['transcriptPaths'],
         },
       },
+      {
+        name: 'protokoll_set_status',
+        description: 'Change the lifecycle status of a transcript. Status values: initial, enhanced, reviewed, in_progress, closed, archived.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            transcriptPath: { type: 'string', description: 'Filename, partial filename, or absolute path' },
+            status: { type: 'string', description: 'New status (initial, enhanced, reviewed, in_progress, closed, archived)' },
+            contextDirectory: { type: 'string', description: 'Optional: Path to the .protokoll context directory' },
+          },
+          required: ['transcriptPath', 'status'],
+        },
+      },
+      {
+        name: 'protokoll_create_task',
+        description: 'Add a new task to a transcript. Tasks are follow-up actions to complete. Returns the generated task ID for later reference.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            transcriptPath: { type: 'string', description: 'Filename, partial filename, or absolute path' },
+            description: { type: 'string', description: 'Description of the task (1-2 sentences)' },
+            contextDirectory: { type: 'string', description: 'Optional: Path to the .protokoll context directory' },
+          },
+          required: ['transcriptPath', 'description'],
+        },
+      },
+      {
+        name: 'protokoll_complete_task',
+        description: 'Mark a task as done. Sets the completed timestamp.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            transcriptPath: { type: 'string', description: 'Filename, partial filename, or absolute path' },
+            taskId: { type: 'string', description: 'ID of the task to complete (e.g., "task-1234567890-abc123")' },
+            contextDirectory: { type: 'string', description: 'Optional: Path to the .protokoll context directory' },
+          },
+          required: ['transcriptPath', 'taskId'],
+        },
+      },
+      {
+        name: 'protokoll_delete_task',
+        description: 'Remove a task from a transcript permanently.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            transcriptPath: { type: 'string', description: 'Filename, partial filename, or absolute path' },
+            taskId: { type: 'string', description: 'ID of the task to delete (e.g., "task-1234567890-abc123")' },
+            contextDirectory: { type: 'string', description: 'Optional: Path to the .protokoll context directory' },
+          },
+          required: ['transcriptPath', 'taskId'],
+        },
+      },
     ];
   }
 
