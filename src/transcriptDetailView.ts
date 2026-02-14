@@ -3209,7 +3209,7 @@ export class TranscriptDetailViewProvider {
         </div>
     </div>
     <div class="info-grid">
-        <div class="metadata collapsed" id="metadata-section">
+        <div class="metadata" id="metadata-section">
             <h2 onclick="toggleMetadata()">
                 <span class="metadata-toggle-icon">▼</span>
                 Metadata
