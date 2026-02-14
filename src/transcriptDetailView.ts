@@ -2633,12 +2633,22 @@ export class TranscriptDetailViewProvider {
         .project-section .button {
             margin-left: 0;
         }
+        .info-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        @media (max-width: 900px) {
+            .info-grid {
+                grid-template-columns: 1fr;
+            }
+        }
         .metadata {
             background-color: var(--vscode-editor-inactiveSelectionBackground);
             border: 1px solid var(--vscode-panel-border);
             border-radius: 4px;
             padding: 12px 16px;
-            margin-bottom: 16px;
         }
         .metadata h2 {
             margin: 0 0 8px 0;
@@ -2861,7 +2871,6 @@ export class TranscriptDetailViewProvider {
             border: 1px solid var(--vscode-panel-border);
             border-radius: 4px;
             padding: 12px 16px;
-            margin-bottom: 16px;
         }
         .tasks-section h3 {
             margin: 0 0 8px 0;
@@ -3199,75 +3208,77 @@ export class TranscriptDetailViewProvider {
             <button class="button button-secondary" onclick="cancelEditTitle()">Cancel (Esc)</button>
         </div>
     </div>
-    <div class="metadata collapsed" id="metadata-section">
-        <h2 onclick="toggleMetadata()">
-            <span class="metadata-toggle-icon">▼</span>
-            Metadata
-        </h2>
-        <div class="metadata-content">
-            <div class="metadata-row">
-                <div class="metadata-label">Date/Time:</div>
-                <div class="metadata-value">
-                    <span class="editable-date" onclick="changeDate()" title="Click to change transcript date">
-                        ${this.escapeHtml(dateTime)}
-                        <svg class="edit-icon-small" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                            <path d="M11.5 1.5L14.5 4.5L5 14H2V11L11.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                            <path d="M10 3L13 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                        </svg>
-                    </span>
-                </div>
-            </div>
-            ${createdAt ? `
-            <div class="metadata-row">
-                <div class="metadata-label">Created:</div>
-                <div class="metadata-value">${this.escapeHtml(this.formatDate(createdAt))}</div>
-            </div>
-            ` : ''}
-            ${updatedAt ? `
-            <div class="metadata-row">
-                <div class="metadata-label">Updated:</div>
-                <div class="metadata-value">${this.escapeHtml(this.formatDate(updatedAt))}</div>
-            </div>
-            ` : ''}
-            <div class="metadata-row">
-                <div class="metadata-label">Status:</div>
-                <div class="metadata-value">
-                    <span class="status-badge ${this.escapeHtml(status)}" onclick="changeStatus()" title="Click to change status">
-                        ${this.getStatusIcon(status)} ${this.getStatusLabel(status)}
-                    </span>
-                </div>
-            </div>
-            <div class="metadata-row">
-                <div class="metadata-label">Tags:</div>
-                <div class="metadata-value">
-                    ${tags.map(tag => `
-                        <span class="tag">
-                            ${this.escapeHtml(tag)}
-                            <button class="tag-remove" onclick="event.stopPropagation(); removeTag('${this.escapeHtml(tag)}'); return false;" title="Remove tag">×</button>
+    <div class="info-grid">
+        <div class="metadata collapsed" id="metadata-section">
+            <h2 onclick="toggleMetadata()">
+                <span class="metadata-toggle-icon">▼</span>
+                Metadata
+            </h2>
+            <div class="metadata-content">
+                <div class="metadata-row">
+                    <div class="metadata-label">Date/Time:</div>
+                    <div class="metadata-value">
+                        <span class="editable-date" onclick="changeDate()" title="Click to change transcript date">
+                            ${this.escapeHtml(dateTime)}
+                            <svg class="edit-icon-small" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path d="M11.5 1.5L14.5 4.5L5 14H2V11L11.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                                <path d="M10 3L13 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
                         </span>
-                    `).join('')}
-                    <button class="tag-add" onclick="addTag()" title="Add tag">+ Add Tag <span class="kbd-hint">G</span></button>
+                    </div>
+                </div>
+                ${createdAt ? `
+                <div class="metadata-row">
+                    <div class="metadata-label">Created:</div>
+                    <div class="metadata-value">${this.escapeHtml(this.formatDate(createdAt))}</div>
+                </div>
+                ` : ''}
+                ${updatedAt ? `
+                <div class="metadata-row">
+                    <div class="metadata-label">Updated:</div>
+                    <div class="metadata-value">${this.escapeHtml(this.formatDate(updatedAt))}</div>
+                </div>
+                ` : ''}
+                <div class="metadata-row">
+                    <div class="metadata-label">Status:</div>
+                    <div class="metadata-value">
+                        <span class="status-badge ${this.escapeHtml(status)}" onclick="changeStatus()" title="Click to change status">
+                            ${this.getStatusIcon(status)} ${this.getStatusLabel(status)}
+                        </span>
+                    </div>
+                </div>
+                <div class="metadata-row">
+                    <div class="metadata-label">Tags:</div>
+                    <div class="metadata-value">
+                        ${tags.map(tag => `
+                            <span class="tag">
+                                ${this.escapeHtml(tag)}
+                                <button class="tag-remove" onclick="event.stopPropagation(); removeTag('${this.escapeHtml(tag)}'); return false;" title="Remove tag">×</button>
+                            </span>
+                        `).join('')}
+                        <button class="tag-add" onclick="addTag()" title="Add tag">+ Add Tag <span class="kbd-hint">G</span></button>
+                    </div>
                 </div>
             </div>
         </div>
-    </div>
-    <div class="tasks-section collapsed" id="tasks-section">
-        <h3 onclick="toggleTasks()">
-            <span class="tasks-toggle-icon">▼</span>
-            Tasks ${openTasks.length > 0 ? `(${openTasks.length} open)` : ''}
-        </h3>
-        <div class="tasks-content">
-            ${tasks.length === 0 ? `
-                <div class="empty-tasks">No tasks</div>
-            ` : tasks.map((task: { id: string; description: string; status: string }) => `
-                <div class="task-item ${task.status}">
-                    <input type="checkbox" class="task-checkbox" ${task.status === 'done' ? 'checked' : ''} 
-                        onchange="toggleTask('${this.escapeHtml(task.id)}')" />
-                    <span class="task-description">${this.escapeHtml(task.description)}</span>
-                    <button class="task-delete-btn" onclick="deleteTask('${this.escapeHtml(task.id)}')" title="Delete task">×</button>
-                </div>
-            `).join('')}
-            <button class="task-add-btn" onclick="addTask()">+ Add Task <span class="kbd-hint">K</span></button>
+        <div class="tasks-section collapsed" id="tasks-section">
+            <h3 onclick="toggleTasks()">
+                <span class="tasks-toggle-icon">▼</span>
+                Tasks ${openTasks.length > 0 ? `(${openTasks.length} open)` : ''}
+            </h3>
+            <div class="tasks-content">
+                ${tasks.length === 0 ? `
+                    <div class="empty-tasks">No tasks</div>
+                ` : tasks.map((task: { id: string; description: string; status: string }) => `
+                    <div class="task-item ${task.status}">
+                        <input type="checkbox" class="task-checkbox" ${task.status === 'done' ? 'checked' : ''} 
+                            onchange="toggleTask('${this.escapeHtml(task.id)}')" />
+                        <span class="task-description">${this.escapeHtml(task.description)}</span>
+                        <button class="task-delete-btn" onclick="deleteTask('${this.escapeHtml(task.id)}')" title="Delete task">×</button>
+                    </div>
+                `).join('')}
+                <button class="task-add-btn" onclick="addTask()">+ Add Task <span class="kbd-hint">K</span></button>
+            </div>
         </div>
     </div>
     <div class="inline-chat-container" id="inline-chat-container">
