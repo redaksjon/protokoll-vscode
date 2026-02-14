@@ -527,6 +527,17 @@ describe('extension', () => {
                 },
             };
 
+            const transcriptData = {
+                uri: 'protokoll://transcript/test',
+                path: 'test.md',
+                title: 'Test Transcript',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test Content',
+            };
+
             mockHttpRequest({
                 statusCode: 200,
                 body: JSON.stringify({
@@ -534,9 +545,9 @@ describe('extension', () => {
                     id: 1,
                     result: {
                         contents: [{
-                            uri: 'protokoll://transcript/test.md',
-                            mimeType: 'text/markdown',
-                            text: '# Test Content',
+                            uri: 'protokoll://transcript/test',
+                            mimeType: 'application/json',
+                            text: JSON.stringify(transcriptData),
                         }],
                     },
                 }),

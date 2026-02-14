@@ -26,86 +26,6 @@ export interface EditableTranscriptInfo {
   originalBody: string;
 }
 
-/**
- * Parse transcript content to separate header (metadata) from body.
- * The header includes the YAML front matter or markdown metadata, and the --- separator.
- * Returns { header, body } where header should be preserved and body is editable.
- * 
- * Supports two formats:
- * 1. YAML front matter (new format):
- *    ---
- *    status: closed
- *    entities: ...
- *    ---
- *    # Title
- *    Body content here
- * 
- * 2. Markdown metadata (legacy format):
- *    # Title
- *    ## Metadata
- *    **Date**: ...
- *    ---
- *    Body content here
- */
-function parseTranscriptContent(content: string): { header: string; body: string } {
-  // Check if content starts with YAML front matter (new format)
-  if (content.trimStart().startsWith('---')) {
-    // Find the closing --- delimiter
-    const lines = content.split('\n');
-    let firstDelimiterIndex = -1;
-    let secondDelimiterIndex = -1;
-    
-    // Find first --- (should be at or near the start)
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].trim() === '---') {
-        if (firstDelimiterIndex === -1) {
-          firstDelimiterIndex = i;
-        } else {
-          secondDelimiterIndex = i;
-          break;
-        }
-      }
-    }
-    
-    // If we found both delimiters, split there
-    if (firstDelimiterIndex !== -1 && secondDelimiterIndex !== -1) {
-      const header = lines.slice(0, secondDelimiterIndex + 1).join('\n') + '\n';
-      const body = lines.slice(secondDelimiterIndex + 1).join('\n').trim();
-      return { header, body };
-    }
-  }
-  
-  // Legacy format: Look for the --- separator that ends the metadata section
-  // The format is typically:
-  // # Title
-  // ## Metadata
-  // **Date**: ...
-  // **Time**: ...
-  // ---
-  // Body content here
-  
-  const separatorIndex = content.indexOf('\n---\n');
-  if (separatorIndex !== -1) {
-    // Include the --- line in the header
-    const header = content.substring(0, separatorIndex + 5); // +5 for '\n---\n'
-    const body = content.substring(separatorIndex + 5).trim();
-    return { header, body };
-  }
-  
-  // Also try just '---' at start of a line (might be at end of file or different formatting)
-  const lines = content.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim() === '---') {
-      const header = lines.slice(0, i + 1).join('\n') + '\n';
-      const body = lines.slice(i + 1).join('\n').trim();
-      return { header, body };
-    }
-  }
-  
-  // No separator found - treat everything as body (shouldn't happen for valid transcripts)
-  return { header: '', body: content };
-}
-
 // Global map of temp file paths -> transcript info for save syncing
 const editableTranscriptFiles: Map<string, EditableTranscriptInfo> = new Map();
 
@@ -265,20 +185,14 @@ export class TranscriptDetailViewProvider {
       // Track when transcript was fetched
       this._transcriptLastFetched.set(transcriptUri, new Date());
       
-      // Update the stored transcript with fresh data (may include updatedAt and entities)
+      // Update the stored transcript with fresh data from structured response
       const updatedTranscript = { ...currentTranscript.transcript };
       
-      // Parse metadata from content (including entities from YAML frontmatter)
-      const parsedMetadata = this.parseMetadata(content.text);
-      if (parsedMetadata.updatedAt) {
-        updatedTranscript.updatedAt = parsedMetadata.updatedAt;
-      }
-      
-      // Update entities from parsed metadata if available
-      if (parsedMetadata.entities) {
+      // Use structured metadata from server - no parsing needed
+      if (content.metadata.entities) {
         updatedTranscript.entities = {
           ...updatedTranscript.entities,
-          ...parsedMetadata.entities,
+          ...content.metadata.entities,
         };
       }
       
@@ -568,7 +482,7 @@ export class TranscriptDetailViewProvider {
       this._transcriptLastFetched.set(transcriptUri, new Date());
       
       // Debug: Log if content is empty
-      if (!content.text || content.text.trim().length === 0) {
+      if (!content.content || content.content.trim().length === 0) {
         console.warn(`Protokoll: Empty content for transcript ${transcriptUri}`);
       }
       
@@ -888,9 +802,9 @@ export class TranscriptDetailViewProvider {
     }
 
     try {
-      // Get current tags from the transcript content
+      // Get current tags from the structured response
       const content: TranscriptContent = await this._client.readTranscript(transcript.uri);
-      const currentTags = this.parseTags(content.text);
+      const currentTags = content.metadata.tags || [];
       
       // Check if tag already exists
       if (currentTags.includes(newTag.trim())) {
@@ -1417,7 +1331,7 @@ export class TranscriptDetailViewProvider {
       
       // Get the global content provider and set the content BEFORE opening the document
       const provider = getTranscriptContentProvider();
-      provider.setContentForUri(virtualUri, content.text);
+      provider.setContentForUri(virtualUri, content.content);
       
       // Small delay to ensure content is set before VS Code requests it
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -1455,11 +1369,11 @@ export class TranscriptDetailViewProvider {
     }
 
     try {
-      // Fetch transcript content from MCP server
+      // Fetch transcript content from MCP server - returns structured JSON
       const content: TranscriptContent = await this._client.readTranscript(transcriptUri);
       
-      // Parse content to separate header (metadata) from body
-      const { header, body } = parseTranscriptContent(content.text);
+      // With structured response, content.content is already the body text (no header parsing needed)
+      const body = content.content;
       
       // Create a temp file with title in filename for clear tab title
       const title = transcript.title || transcript.filename || 'Transcript';
@@ -1467,15 +1381,16 @@ export class TranscriptDetailViewProvider {
       const tempDir = os.tmpdir();
       const tempFilePath = path.join(tempDir, `Editing - ${safeTitle}.md`);
       
-      // Write only the body content to temp file (not the metadata header)
+      // Write only the body content to temp file (metadata is stored on server)
       fs.writeFileSync(tempFilePath, body, 'utf8');
       
-      // Track this file for save syncing, storing header separately
+      // Track this file for save syncing
+      // Note: With PKL format, metadata is stored separately - no header needed
       editableTranscriptFiles.set(tempFilePath, {
         transcriptPath: this.convertToRelativePath(transcriptPath),
         transcriptUri: transcriptUri,
-        originalContent: content.text,
-        header: header,
+        originalContent: content.content,
+        header: '', // No header with PKL format - metadata is separate
         originalBody: body,
       });
       
@@ -2461,94 +2376,36 @@ export class TranscriptDetailViewProvider {
   }
 
   public getWebviewContent(transcript: Transcript, content: TranscriptContent, lastFetched?: Date): string {
-    const text = content.text;
-    const metadata: Record<string, string> = {};
-    let transcriptText = text;
-
-    // Try to parse frontmatter at the start (YAML-style)
-    const frontmatterMatch = text.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
-    if (frontmatterMatch) {
-      const frontmatter = frontmatterMatch[1];
-      transcriptText = frontmatterMatch[2];
-
-      // Parse YAML-like frontmatter
-      frontmatter.split('\n').forEach((line) => {
-        const match = line.match(/^(\w+):\s*(.+)$/);
-        if (match) {
-          metadata[match[1]] = match[2].trim();
-        }
-      });
-    }
-
-    // Parse metadata from the content (Date, Time, Project, Project ID)
-    const parsedMetadata = this.parseMetadata(text);
-
-    // Parse tags from the content
-    const tags = this.parseTags(text);
-
-    // Parse routing information from the content (reserved for future use)
-    this.parseRouting(text);
-
-    // Parse entity references from the content
-    const entityReferences = this.parseEntityReferences(text);
+    // Server returns structured JSON - use metadata directly, no parsing needed
+    const transcriptText = content.content || '*No content available*';
+    const tags = content.metadata.tags || [];
     
-    // Add project from parsed metadata if available and not already in entity references (legacy format)
-    if (parsedMetadata.projectId && parsedMetadata.project) {
-      if (!entityReferences.projects) {
-        entityReferences.projects = [];
-      }
-      // Check if project already exists
-      const projectExists = entityReferences.projects.some(p => p.id === parsedMetadata.projectId);
+    // Entity references come directly from server
+    const entityReferences: {
+      projects?: Array<{ id: string; name: string }>;
+      people?: Array<{ id: string; name: string }>;
+      terms?: Array<{ id: string; name: string }>;
+      companies?: Array<{ id: string; name: string }>;
+    } = {
+      projects: content.metadata.entities?.projects || [],
+      people: content.metadata.entities?.people || [],
+      terms: content.metadata.entities?.terms || [],
+      companies: content.metadata.entities?.companies || [],
+    };
+    
+    // Add project from metadata if available and not already in entity references
+    if (content.metadata.projectId && content.metadata.project) {
+      const projectExists = entityReferences.projects?.some(p => p.id === content.metadata.projectId);
       if (!projectExists) {
+        entityReferences.projects = entityReferences.projects || [];
         entityReferences.projects.push({
-          id: parsedMetadata.projectId,
-          name: parsedMetadata.project,
+          id: content.metadata.projectId,
+          name: content.metadata.project,
         });
       }
     }
     
-    // Merge with entities from parsed metadata (YAML frontmatter)
-    if (parsedMetadata.entities) {
-      if (parsedMetadata.entities.projects) {
-        entityReferences.projects = [
-          ...(entityReferences.projects || []),
-          ...parsedMetadata.entities.projects.map(p => ({ id: p.id, name: p.name }))
-        ];
-        // Remove duplicates
-        entityReferences.projects = entityReferences.projects.filter((p, index, self) =>
-          index === self.findIndex((t) => t.id === p.id)
-        );
-      }
-      if (parsedMetadata.entities.people) {
-        entityReferences.people = [
-          ...(entityReferences.people || []),
-          ...parsedMetadata.entities.people.map(p => ({ id: p.id, name: p.name }))
-        ];
-        entityReferences.people = entityReferences.people.filter((p, index, self) =>
-          index === self.findIndex((t) => t.id === p.id)
-        );
-      }
-      if (parsedMetadata.entities.terms) {
-        entityReferences.terms = [
-          ...(entityReferences.terms || []),
-          ...parsedMetadata.entities.terms.map(t => ({ id: t.id, name: t.name }))
-        ];
-        entityReferences.terms = entityReferences.terms.filter((t, index, self) =>
-          index === self.findIndex((e) => e.id === t.id)
-        );
-      }
-      if (parsedMetadata.entities.companies) {
-        entityReferences.companies = [
-          ...(entityReferences.companies || []),
-          ...parsedMetadata.entities.companies.map(c => ({ id: c.id, name: c.name }))
-        ];
-        entityReferences.companies = entityReferences.companies.filter((c, index, self) =>
-          index === self.findIndex((e) => e.id === c.id)
-        );
-      }
-    }
-    
-    // Also merge with entities from transcript object if available
+    // Also merge with entities from transcript object if available (for backwards compatibility)
     if (transcript.entities) {
       if (transcript.entities.projects) {
         entityReferences.projects = [
@@ -2589,57 +2446,23 @@ export class TranscriptDetailViewProvider {
       }
     }
 
-    // Extract content after the YAML frontmatter (if present)
-    // Look for the pattern: ---\n(yaml content)\n---\n(actual content)
-    // We want to extract everything after the last closing --- delimiter
-    const yamlFrontmatterMatch = transcriptText.match(/---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/);
-    if (yamlFrontmatterMatch) {
-      // Found YAML frontmatter with content after it
-      transcriptText = yamlFrontmatterMatch[1].trim();
-    } else {
-      // No YAML frontmatter pattern found, try legacy format
-      // Look for content after a single --- delimiter (legacy metadata format)
-      const legacyDelimiterMatch = transcriptText.match(/---\s*\n([\s\S]*)$/);
-      if (legacyDelimiterMatch) {
-        transcriptText = legacyDelimiterMatch[1].trim();
-        
-        // If the content starts with another ---, it might be YAML frontmatter
-        // In that case, look for content after the closing ---
-        if (transcriptText.startsWith('---')) {
-          const afterYamlMatch = transcriptText.match(/^---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/);
-          if (afterYamlMatch) {
-            transcriptText = afterYamlMatch[1].trim();
-          }
-        }
-      } else {
-        // No delimiters found, use the old method to remove redundant sections
-        transcriptText = this.removeRedundantSections(transcriptText);
-        transcriptText = this.removeRedundantTitle(transcriptText, transcript.title || transcript.filename);
-      }
-    }
-    
-    // Ensure we have content to display
-    if (!transcriptText || transcriptText.trim().length === 0) {
-      transcriptText = '*No content available*';
-    }
-
-    // Format date/time - prefer parsed metadata, fallback to transcript object
-    const date = parsedMetadata.date || transcript.date || 'Unknown date';
-    const time = parsedMetadata.time || transcript.time || '';
+    // Format date/time - use structured metadata from server
+    const date = content.metadata.date || transcript.date || 'Unknown date';
+    const time = content.metadata.time || transcript.time || '';
     const dateTime = time ? `${date} ${time}` : date;
 
-    // Get createdAt and updatedAt - prefer parsed metadata, fallback to transcript object
-    const createdAt = parsedMetadata.createdAt || transcript.createdAt;
-    const updatedAt = parsedMetadata.updatedAt || transcript.updatedAt;
+    // Get createdAt and updatedAt from transcript object (not in content.metadata)
+    const createdAt = transcript.createdAt;
+    const updatedAt = transcript.updatedAt;
 
-    // Get status and tasks - prefer parsed metadata, fallback to transcript object
-    const status = parsedMetadata.status || transcript.status || 'reviewed';
-    const tasks = parsedMetadata.tasks || transcript.tasks || [];
+    // Get status and tasks from structured metadata
+    const status = content.metadata.status || transcript.status || 'reviewed';
+    const tasks = content.metadata.tasks || transcript.tasks || [];
     const openTasks = tasks.filter((t: { status: string }) => t.status === 'open');
 
-    // Get project info - prefer parsed metadata entities, then legacy metadata fields, fallback to transcript object
-    const projectId = parsedMetadata.entities?.projects?.[0]?.id || parsedMetadata.projectId || transcript.entities?.projects?.[0]?.id || '';
-    const projectName = parsedMetadata.entities?.projects?.[0]?.name || parsedMetadata.project || transcript.entities?.projects?.[0]?.name || '';
+    // Get project info from structured metadata
+    const projectId = content.metadata.entities?.projects?.[0]?.id || content.metadata.projectId || transcript.entities?.projects?.[0]?.id || '';
+    const projectName = content.metadata.entities?.projects?.[0]?.name || content.metadata.project || transcript.entities?.projects?.[0]?.name || '';
     const transcriptPath = transcript.path || transcript.filename;
 
     return `<!DOCTYPE html>
@@ -3343,12 +3166,6 @@ export class TranscriptDetailViewProvider {
                 <button class="tag-add" onclick="addTag()" title="Add tag">+ Add Tag <span class="kbd-hint">G</span></button>
             </div>
         </div>
-        ${Object.entries(metadata).map(([key, value]) => `
-        <div class="metadata-row">
-            <div class="metadata-label">${this.escapeHtml(key)}:</div>
-            <div class="metadata-value">${this.escapeHtml(value)}</div>
-        </div>
-        `).join('')}
     </div>
     <div class="tasks-section">
         <h3>Tasks ${openTasks.length > 0 ? `(${openTasks.length} open)` : ''}</h3>

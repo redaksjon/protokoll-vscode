@@ -103,8 +103,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test Transcript\n\nContent here.',
+                path: '/path/to/test.md',
+                title: 'Test Transcript',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test Transcript\n\nContent here.',
             };
 
             const html = provider.getWebviewContent(transcript, content);
@@ -124,8 +129,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Content\n\nSome content.',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Content\n\nSome content.',
             };
 
             const html = provider.getWebviewContent(transcript, content);
@@ -146,8 +156,17 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: 'Content',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                    entities: {
+                        people: [{ id: 'john-doe', name: 'John Doe' }],
+                        projects: [{ id: 'test-project', name: 'Test Project' }],
+                    },
+                },
+                content: 'Content',
             };
 
             const html = provider.getWebviewContent(transcript, content);
@@ -188,8 +207,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test Transcript\n\nContent.',
+                path: '/path/to/test.md',
+                title: 'Test Transcript',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test Transcript\n\nContent.',
             };
 
             // Mock readTranscript
@@ -279,8 +303,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
             };
 
             vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
@@ -328,8 +357,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test\n\nTags: tag1',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: ['tag1'],
+                },
+                content: '# Test\n\nTags: tag1',
             };
 
             vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
@@ -361,8 +395,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
             };
 
             vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);

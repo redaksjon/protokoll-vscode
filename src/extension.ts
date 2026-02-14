@@ -1013,7 +1013,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
       try {
         const content: TranscriptContent = await mcpClient.readTranscript(item.transcript.uri);
-        await vscode.env.clipboard.writeText(content.text);
+        await vscode.env.clipboard.writeText(content.content);
         vscode.window.showInformationMessage('Transcript text copied to clipboard');
       } catch (error) {
         vscode.window.showErrorMessage(

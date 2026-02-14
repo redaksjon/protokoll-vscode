@@ -314,10 +314,21 @@ describe('McpClient', () => {
 
     describe('readTranscript', () => {
         it('should read transcript successfully', async () => {
-            const mockContent: TranscriptContent = {
-                uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test Transcript',
+            const transcriptData: TranscriptContent = {
+                uri: 'protokoll://transcript/test',
+                path: 'test.md',
+                title: 'Test Transcript',
+                metadata: {
+                    date: '2024-01-01',
+                    tags: ['test'],
+                },
+                content: '# Test Transcript',
+            };
+
+            const mockResource = {
+                uri: 'protokoll://transcript/test',
+                mimeType: 'application/json',
+                text: JSON.stringify(transcriptData),
             };
 
             mockHttpRequest({
@@ -326,14 +337,16 @@ describe('McpClient', () => {
                     jsonrpc: '2.0',
                     id: 1,
                     result: {
-                        contents: [mockContent],
+                        contents: [mockResource],
                     },
                 }),
             });
 
             const result = await client.readTranscript('protokoll://transcript/test.md');
-            expect(result.uri).toBe('protokoll://transcript/test.md');
-            expect(result.text).toBe('# Test Transcript');
+            expect(result.uri).toBe('protokoll://transcript/test');
+            expect(result.content).toBe('# Test Transcript');
+            expect(result.title).toBe('Test Transcript');
+            expect(result.metadata.tags).toEqual(['test']);
         });
     });
 
