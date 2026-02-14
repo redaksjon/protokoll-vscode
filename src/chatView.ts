@@ -14,6 +14,7 @@ interface TranscriptContext {
   path: string; // Path to transcript (can be relative or absolute)
   filename: string; // Exact filename (e.g., "02012026073646.md")
   uri: string;
+  content?: string; // Optional: Full transcript content (fetched from MCP)
 }
 
 export class ChatViewProvider {
@@ -263,6 +264,7 @@ Example: If user says "Change the title to X", immediately call protokoll_edit_t
     }
 
     // Set current transcript context AFTER disposing old panel
+    // Also fetch the actual transcript content from MCP if we have a URI
     if (transcriptContext) {
       this._currentTranscript = transcriptContext;
       console.log('Protokoll: [CHAT] Set transcript context for new panel:', {
@@ -271,6 +273,39 @@ Example: If user says "Change the title to X", immediately call protokoll_edit_t
         path: transcriptContext.path,
         uri: transcriptContext.uri
       });
+      
+      // Fetch transcript content via MCP so we can include it in the system message
+      if (transcriptUri && this._mcpClient) {
+        try {
+          console.log('Protokoll: [CHAT] Fetching transcript content from MCP for URI:', transcriptUri);
+          const transcriptData = await this._mcpClient.readTranscript(transcriptUri);
+          console.log('Protokoll: [CHAT] Received transcript data:', {
+            hasContent: !!transcriptData?.content,
+            contentLength: transcriptData?.content?.length || 0,
+            contentPreview: transcriptData?.content?.substring(0, 100) || 'N/A',
+            title: transcriptData?.title,
+            path: transcriptData?.path
+          });
+          // Store the content in the transcript context
+          if (transcriptData && transcriptData.content) {
+            (this._currentTranscript as { content?: string }).content = transcriptData.content;
+            console.log('Protokoll: [CHAT] ✅ Successfully stored transcript content in context');
+          } else {
+            console.error('Protokoll: [CHAT] ❌ Transcript data has no content field:', JSON.stringify(transcriptData, null, 2));
+          }
+        } catch (error) {
+          console.error('Protokoll: [CHAT] ❌ Failed to fetch transcript content:', error);
+          if (error instanceof Error) {
+            console.error('Protokoll: [CHAT] Error details:', error.message, error.stack);
+          }
+          // Continue anyway - the AI can still try to use tools to fetch it
+        }
+      } else {
+        console.warn('Protokoll: [CHAT] Cannot fetch transcript content:', {
+          hasTranscriptUri: !!transcriptUri,
+          hasMcpClient: !!this._mcpClient
+        });
+      }
     } else {
       console.log('Protokoll: [CHAT] No transcript context provided - chat will be generic');
     }
@@ -480,15 +515,26 @@ Example: If user says "Change the title to X", immediately call protokoll_edit_t
           console.error('Protokoll: [CHAT] ERROR: No transcript identifier available (filename, path, or title)');
           console.error('Protokoll: [CHAT] Transcript context:', JSON.stringify(this._currentTranscript, null, 2));
         } else {
-          const systemMessage: ChatCompletionMessageParam = {
-            role: 'system',
-            content: `You are helping the user review and improve a Protokoll transcript.
+          // Build system message with transcript content if available
+          let systemContent = `You are helping the user review and improve a Protokoll transcript.
 
 === CURRENT TRANSCRIPT (THE ONLY TRANSCRIPT FOR THIS CONVERSATION) ===
 Title: ${this._currentTranscript.title || 'Untitled'}
 Filename: ${this._currentTranscript.filename || 'N/A'}
 Path: ${this._currentTranscript.path || 'N/A'}
-URI: ${this._currentTranscript.uri}
+URI: ${this._currentTranscript.uri}`;
+
+          // Include transcript content if we have it
+          if (this._currentTranscript.content) {
+            systemContent += `
+
+=== TRANSCRIPT CONTENT ===
+${this._currentTranscript.content}
+
+=== END TRANSCRIPT CONTENT ===`;
+          }
+
+          systemContent += `
 
 === MANDATORY RULES - FOLLOW THESE EXACTLY ===
 1. This ENTIRE conversation is about ONLY ONE transcript: the one listed above.
@@ -500,13 +546,22 @@ URI: ${this._currentTranscript.uri}
 5. NEVER ask for the transcript filename or path - you already have it: "${transcriptIdentifier}"
 6. If the user says "change the title" or "rename" or "edit", they mean THIS transcript.
 7. Execute the user's request immediately using "${transcriptIdentifier}" as the transcriptPath.
+${this._currentTranscript.content ? '8. ⚠️ CRITICAL: You ALREADY HAVE the FULL TRANSCRIPT CONTENT above in the "TRANSCRIPT CONTENT" section. DO NOT call protokoll_read_transcript - you already have all the content you need. Just read it from the system message above.' : '8. If you need the transcript content, call protokoll_read_transcript with transcriptPath="${transcriptIdentifier}".'}
 
-Example: If user says "Change the title to X", immediately call protokoll_edit_transcript with transcriptPath="${transcriptIdentifier}" and title="X". Do NOT ask which transcript.`,
+Example: If user says "Change the title to X", immediately call protokoll_edit_transcript with transcriptPath="${transcriptIdentifier}" and title="X". Do NOT ask which transcript.`;
+
+          const systemMessage: ChatCompletionMessageParam = {
+            role: 'system',
+            content: systemContent,
           };
           openaiMessages.push(systemMessage);
           console.log('Protokoll: [CHAT] ✅ Added system message with transcript context');
           console.log('Protokoll: [CHAT] Using transcript identifier:', transcriptIdentifier);
-          console.log('Protokoll: [CHAT] Full transcript context:', JSON.stringify(this._currentTranscript, null, 2));
+          console.log('Protokoll: [CHAT] Has transcript content:', !!this._currentTranscript.content);
+          console.log('Protokoll: [CHAT] Full transcript context:', JSON.stringify({
+            ...this._currentTranscript,
+            content: this._currentTranscript.content ? `[${this._currentTranscript.content.length} chars]` : undefined
+          }, null, 2));
         }
       } else if (transcriptUri) {
         // Fallback: add context if we have URI but no full context

@@ -147,20 +147,28 @@ vi.mock('vscode', () => {
 });
 
 // Mock http and https modules
-vi.mock('http', async () => {
+vi.mock('http', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('http')>();
   const { mockHttpRequestFn } = await import('./helpers/httpMock');
   return {
+    ...actual,
     default: {
+      ...actual.default,
       request: mockHttpRequestFn,
+      createServer: actual.createServer, // Use real createServer for mock MCP server
     },
     request: mockHttpRequestFn,
+    createServer: actual.createServer, // Use real createServer for mock MCP server
   };
 });
 
-vi.mock('https', async () => {
+vi.mock('https', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('https')>();
   const { mockHttpsRequestFn } = await import('./helpers/httpMock');
   return {
+    ...actual,
     default: {
+      ...actual.default,
       request: mockHttpsRequestFn,
     },
     request: mockHttpsRequestFn,
