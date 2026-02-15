@@ -2,19 +2,7 @@
  * Test setup - Mock VS Code API and HTTP modules
  */
 
-import { vi, afterEach } from 'vitest';
-
-// Global cleanup after each test to prevent memory leaks
-afterEach(() => {
-  // Clear all timers
-  vi.clearAllTimers();
-  // Clear all mocks
-  vi.clearAllMocks();
-  // Force garbage collection if available (Node.js with --expose-gc flag)
-  if (global.gc) {
-    global.gc();
-  }
-});
+import { vi } from 'vitest';
 
 // Mock vscode module
 const mockVscode = {
