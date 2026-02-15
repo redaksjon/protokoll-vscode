@@ -2,7 +2,7 @@
   "name": "protokoll-vscode",
   "displayName": "Protokoll",
   "description": "VS Code extension for viewing Protokoll transcripts and entities via HTTP MCP server",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/redaksjon/protokoll-vscode.git"
@@ -288,11 +288,12 @@
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
     "lint:fix": "eslint src --ext ts --fix",
-    "test": "vitest run --coverage",
-    "test:watch": "vitest watch",
+    "test": "NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' vitest run --coverage",
+    "test:fast": "NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' vitest run --coverage --exclude='tests/extension.test.ts' --exclude='tests/mcpClient.test.ts' --exclude='tests/openaiClient.test.ts' --exclude='tests/transcriptsView.test.ts'",
+    "test:watch": "NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' vitest watch",
     "build": "npm run lint && npm run compile",
     "clean": "rm -rf out",
-    "precommit": "npm run lint && npm run build && npm run test",
+    "precommit": "npm run lint && npm run build && npm run test:fast",
     "prepublishOnly": "npm run clean && npm run build",
     "package": "vsce package",
     "publish": "npm run build && npm run package",
@@ -312,6 +313,6 @@
     "vitest": "^2.0.0"
   },
   "dependencies": {
-    "openai": "^4.67.0"
+    "openai": "^6.22.0"
   }
 }

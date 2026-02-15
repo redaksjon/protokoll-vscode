@@ -10,6 +10,7 @@ import * as fs from 'fs';
 import { McpClient } from './mcpClient';
 import { ChatViewProvider } from './chatView';
 import type { Transcript, TranscriptContent } from './types';
+import { shouldPassContextDirectory } from './serverMode';
 
 /**
  * Track temp files opened for editing, mapping file path -> transcript info
@@ -23,86 +24,6 @@ export interface EditableTranscriptInfo {
   header: string;
   /** The original body content (for change detection) */
   originalBody: string;
-}
-
-/**
- * Parse transcript content to separate header (metadata) from body.
- * The header includes the YAML front matter or markdown metadata, and the --- separator.
- * Returns { header, body } where header should be preserved and body is editable.
- * 
- * Supports two formats:
- * 1. YAML front matter (new format):
- *    ---
- *    status: closed
- *    entities: ...
- *    ---
- *    # Title
- *    Body content here
- * 
- * 2. Markdown metadata (legacy format):
- *    # Title
- *    ## Metadata
- *    **Date**: ...
- *    ---
- *    Body content here
- */
-function parseTranscriptContent(content: string): { header: string; body: string } {
-  // Check if content starts with YAML front matter (new format)
-  if (content.trimStart().startsWith('---')) {
-    // Find the closing --- delimiter
-    const lines = content.split('\n');
-    let firstDelimiterIndex = -1;
-    let secondDelimiterIndex = -1;
-    
-    // Find first --- (should be at or near the start)
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].trim() === '---') {
-        if (firstDelimiterIndex === -1) {
-          firstDelimiterIndex = i;
-        } else {
-          secondDelimiterIndex = i;
-          break;
-        }
-      }
-    }
-    
-    // If we found both delimiters, split there
-    if (firstDelimiterIndex !== -1 && secondDelimiterIndex !== -1) {
-      const header = lines.slice(0, secondDelimiterIndex + 1).join('\n') + '\n';
-      const body = lines.slice(secondDelimiterIndex + 1).join('\n').trim();
-      return { header, body };
-    }
-  }
-  
-  // Legacy format: Look for the --- separator that ends the metadata section
-  // The format is typically:
-  // # Title
-  // ## Metadata
-  // **Date**: ...
-  // **Time**: ...
-  // ---
-  // Body content here
-  
-  const separatorIndex = content.indexOf('\n---\n');
-  if (separatorIndex !== -1) {
-    // Include the --- line in the header
-    const header = content.substring(0, separatorIndex + 5); // +5 for '\n---\n'
-    const body = content.substring(separatorIndex + 5).trim();
-    return { header, body };
-  }
-  
-  // Also try just '---' at start of a line (might be at end of file or different formatting)
-  const lines = content.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim() === '---') {
-      const header = lines.slice(0, i + 1).join('\n') + '\n';
-      const body = lines.slice(i + 1).join('\n').trim();
-      return { header, body };
-    }
-  }
-  
-  // No separator found - treat everything as body (shouldn't happen for valid transcripts)
-  return { header: '', body: content };
 }
 
 // Global map of temp file paths -> transcript info for save syncing
@@ -198,6 +119,9 @@ export class TranscriptDetailViewProvider {
   private _panels: Map<string, vscode.WebviewPanel> = new Map();
   private _entityPanels: Map<string, vscode.WebviewPanel> = new Map(); // Track entity panels
   private _client: McpClient | null = null;
+  private getDefaultContextDirectory(): string | undefined {
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  }
   private _chatProvider: ChatViewProvider | null = null;
   private _currentTranscripts: Map<string, { uri: string; transcript: Transcript }> = new Map();
   private _updatingTranscripts: Set<string> = new Set(); // Track transcripts being updated
@@ -261,20 +185,14 @@ export class TranscriptDetailViewProvider {
       // Track when transcript was fetched
       this._transcriptLastFetched.set(transcriptUri, new Date());
       
-      // Update the stored transcript with fresh data (may include updatedAt and entities)
+      // Update the stored transcript with fresh data from structured response
       const updatedTranscript = { ...currentTranscript.transcript };
       
-      // Parse metadata from content (including entities from YAML frontmatter)
-      const parsedMetadata = this.parseMetadata(content.text);
-      if (parsedMetadata.updatedAt) {
-        updatedTranscript.updatedAt = parsedMetadata.updatedAt;
-      }
-      
-      // Update entities from parsed metadata if available
-      if (parsedMetadata.entities) {
+      // Use structured metadata from server - no parsing needed
+      if (content.metadata.entities) {
         updatedTranscript.entities = {
           ...updatedTranscript.entities,
-          ...parsedMetadata.entities,
+          ...content.metadata.entities,
         };
       }
       
@@ -462,7 +380,10 @@ export class TranscriptDetailViewProvider {
 
         switch (message.command) {
           case 'changeProject':
-            await this.handleChangeProject(currentTranscript.transcript, transcriptUri);
+            // Defer to next tick so QuickPick can receive focus (webview focus workaround)
+            setTimeout(() => {
+              this.handleChangeProject(currentTranscript.transcript, transcriptUri);
+            }, 0);
             break;
           case 'changeDate':
             await this.handleChangeDate(currentTranscript.transcript, message.transcriptPath, transcriptUri);
@@ -561,7 +482,7 @@ export class TranscriptDetailViewProvider {
       this._transcriptLastFetched.set(transcriptUri, new Date());
       
       // Debug: Log if content is empty
-      if (!content.text || content.text.trim().length === 0) {
+      if (!content.content || content.content.trim().length === 0) {
         console.warn(`Protokoll: Empty content for transcript ${transcriptUri}`);
       }
       
@@ -614,36 +535,109 @@ export class TranscriptDetailViewProvider {
 
     try {
       // List available projects
-      const projectsResult = await this._client.callTool('protokoll_list_projects', {}) as {
+      // Only pass contextDirectory if server is in local mode
+      const shouldPass = await shouldPassContextDirectory(this._client);
+      const contextDirectory = shouldPass ? this.getDefaultContextDirectory() : undefined;
+      const projectsResult = await this._client.callTool(
+        'protokoll_list_projects',
+        contextDirectory ? { contextDirectory } : {}
+      ) as {
         projects?: Array<{ id: string; name: string; active?: boolean }>;
       };
 
-      if (!projectsResult.projects || projectsResult.projects.length === 0) {
-        vscode.window.showWarningMessage('No projects found.');
-        return;
-      }
+      const allProjects = projectsResult.projects || [];
 
-      // Filter to active projects only
-      const activeProjects = projectsResult.projects.filter(p => p.active !== false);
+      // In the detail view "Assign Project" flow, show ALL projects (active + inactive).
+      // Users may still want to assign to an inactive project, and hiding them makes it
+      // look like the server isn't returning projects at all.
+      const createDescription =
+        allProjects.length === 0
+          ? 'No projects returned from server — create one and assign this transcript'
+          : 'Add a new project and assign this transcript to it';
 
-      if (activeProjects.length === 0) {
-        vscode.window.showWarningMessage('No active projects found.');
-        return;
-      }
-
-      // Show quick pick to select project
-      const projectItems = activeProjects.map(p => ({
-        label: p.name,
-        description: p.id,
-        id: p.id,
-      }));
+      // Build quick pick items - always include "Create new project" option
+      const projectItems: Array<vscode.QuickPickItem & { id: string | null; isCreateNew?: boolean; active?: boolean }> = [
+        {
+          label: '$(add) Create new project...',
+          description: createDescription,
+          id: '',
+          isCreateNew: true,
+        },
+        ...(allProjects.length > 0
+          ? ([
+              {
+                label: '',
+                kind: vscode.QuickPickItemKind.Separator,
+                id: null,
+                isCreateNew: false,
+              },
+            ] as Array<vscode.QuickPickItem & { id: string | null; isCreateNew?: boolean; active?: boolean }>)
+          : []),
+        ...allProjects.map(p => ({
+          label: p.active === false ? `$(circle-slash) ${p.name}` : p.name,
+          description: p.active === false ? `${p.id} (inactive)` : p.id,
+          id: p.id,
+          isCreateNew: false,
+          active: p.active,
+        })),
+      ];
 
       const selected = await vscode.window.showQuickPick(projectItems, {
         placeHolder: 'Select a project for this transcript',
+        title: 'Assign Project',
+        ignoreFocusOut: true,
+        matchOnDescription: true,
       });
 
       if (!selected) {
         return; // User cancelled
+      }
+
+      let projectId: string;
+      let projectName: string;
+
+      if (selected.isCreateNew) {
+        // Create new project
+        const projectNameInput = await vscode.window.showInputBox({
+          prompt: 'Enter name for the new project',
+          placeHolder: 'Project name',
+          title: 'Create Project',
+          ignoreFocusOut: true,
+          validateInput: (value) => {
+            if (!value || value.trim() === '') {
+              return 'Project name cannot be empty';
+            }
+            return null;
+          },
+        });
+
+        if (!projectNameInput || !projectNameInput.trim()) {
+          return;
+        }
+
+        const addResult = await this._client.callTool('protokoll_add_project', {
+          name: projectNameInput.trim(),
+        }) as { id?: string; name?: string; entity?: { id: string; name: string } };
+
+        // Support both { id, name } and { entity: { id, name } } response formats
+        const createdId = addResult.entity?.id ?? addResult.id;
+        const createdName = addResult.entity?.name ?? addResult.name ?? projectNameInput.trim();
+
+        if (!createdId) {
+          vscode.window.showErrorMessage('Failed to create project: No ID returned');
+          return;
+        }
+
+        projectId = createdId;
+        projectName = createdName;
+      } else {
+        projectId = selected.id ?? '';
+        projectName = selected.label;
+      }
+
+      if (!projectId) {
+        vscode.window.showErrorMessage('No project selected');
+        return;
       }
 
       // Update transcript - convert absolute path to relative path
@@ -651,16 +645,16 @@ export class TranscriptDetailViewProvider {
       const transcriptPath = this.convertToRelativePath(rawPath);
       
       // Log for debugging
-      console.log(`Protokoll: Updating transcript with path: ${transcriptPath}, projectId: ${selected.id}`);
+      console.log(`Protokoll: Updating transcript with path: ${transcriptPath}, projectId: ${projectId}`);
       
       try {
         const result = await this._client.callTool('protokoll_edit_transcript', {
           transcriptPath: transcriptPath,
-          projectId: selected.id,
+          projectId: projectId,
         });
         
         console.log(`Protokoll: Edit transcript result:`, result);
-        vscode.window.showInformationMessage(`Protokoll: Transcript assigned to project "${selected.label}"`);
+        vscode.window.showInformationMessage(`Protokoll: Transcript assigned to project "${projectName}"`);
       } catch (toolError) {
         console.error(`Protokoll: Error calling protokoll_edit_transcript:`, toolError);
         throw toolError; // Re-throw to be caught by outer catch
@@ -678,8 +672,8 @@ export class TranscriptDetailViewProvider {
           entities: {
             ...currentTranscript.transcript.entities,
             projects: [{
-              id: selected.id,
-              name: selected.label,
+              id: projectId,
+              name: projectName,
             }],
           },
         };
@@ -808,9 +802,9 @@ export class TranscriptDetailViewProvider {
     }
 
     try {
-      // Get current tags from the transcript content
+      // Get current tags from the structured response
       const content: TranscriptContent = await this._client.readTranscript(transcript.uri);
-      const currentTags = this.parseTags(content.text);
+      const currentTags = content.metadata.tags || [];
       
       // Check if tag already exists
       if (currentTags.includes(newTag.trim())) {
@@ -1337,7 +1331,7 @@ export class TranscriptDetailViewProvider {
       
       // Get the global content provider and set the content BEFORE opening the document
       const provider = getTranscriptContentProvider();
-      provider.setContentForUri(virtualUri, content.text);
+      provider.setContentForUri(virtualUri, content.content);
       
       // Small delay to ensure content is set before VS Code requests it
       await new Promise(resolve => setTimeout(resolve, 10));
@@ -1375,11 +1369,11 @@ export class TranscriptDetailViewProvider {
     }
 
     try {
-      // Fetch transcript content from MCP server
+      // Fetch transcript content from MCP server - returns structured JSON
       const content: TranscriptContent = await this._client.readTranscript(transcriptUri);
       
-      // Parse content to separate header (metadata) from body
-      const { header, body } = parseTranscriptContent(content.text);
+      // With structured response, content.content is already the body text (no header parsing needed)
+      const body = content.content;
       
       // Create a temp file with title in filename for clear tab title
       const title = transcript.title || transcript.filename || 'Transcript';
@@ -1387,15 +1381,16 @@ export class TranscriptDetailViewProvider {
       const tempDir = os.tmpdir();
       const tempFilePath = path.join(tempDir, `Editing - ${safeTitle}.md`);
       
-      // Write only the body content to temp file (not the metadata header)
+      // Write only the body content to temp file (metadata is stored on server)
       fs.writeFileSync(tempFilePath, body, 'utf8');
       
-      // Track this file for save syncing, storing header separately
+      // Track this file for save syncing
+      // Note: With PKL format, metadata is stored separately - no header needed
       editableTranscriptFiles.set(tempFilePath, {
         transcriptPath: this.convertToRelativePath(transcriptPath),
         transcriptUri: transcriptUri,
-        originalContent: content.text,
-        header: header,
+        originalContent: content.content,
+        header: '', // No header with PKL format - metadata is separate
         originalBody: body,
       });
       
@@ -2381,94 +2376,36 @@ export class TranscriptDetailViewProvider {
   }
 
   public getWebviewContent(transcript: Transcript, content: TranscriptContent, lastFetched?: Date): string {
-    const text = content.text;
-    const metadata: Record<string, string> = {};
-    let transcriptText = text;
-
-    // Try to parse frontmatter at the start (YAML-style)
-    const frontmatterMatch = text.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
-    if (frontmatterMatch) {
-      const frontmatter = frontmatterMatch[1];
-      transcriptText = frontmatterMatch[2];
-
-      // Parse YAML-like frontmatter
-      frontmatter.split('\n').forEach((line) => {
-        const match = line.match(/^(\w+):\s*(.+)$/);
-        if (match) {
-          metadata[match[1]] = match[2].trim();
-        }
-      });
-    }
-
-    // Parse metadata from the content (Date, Time, Project, Project ID)
-    const parsedMetadata = this.parseMetadata(text);
-
-    // Parse tags from the content
-    const tags = this.parseTags(text);
-
-    // Parse routing information from the content (reserved for future use)
-    this.parseRouting(text);
-
-    // Parse entity references from the content
-    const entityReferences = this.parseEntityReferences(text);
+    // Server returns structured JSON - use metadata directly, no parsing needed
+    const transcriptText = content.content || '*No content available*';
+    const tags = content.metadata.tags || [];
     
-    // Add project from parsed metadata if available and not already in entity references (legacy format)
-    if (parsedMetadata.projectId && parsedMetadata.project) {
-      if (!entityReferences.projects) {
-        entityReferences.projects = [];
-      }
-      // Check if project already exists
-      const projectExists = entityReferences.projects.some(p => p.id === parsedMetadata.projectId);
+    // Entity references come directly from server
+    const entityReferences: {
+      projects?: Array<{ id: string; name: string }>;
+      people?: Array<{ id: string; name: string }>;
+      terms?: Array<{ id: string; name: string }>;
+      companies?: Array<{ id: string; name: string }>;
+    } = {
+      projects: content.metadata.entities?.projects || [],
+      people: content.metadata.entities?.people || [],
+      terms: content.metadata.entities?.terms || [],
+      companies: content.metadata.entities?.companies || [],
+    };
+    
+    // Add project from metadata if available and not already in entity references
+    if (content.metadata.projectId && content.metadata.project) {
+      const projectExists = entityReferences.projects?.some(p => p.id === content.metadata.projectId);
       if (!projectExists) {
+        entityReferences.projects = entityReferences.projects || [];
         entityReferences.projects.push({
-          id: parsedMetadata.projectId,
-          name: parsedMetadata.project,
+          id: content.metadata.projectId,
+          name: content.metadata.project,
         });
       }
     }
     
-    // Merge with entities from parsed metadata (YAML frontmatter)
-    if (parsedMetadata.entities) {
-      if (parsedMetadata.entities.projects) {
-        entityReferences.projects = [
-          ...(entityReferences.projects || []),
-          ...parsedMetadata.entities.projects.map(p => ({ id: p.id, name: p.name }))
-        ];
-        // Remove duplicates
-        entityReferences.projects = entityReferences.projects.filter((p, index, self) =>
-          index === self.findIndex((t) => t.id === p.id)
-        );
-      }
-      if (parsedMetadata.entities.people) {
-        entityReferences.people = [
-          ...(entityReferences.people || []),
-          ...parsedMetadata.entities.people.map(p => ({ id: p.id, name: p.name }))
-        ];
-        entityReferences.people = entityReferences.people.filter((p, index, self) =>
-          index === self.findIndex((t) => t.id === p.id)
-        );
-      }
-      if (parsedMetadata.entities.terms) {
-        entityReferences.terms = [
-          ...(entityReferences.terms || []),
-          ...parsedMetadata.entities.terms.map(t => ({ id: t.id, name: t.name }))
-        ];
-        entityReferences.terms = entityReferences.terms.filter((t, index, self) =>
-          index === self.findIndex((e) => e.id === t.id)
-        );
-      }
-      if (parsedMetadata.entities.companies) {
-        entityReferences.companies = [
-          ...(entityReferences.companies || []),
-          ...parsedMetadata.entities.companies.map(c => ({ id: c.id, name: c.name }))
-        ];
-        entityReferences.companies = entityReferences.companies.filter((c, index, self) =>
-          index === self.findIndex((e) => e.id === c.id)
-        );
-      }
-    }
-    
-    // Also merge with entities from transcript object if available
+    // Also merge with entities from transcript object if available (for backwards compatibility)
     if (transcript.entities) {
       if (transcript.entities.projects) {
         entityReferences.projects = [
@@ -2509,57 +2446,23 @@ export class TranscriptDetailViewProvider {
       }
     }
 
-    // Extract content after the YAML frontmatter (if present)
-    // Look for the pattern: ---\n(yaml content)\n---\n(actual content)
-    // We want to extract everything after the last closing --- delimiter
-    const yamlFrontmatterMatch = transcriptText.match(/---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/);
-    if (yamlFrontmatterMatch) {
-      // Found YAML frontmatter with content after it
-      transcriptText = yamlFrontmatterMatch[1].trim();
-    } else {
-      // No YAML frontmatter pattern found, try legacy format
-      // Look for content after a single --- delimiter (legacy metadata format)
-      const legacyDelimiterMatch = transcriptText.match(/---\s*\n([\s\S]*)$/);
-      if (legacyDelimiterMatch) {
-        transcriptText = legacyDelimiterMatch[1].trim();
-        
-        // If the content starts with another ---, it might be YAML frontmatter
-        // In that case, look for content after the closing ---
-        if (transcriptText.startsWith('---')) {
-          const afterYamlMatch = transcriptText.match(/^---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/);
-          if (afterYamlMatch) {
-            transcriptText = afterYamlMatch[1].trim();
-          }
-        }
-      } else {
-        // No delimiters found, use the old method to remove redundant sections
-        transcriptText = this.removeRedundantSections(transcriptText);
-        transcriptText = this.removeRedundantTitle(transcriptText, transcript.title || transcript.filename);
-      }
-    }
-    
-    // Ensure we have content to display
-    if (!transcriptText || transcriptText.trim().length === 0) {
-      transcriptText = '*No content available*';
-    }
-
-    // Format date/time - prefer parsed metadata, fallback to transcript object
-    const date = parsedMetadata.date || transcript.date || 'Unknown date';
-    const time = parsedMetadata.time || transcript.time || '';
+    // Format date/time - use structured metadata from server
+    const date = content.metadata.date || transcript.date || 'Unknown date';
+    const time = content.metadata.time || transcript.time || '';
     const dateTime = time ? `${date} ${time}` : date;
 
-    // Get createdAt and updatedAt - prefer parsed metadata, fallback to transcript object
-    const createdAt = parsedMetadata.createdAt || transcript.createdAt;
-    const updatedAt = parsedMetadata.updatedAt || transcript.updatedAt;
+    // Get createdAt and updatedAt from transcript object (not in content.metadata)
+    const createdAt = transcript.createdAt;
+    const updatedAt = transcript.updatedAt;
 
-    // Get status and tasks - prefer parsed metadata, fallback to transcript object
-    const status = parsedMetadata.status || transcript.status || 'reviewed';
-    const tasks = parsedMetadata.tasks || transcript.tasks || [];
+    // Get status and tasks from structured metadata
+    const status = content.metadata.status || transcript.status || 'reviewed';
+    const tasks = content.metadata.tasks || transcript.tasks || [];
     const openTasks = tasks.filter((t: { status: string }) => t.status === 'open');
 
-    // Get project info - prefer parsed metadata entities, then legacy metadata fields, fallback to transcript object
-    const projectId = parsedMetadata.entities?.projects?.[0]?.id || parsedMetadata.projectId || transcript.entities?.projects?.[0]?.id || '';
-    const projectName = parsedMetadata.entities?.projects?.[0]?.name || parsedMetadata.project || transcript.entities?.projects?.[0]?.name || '';
+    // Get project info from structured metadata
+    const projectId = content.metadata.entities?.projects?.[0]?.id || content.metadata.projectId || transcript.entities?.projects?.[0]?.id || '';
+    const projectName = content.metadata.entities?.projects?.[0]?.name || content.metadata.project || transcript.entities?.projects?.[0]?.name || '';
     const transcriptPath = transcript.path || transcript.filename;
 
     return `<!DOCTYPE html>
@@ -2730,30 +2633,64 @@ export class TranscriptDetailViewProvider {
         .project-section .button {
             margin-left: 0;
         }
+        .info-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        @media (max-width: 900px) {
+            .info-grid {
+                grid-template-columns: 1fr;
+            }
+        }
         .metadata {
             background-color: var(--vscode-editor-inactiveSelectionBackground);
             border: 1px solid var(--vscode-panel-border);
             border-radius: 4px;
-            padding: 16px;
-            margin-bottom: 24px;
+            padding: 12px 16px;
         }
         .metadata h2 {
-            margin-top: 0;
+            margin: 0 0 8px 0;
             color: var(--vscode-textLink-foreground);
+            font-size: 0.95em;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .metadata h2:hover {
+            opacity: 0.8;
+        }
+        .metadata-toggle-icon {
+            font-size: 0.8em;
+            transition: transform 0.2s;
+        }
+        .metadata.collapsed .metadata-toggle-icon {
+            transform: rotate(-90deg);
+        }
+        .metadata-content {
+            margin-top: 8px;
+        }
+        .metadata.collapsed .metadata-content {
+            display: none;
         }
         .metadata-row {
             display: flex;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
             align-items: flex-start;
         }
         .metadata-label {
             font-weight: 600;
-            min-width: 120px;
+            min-width: 100px;
             color: var(--vscode-descriptionForeground);
+            font-size: 0.9em;
         }
         .metadata-value {
             flex: 1;
             color: var(--vscode-foreground);
+            font-size: 0.9em;
         }
         .metadata-value-with-actions {
             flex: 1;
@@ -2818,8 +2755,43 @@ export class TranscriptDetailViewProvider {
             margin: 0;
         }
         .transcript-content-wrapper {
-            margin-top: 24px;
+            margin-top: 16px;
             position: relative;
+        }
+        .content-tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 12px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        .content-tab {
+            background: transparent;
+            border: none;
+            padding: 8px 16px;
+            cursor: pointer;
+            color: var(--vscode-descriptionForeground);
+            font-size: 0.95em;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+        .content-tab:hover {
+            color: var(--vscode-foreground);
+            background-color: var(--vscode-list-hoverBackground);
+        }
+        .content-tab.active {
+            color: var(--vscode-textLink-foreground);
+            border-bottom-color: var(--vscode-textLink-foreground);
+            font-weight: 600;
+        }
+        .content-tab.disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
         }
         .edit-button {
             background-color: var(--vscode-button-background);
@@ -2898,14 +2870,33 @@ export class TranscriptDetailViewProvider {
             background-color: var(--vscode-editor-inactiveSelectionBackground);
             border: 1px solid var(--vscode-panel-border);
             border-radius: 4px;
-            padding: 16px;
-            margin-bottom: 24px;
+            padding: 12px 16px;
         }
         .tasks-section h3 {
-            margin-top: 0;
-            margin-bottom: 12px;
+            margin: 0 0 8px 0;
             color: var(--vscode-textLink-foreground);
-            font-size: 1em;
+            font-size: 0.95em;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .tasks-section h3:hover {
+            opacity: 0.8;
+        }
+        .tasks-toggle-icon {
+            font-size: 0.8em;
+            transition: transform 0.2s;
+        }
+        .tasks-section.collapsed .tasks-toggle-icon {
+            transform: rotate(-90deg);
+        }
+        .tasks-content {
+            margin-top: 8px;
+        }
+        .tasks-section.collapsed .tasks-content {
+            display: none;
         }
         .task-item {
             display: flex;
@@ -3193,7 +3184,7 @@ export class TranscriptDetailViewProvider {
             ` : `
                 <div class="project-info">
                     <span style="color: var(--vscode-descriptionForeground); font-style: italic;">No project assigned</span>
-                    <button class="button button-secondary" onclick="changeProject()">Assign Project <span class="kbd-hint">P</span></button>
+                    <button type="button" class="button button-secondary" onclick="changeProject()">Assign Project <span class="kbd-hint">P</span></button>
                 </div>
             `}
         </div>
@@ -3217,72 +3208,78 @@ export class TranscriptDetailViewProvider {
             <button class="button button-secondary" onclick="cancelEditTitle()">Cancel (Esc)</button>
         </div>
     </div>
-    <div class="metadata">
-        <h2>Transcript Metadata</h2>
-        <div class="metadata-row">
-            <div class="metadata-label">Date/Time:</div>
-            <div class="metadata-value">
-                <span class="editable-date" onclick="changeDate()" title="Click to change transcript date">
-                    ${this.escapeHtml(dateTime)}
-                    <svg class="edit-icon-small" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                        <path d="M11.5 1.5L14.5 4.5L5 14H2V11L11.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                        <path d="M10 3L13 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                    </svg>
-                </span>
+    <div class="info-grid">
+        <div class="metadata" id="metadata-section">
+            <h2 onclick="toggleMetadata()">
+                <span class="metadata-toggle-icon">▼</span>
+                Metadata
+            </h2>
+            <div class="metadata-content">
+                <div class="metadata-row">
+                    <div class="metadata-label">Date/Time:</div>
+                    <div class="metadata-value">
+                        <span class="editable-date" onclick="changeDate()" title="Click to change transcript date">
+                            ${this.escapeHtml(dateTime)}
+                            <svg class="edit-icon-small" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path d="M11.5 1.5L14.5 4.5L5 14H2V11L11.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                                <path d="M10 3L13 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </span>
+                    </div>
+                </div>
+                ${createdAt ? `
+                <div class="metadata-row">
+                    <div class="metadata-label">Created:</div>
+                    <div class="metadata-value">${this.escapeHtml(this.formatDate(createdAt))}</div>
+                </div>
+                ` : ''}
+                ${updatedAt ? `
+                <div class="metadata-row">
+                    <div class="metadata-label">Updated:</div>
+                    <div class="metadata-value">${this.escapeHtml(this.formatDate(updatedAt))}</div>
+                </div>
+                ` : ''}
+                <div class="metadata-row">
+                    <div class="metadata-label">Status:</div>
+                    <div class="metadata-value">
+                        <span class="status-badge ${this.escapeHtml(status)}" onclick="changeStatus()" title="Click to change status">
+                            ${this.getStatusIcon(status)} ${this.getStatusLabel(status)}
+                        </span>
+                    </div>
+                </div>
+                <div class="metadata-row">
+                    <div class="metadata-label">Tags:</div>
+                    <div class="metadata-value">
+                        ${tags.map(tag => `
+                            <span class="tag">
+                                ${this.escapeHtml(tag)}
+                                <button class="tag-remove" onclick="event.stopPropagation(); removeTag('${this.escapeHtml(tag)}'); return false;" title="Remove tag">×</button>
+                            </span>
+                        `).join('')}
+                        <button class="tag-add" onclick="addTag()" title="Add tag">+ Add Tag <span class="kbd-hint">G</span></button>
+                    </div>
+                </div>
             </div>
         </div>
-        ${createdAt ? `
-        <div class="metadata-row">
-            <div class="metadata-label">Created At:</div>
-            <div class="metadata-value">${this.escapeHtml(this.formatDate(createdAt))}</div>
-        </div>
-        ` : ''}
-        ${updatedAt ? `
-        <div class="metadata-row">
-            <div class="metadata-label">Updated At:</div>
-            <div class="metadata-value">${this.escapeHtml(this.formatDate(updatedAt))}</div>
-        </div>
-        ` : ''}
-        <div class="metadata-row">
-            <div class="metadata-label">Status:</div>
-            <div class="metadata-value">
-                <span class="status-badge ${this.escapeHtml(status)}" onclick="changeStatus()" title="Click to change status">
-                    ${this.getStatusIcon(status)} ${this.getStatusLabel(status)}
-                </span>
-            </div>
-        </div>
-        <div class="metadata-row">
-            <div class="metadata-label">Tags:</div>
-            <div class="metadata-value">
-                ${tags.map(tag => `
-                    <span class="tag">
-                        ${this.escapeHtml(tag)}
-                        <button class="tag-remove" onclick="event.stopPropagation(); removeTag('${this.escapeHtml(tag)}'); return false;" title="Remove tag">×</button>
-                    </span>
+        <div class="tasks-section" id="tasks-section">
+            <h3 onclick="toggleTasks()">
+                <span class="tasks-toggle-icon">▼</span>
+                Tasks ${openTasks.length > 0 ? `(${openTasks.length} open)` : ''}
+            </h3>
+            <div class="tasks-content">
+                ${tasks.length === 0 ? `
+                    <div class="empty-tasks">No tasks</div>
+                ` : tasks.map((task: { id: string; description: string; status: string }) => `
+                    <div class="task-item ${task.status}">
+                        <input type="checkbox" class="task-checkbox" ${task.status === 'done' ? 'checked' : ''} 
+                            onchange="toggleTask('${this.escapeHtml(task.id)}')" />
+                        <span class="task-description">${this.escapeHtml(task.description)}</span>
+                        <button class="task-delete-btn" onclick="deleteTask('${this.escapeHtml(task.id)}')" title="Delete task">×</button>
+                    </div>
                 `).join('')}
-                <button class="tag-add" onclick="addTag()" title="Add tag">+ Add Tag <span class="kbd-hint">G</span></button>
+                <button class="task-add-btn" onclick="addTask()">+ Add Task <span class="kbd-hint">K</span></button>
             </div>
         </div>
-        ${Object.entries(metadata).map(([key, value]) => `
-        <div class="metadata-row">
-            <div class="metadata-label">${this.escapeHtml(key)}:</div>
-            <div class="metadata-value">${this.escapeHtml(value)}</div>
-        </div>
-        `).join('')}
-    </div>
-    <div class="tasks-section">
-        <h3>Tasks ${openTasks.length > 0 ? `(${openTasks.length} open)` : ''}</h3>
-        ${tasks.length === 0 ? `
-            <div class="empty-tasks">No tasks</div>
-        ` : tasks.map((task: { id: string; description: string; status: string }) => `
-            <div class="task-item ${task.status}">
-                <input type="checkbox" class="task-checkbox" ${task.status === 'done' ? 'checked' : ''} 
-                    onchange="toggleTask('${this.escapeHtml(task.id)}')" />
-                <span class="task-description">${this.escapeHtml(task.description)}</span>
-                <button class="task-delete-btn" onclick="deleteTask('${this.escapeHtml(task.id)}')" title="Delete task">×</button>
-            </div>
-        `).join('')}
-        <button class="task-add-btn" onclick="addTask()">+ Add Task <span class="kbd-hint">K</span></button>
     </div>
     <div class="inline-chat-container" id="inline-chat-container">
         <div class="inline-chat-input-wrapper">
@@ -3300,14 +3297,34 @@ export class TranscriptDetailViewProvider {
         </div>
     </div>
     <div class="transcript-content-wrapper">
-        <div style="display: flex; gap: 8px; margin-bottom: 16px;">
-            <button class="edit-button" onclick="editInEditor()" id="edit-in-editor-btn" title="Edit in VS Code editor (supports voice dictation)">Edit in Editor <span class="kbd-hint">E</span></button>
-            <button class="edit-button" onclick="openSource()" id="open-source-btn" title="View source (read-only)" style="opacity: 0.7;">View Source <span class="kbd-hint">S</span></button>
+        <div class="content-tabs">
+            <button class="content-tab active" id="enhanced-tab" onclick="switchTab('enhanced')">Enhanced</button>
+            <button class="content-tab ${content.rawTranscript ? '' : 'disabled'}" id="raw-tab" onclick="switchTab('raw')" ${content.rawTranscript ? '' : 'disabled'}>Original</button>
         </div>
-        <div class="transcript-content" id="transcript-content-display">
-            ${this.markdownToHtml(transcriptText)}
+        <div class="tab-content active" id="enhanced-content">
+            <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+                <button class="edit-button" onclick="editInEditor()" id="edit-in-editor-btn" title="Edit in VS Code editor (supports voice dictation)">Edit in Editor <span class="kbd-hint">E</span></button>
+                <button class="edit-button" onclick="openSource()" id="open-source-btn" title="View source (read-only)" style="opacity: 0.7;">View Source <span class="kbd-hint">S</span></button>
+            </div>
+            <div class="transcript-content" id="transcript-content-display">
+                ${this.markdownToHtml(transcriptText)}
+            </div>
+            <button class="create-entity-button" id="create-entity-btn" onclick="createEntityFromSelection()">Create Entity</button>
         </div>
-        <button class="create-entity-button" id="create-entity-btn" onclick="createEntityFromSelection()">Create Entity</button>
+        ${content.rawTranscript ? `
+        <div class="tab-content" id="raw-content">
+            <div class="transcript-content" style="white-space: pre-wrap; font-family: var(--vscode-editor-font-family);">
+                ${this.escapeHtml(content.rawTranscript.text)}
+            </div>
+            ${content.rawTranscript.model || content.rawTranscript.transcribedAt ? `
+            <div style="margin-top: 16px; padding: 12px; background-color: var(--vscode-editor-inactiveSelectionBackground); border-radius: 4px; font-size: 0.85em; color: var(--vscode-descriptionForeground);">
+                ${content.rawTranscript.model ? `Model: ${this.escapeHtml(content.rawTranscript.model)}` : ''}
+                ${content.rawTranscript.model && content.rawTranscript.transcribedAt ? ' • ' : ''}
+                ${content.rawTranscript.transcribedAt ? `Transcribed: ${this.escapeHtml(this.formatDate(content.rawTranscript.transcribedAt))}` : ''}
+            </div>
+            ` : ''}
+        </div>
+        ` : ''}
     </div>
     ${this.renderEntityReferences(entityReferences)}
     <script>
@@ -3317,6 +3334,40 @@ export class TranscriptDetailViewProvider {
         const projectId = ${JSON.stringify(projectId)};
         const currentTags = ${JSON.stringify(tags)};
         const originalTranscriptText = ${JSON.stringify(transcriptText)};
+
+        function toggleMetadata() {
+            const section = document.getElementById('metadata-section');
+            if (section) {
+                section.classList.toggle('collapsed');
+            }
+        }
+
+        function toggleTasks() {
+            const section = document.getElementById('tasks-section');
+            if (section) {
+                section.classList.toggle('collapsed');
+            }
+        }
+
+        function switchTab(tabName) {
+            // Update tab buttons
+            document.querySelectorAll('.content-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            const activeTab = document.getElementById(tabName + '-tab');
+            if (activeTab && !activeTab.disabled) {
+                activeTab.classList.add('active');
+            }
+
+            // Update tab content
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.remove('active');
+            });
+            const activeContent = document.getElementById(tabName + '-content');
+            if (activeContent) {
+                activeContent.classList.add('active');
+            }
+        }
 
         function changeProject() {
             vscode.postMessage({

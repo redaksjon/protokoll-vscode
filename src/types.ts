@@ -67,10 +67,51 @@ export interface TranscriptsListResponse {
   };
 }
 
-export interface TranscriptContent {
+/**
+ * Raw MCP resource response
+ */
+export interface McpResourceResponse {
   uri: string;
   mimeType: string;
   text: string;
+}
+
+/**
+ * Structured transcript content returned by MCP server
+ * The server returns all metadata pre-parsed - clients should NOT parse this
+ */
+export interface TranscriptContent {
+  uri: string;
+  path: string;
+  title: string;
+  metadata: {
+    date?: string;
+    time?: string;
+    project?: string;
+    projectId?: string;
+    status?: TranscriptStatus;
+    tags?: string[];
+    duration?: number;
+    entities?: {
+      people?: Array<{ id: string; name: string }>;
+      projects?: Array<{ id: string; name: string }>;
+      terms?: Array<{ id: string; name: string }>;
+      companies?: Array<{ id: string; name: string }>;
+    };
+    tasks?: Task[];
+    history?: StatusTransition[];
+    routing?: {
+      destination?: string;
+      confidence?: string;
+    };
+  };
+  content: string;
+  rawTranscript?: {
+    text: string;
+    model?: string;
+    duration?: number;
+    transcribedAt?: string;
+  };
 }
 
 export interface JsonRpcRequest {

@@ -12,6 +12,7 @@ import { ChatViewProvider } from './chatView';
 import { ChatsViewProvider } from './chatsView';
 import type { Transcript, TranscriptContent } from './types';
 import { log, initLogger } from './logger';
+import { shouldPassContextDirectory, clearServerModeCache } from './serverMode';
 
 let mcpClient: McpClient | null = null;
 let transcriptsViewProvider: TranscriptsViewProvider | null = null;
@@ -19,6 +20,10 @@ let transcriptDetailViewProvider: TranscriptDetailViewProvider | null = null;
 let connectionStatusViewProvider: ConnectionStatusViewProvider | null = null;
 let chatViewProvider: ChatViewProvider | null = null;
 let chatsViewProvider: ChatsViewProvider | null = null;
+
+function getDefaultContextDirectory(): string | undefined {
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+}
 
 // Create an output channel for debugging
 const outputChannel = vscode.window.createOutputChannel('Protokoll Debug');
@@ -28,10 +33,13 @@ initLogger(outputChannel);
 
 export async function activate(context: vscode.ExtensionContext) {
   log('Protokoll extension is now active');
+  console.log('Protokoll: [ACTIVATION] Extension activate() called');
 
   // Initialize MCP client
   const config = vscode.workspace.getConfiguration('protokoll');
-  const serverUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3001');
+  const rawServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3001');
+  // Remove trailing slashes to ensure consistent URL handling
+  const serverUrl = rawServerUrl.replace(/\/+$/, '');
   const hasConfiguredUrl = context.globalState.get<boolean>('protokoll.hasConfiguredUrl', false);
 
   // Check if server URL is configured or if we should prompt
@@ -54,6 +62,7 @@ export async function activate(context: vscode.ExtensionContext) {
   
   try {
     mcpClient = new McpClient(serverUrl);
+    clearServerModeCache(); // Clear cached server mode on new connection
     
     // Check server health
     const isHealthy = await mcpClient.healthCheck();
@@ -72,14 +81,10 @@ export async function activate(context: vscode.ExtensionContext) {
       try {
         await mcpClient.initialize();
         serverConnected = true;
-        const sessionId = mcpClient.getSessionId();
         vscode.window.showInformationMessage(`Protokoll: Connected to ${serverUrl}`);
         
-        // Update connection status view
-        if (connectionStatusViewProvider) {
-          connectionStatusViewProvider.setClient(mcpClient);
-          connectionStatusViewProvider.setConnectionStatus(true, sessionId);
-        }
+        // Note: connectionStatusViewProvider is not yet initialized at this point
+        // It will be set up later after view providers are created
         
         // Subscribe to resource list change notifications (for transcript list)
         console.log('Protokoll: [EXTENSION] Registering notification handler for resources_changed');
@@ -387,31 +392,40 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(closeListener);
 
   // Register tree views
+  log('Protokoll: Creating transcripts tree view...');
   const transcriptsTreeView = vscode.window.createTreeView('protokollTranscripts', {
     treeDataProvider: transcriptsViewProvider,
     showCollapseAll: false,
     canSelectMany: true, // Enable multi-selection
   });
+  log('Protokoll: Transcripts tree view created', { visible: transcriptsTreeView.visible });
 
   // Set the tree view reference in the provider
   transcriptsViewProvider.setTreeView(transcriptsTreeView);
 
   // Refresh transcripts when view becomes visible
-  let hasRefreshedOnce = false;
+  // Note: We don't use hasRefreshedOnce anymore because it caused race conditions
+  // where visibility fired before connection completed, blocking subsequent refreshes
   transcriptsTreeView.onDidChangeVisibility(async (e) => {
-    log('Protokoll: onDidChangeVisibility fired', { visible: e.visible, hasRefreshedOnce });
-    if (e.visible && !hasRefreshedOnce && transcriptsViewProvider) {
-      log('Protokoll: Transcripts view became visible, refreshing...');
-      hasRefreshedOnce = true;
-      await transcriptsViewProvider.refresh();
-      log('Protokoll: Auto-refresh on visibility completed');
-      
-      // VS Code sometimes doesn't render the tree immediately after visibility change
-      // Fire the change event again after a short delay to ensure rendering
-      setTimeout(() => {
-        log('Protokoll: Firing delayed tree refresh');
-        transcriptsViewProvider?.fireTreeDataChange();
-      }, 100);
+    log('Protokoll: onDidChangeVisibility fired', { visible: e.visible, hasClient: !!mcpClient, hasTranscripts: transcriptsViewProvider?.hasTranscripts() });
+    if (e.visible && transcriptsViewProvider && mcpClient) {
+      // Only refresh if we don't have data yet (avoids unnecessary API calls)
+      if (!transcriptsViewProvider.hasTranscripts()) {
+        log('Protokoll: Transcripts view became visible with no data, refreshing...');
+        await transcriptsViewProvider.refresh();
+        log('Protokoll: Auto-refresh on visibility completed');
+        
+        // VS Code sometimes doesn't render the tree immediately after visibility change
+        // Fire the change event again after a short delay to ensure rendering
+        setTimeout(() => {
+          log('Protokoll: Firing delayed tree refresh');
+          transcriptsViewProvider?.fireTreeDataChange();
+        }, 100);
+      } else {
+        log('Protokoll: Transcripts view visible but already has data, skipping refresh');
+      }
+    } else if (e.visible && !mcpClient) {
+      log('Protokoll: Transcripts view visible but no client yet, will refresh when connected');
     }
   });
 
@@ -535,16 +549,19 @@ export async function activate(context: vscode.ExtensionContext) {
       });
 
       if (input) {
-        await config.update('serverUrl', input.trim(), true);
+        // Remove trailing slashes to ensure consistent URL handling
+        const cleanUrl = input.trim().replace(/\/+$/, '');
+        await config.update('serverUrl', cleanUrl, true);
         
         // Mark that user has configured the URL
         await context.globalState.update('protokoll.hasConfiguredUrl', true);
         
-        vscode.window.showInformationMessage(`Protokoll: Server URL updated to ${input.trim()}`);
+        vscode.window.showInformationMessage(`Protokoll: Server URL updated to ${cleanUrl}`);
         
         // Reinitialize client
         try {
-          mcpClient = new McpClient(input.trim());
+          mcpClient = new McpClient(cleanUrl);
+          clearServerModeCache(); // Clear cached server mode on new connection
           const isHealthy = await mcpClient.healthCheck();
           if (isHealthy) {
             await mcpClient.initialize();
@@ -638,7 +655,13 @@ export async function activate(context: vscode.ExtensionContext) {
 
       try {
         // List available projects
-        const projectsResult = await mcpClient.callTool('protokoll_list_projects', {}) as {
+        // Only pass contextDirectory if server is in local mode
+        const shouldPass = await shouldPassContextDirectory(mcpClient);
+        const contextDirectory = shouldPass ? getDefaultContextDirectory() : undefined;
+        const projectsResult = await mcpClient.callTool(
+          'protokoll_list_projects',
+          contextDirectory ? { contextDirectory } : {}
+        ) as {
           projects?: Array<{ id: string; name: string; active?: boolean }>;
         };
 
@@ -898,7 +921,13 @@ export async function activate(context: vscode.ExtensionContext) {
   ): Promise<void> {
     try {
       // List available projects
-      const projectsResult = await client.callTool('protokoll_list_projects', {}) as {
+      // Only pass contextDirectory if server is in local mode
+      const shouldPass = await shouldPassContextDirectory(client);
+      const contextDirectory = shouldPass ? getDefaultContextDirectory() : undefined;
+      const projectsResult = await client.callTool(
+        'protokoll_list_projects',
+        contextDirectory ? { contextDirectory } : {}
+      ) as {
         projects?: Array<{ id: string; name: string; active?: boolean }>;
       };
 
@@ -984,7 +1013,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
       try {
         const content: TranscriptContent = await mcpClient.readTranscript(item.transcript.uri);
-        await vscode.env.clipboard.writeText(content.text);
+        await vscode.env.clipboard.writeText(content.content);
         vscode.window.showInformationMessage('Transcript text copied to clipboard');
       } catch (error) {
         vscode.window.showErrorMessage(
@@ -1154,7 +1183,13 @@ export async function activate(context: vscode.ExtensionContext) {
         // Prompt for project
         let projectId: string | undefined;
         try {
-          const projectsResult = await mcpClient.callTool('protokoll_list_projects', {}) as {
+          // Only pass contextDirectory if server is in local mode
+          const shouldPass = await shouldPassContextDirectory(mcpClient);
+          const contextDirectory = shouldPass ? getDefaultContextDirectory() : undefined;
+          const projectsResult = await mcpClient.callTool(
+            'protokoll_list_projects',
+            contextDirectory ? { contextDirectory } : {}
+          ) as {
             projects?: Array<{ id: string; name: string; active?: boolean }>;
           };
           
@@ -1239,7 +1274,9 @@ export async function activate(context: vscode.ExtensionContext) {
   const configWatcher = vscode.workspace.onDidChangeConfiguration(async (e) => {
     if (e.affectsConfiguration('protokoll.serverUrl')) {
       const config = vscode.workspace.getConfiguration('protokoll');
-      const serverUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3000');
+      const rawServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3000');
+      // Remove trailing slashes to ensure consistent URL handling
+      const serverUrl = rawServerUrl.replace(/\/+$/, '');
       
       if (connectionStatusViewProvider) {
         connectionStatusViewProvider.setServerUrl(serverUrl);
@@ -1248,6 +1285,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (serverUrl && serverUrl !== '') {
         try {
           mcpClient = new McpClient(serverUrl);
+          clearServerModeCache(); // Clear cached server mode on new connection
           await mcpClient.initialize();
           const sessionId = mcpClient.getSessionId();
           if (transcriptsViewProvider) {

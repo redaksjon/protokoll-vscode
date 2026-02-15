@@ -71,8 +71,19 @@ const mockVscode = {
     }),
   },
   EventEmitter: class {
-    event = {};
-    fire = vi.fn();
+    private listeners: Array<(e: any) => void> = [];
+    event = (listener: (e: any) => void) => {
+      this.listeners.push(listener);
+      return { dispose: () => {
+        const index = this.listeners.indexOf(listener);
+        if (index > -1) {
+          this.listeners.splice(index, 1);
+        }
+      }};
+    };
+    fire = vi.fn((data?: any) => {
+      this.listeners.forEach(listener => listener(data));
+    });
   },
   TreeItemCollapsibleState: {
     None: 0,
@@ -95,11 +106,42 @@ const mockVscode = {
     Three: 3,
   },
   ExtensionContext: class {
-    globalState = {
-      get: vi.fn(),
-      update: vi.fn(),
+    private _globalStateData: Map<string, unknown> = new Map();
+    private _workspaceStateData: Map<string, unknown> = new Map();
+    
+    globalState: {
+      get: (key: string, defaultValue?: unknown) => unknown;
+      update: (key: string, value: unknown) => Promise<void>;
     };
+    
+    workspaceState: {
+      get: (key: string, defaultValue?: unknown) => unknown;
+      update: (key: string, value: unknown) => Promise<void>;
+    };
+    
     subscriptions = [];
+    
+    constructor() {
+      this.globalState = {
+        get: (key: string, defaultValue?: unknown) => {
+          return this._globalStateData.has(key) ? this._globalStateData.get(key) : defaultValue;
+        },
+        update: (key: string, value: unknown) => {
+          this._globalStateData.set(key, value);
+          return Promise.resolve();
+        },
+      };
+      
+      this.workspaceState = {
+        get: (key: string, defaultValue?: unknown) => {
+          return this._workspaceStateData.has(key) ? this._workspaceStateData.get(key) : defaultValue;
+        },
+        update: (key: string, value: unknown) => {
+          this._workspaceStateData.set(key, value);
+          return Promise.resolve();
+        },
+      };
+    }
   },
   TreeItem: class {
     constructor(public label: string, public collapsibleState: number) {}
@@ -115,23 +157,5 @@ vi.mock('vscode', () => {
   return mockVscode;
 });
 
-// Mock http and https modules
-vi.mock('http', async () => {
-  const { mockHttpRequestFn } = await import('./helpers/httpMock');
-  return {
-    default: {
-      request: mockHttpRequestFn,
-    },
-    request: mockHttpRequestFn,
-  };
-});
-
-vi.mock('https', async () => {
-  const { mockHttpsRequestFn } = await import('./helpers/httpMock');
-  return {
-    default: {
-      request: mockHttpsRequestFn,
-    },
-    request: mockHttpsRequestFn,
-  };
-});
+// Don't mock http/https globally - let tests that need mocking do it themselves
+// This prevents issues with tests that use real HTTP servers (MockTransportServer)

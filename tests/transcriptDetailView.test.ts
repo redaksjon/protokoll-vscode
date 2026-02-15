@@ -103,8 +103,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test Transcript\n\nContent here.',
+                path: '/path/to/test.md',
+                title: 'Test Transcript',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test Transcript\n\nContent here.',
             };
 
             const html = provider.getWebviewContent(transcript, content);
@@ -124,8 +129,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Content\n\nSome content.',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Content\n\nSome content.',
             };
 
             const html = provider.getWebviewContent(transcript, content);
@@ -146,8 +156,17 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: 'Content',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                    entities: {
+                        people: [{ id: 'john-doe', name: 'John Doe' }],
+                        projects: [{ id: 'test-project', name: 'Test Project' }],
+                    },
+                },
+                content: 'Content',
             };
 
             const html = provider.getWebviewContent(transcript, content);
@@ -188,8 +207,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test Transcript\n\nContent.',
+                path: '/path/to/test.md',
+                title: 'Test Transcript',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test Transcript\n\nContent.',
             };
 
             // Mock readTranscript
@@ -266,6 +290,8 @@ Content here.`;
         });
 
         it('should handle changeProject message', async () => {
+            vi.useFakeTimers();
+            
             provider.setClient(mockClient);
             
             const transcript: Transcript = {
@@ -277,12 +303,29 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
             };
 
             vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
-            vi.spyOn(mockClient, 'callTool').mockResolvedValue({});
+            
+            // Mock callTool to handle both protokoll_info and protokoll_list_projects
+            const callToolSpy = vi.spyOn(mockClient, 'callTool').mockImplementation(async (toolName: string) => {
+                if (toolName === 'protokoll_info') {
+                    return { mode: 'local', acceptsDirectoryParameters: true };
+                } else if (toolName === 'protokoll_list_projects') {
+                    return { projects: [{ id: 'project-1', name: 'Project 1', active: true }] };
+                } else if (toolName === 'protokoll_edit_transcript') {
+                    return {};
+                }
+                return {};
+            });
+            
             (vscode.window.showQuickPick as any).mockResolvedValue({ id: 'project-1', label: 'Project 1' });
             (vscode.commands.executeCommand as any).mockResolvedValue(undefined);
 
@@ -292,9 +335,14 @@ Content here.`;
                 await messageHandler({
                     command: 'changeProject',
                 });
+                
+                // Run all timers to execute the setTimeout callback
+                await vi.runAllTimersAsync();
             }
 
-            expect(mockClient.callTool).toHaveBeenCalled();
+            expect(callToolSpy).toHaveBeenCalled();
+            
+            vi.useRealTimers();
         });
 
         it('should handle addTag message', async () => {
@@ -309,8 +357,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test\n\nTags: tag1',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: ['tag1'],
+                },
+                content: '# Test\n\nTags: tag1',
             };
 
             vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
@@ -342,8 +395,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
             };
 
             vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);

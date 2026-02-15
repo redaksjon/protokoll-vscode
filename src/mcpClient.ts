@@ -10,6 +10,7 @@ import type {
   JsonRpcResponse,
   TranscriptsListResponse,
   TranscriptContent,
+  McpResourceResponse,
   McpResourcesListResponse,
 } from './types';
 
@@ -22,7 +23,8 @@ export class McpClient {
   private onSessionRecoveredCallbacks: Array<() => void | Promise<void>> = []; // Callbacks to run after session recovery
 
   constructor(serverUrl: string) {
-    this.serverUrl = serverUrl;
+    // Remove trailing slash to ensure consistent URL handling
+    this.serverUrl = serverUrl.replace(/\/+$/, '');
   }
 
   /**
@@ -293,8 +295,9 @@ export class McpClient {
 
   /**
    * Read a resource by URI
+   * Returns raw MCP resource response with uri, mimeType, and text
    */
-  async readResource(uri: string): Promise<TranscriptContent> {
+  async readResource(uri: string): Promise<McpResourceResponse> {
     const request: JsonRpcRequest = {
       jsonrpc: '2.0',
       id: Date.now(),
@@ -308,7 +311,7 @@ export class McpClient {
       throw new Error(`Failed to read resource: ${response.error.message}`);
     }
 
-    const result = response.result as { contents: TranscriptContent[] };
+    const result = response.result as { contents: McpResourceResponse[] };
     if (!result.contents || result.contents.length === 0) {
       throw new Error('No content returned from resource');
     }
@@ -358,9 +361,12 @@ export class McpClient {
 
   /**
    * Read a transcript by URI
+   * Returns structured JSON with metadata and content - no parsing needed
    */
   async readTranscript(transcriptUri: string): Promise<TranscriptContent> {
-    return this.readResource(transcriptUri);
+    const resource = await this.readResource(transcriptUri);
+    // Server returns structured JSON - parse it directly
+    return JSON.parse(resource.text) as TranscriptContent;
   }
 
   /**
@@ -519,6 +525,25 @@ export class McpClient {
       const req = httpModule.request(options, (res) => {
         if (res.statusCode !== 200) {
           console.error(`Protokoll: [SSE] Connection failed with status ${res.statusCode}`);
+          
+          // Read error response body
+          let errorBody = '';
+          res.on('data', (chunk) => {
+            errorBody += chunk.toString();
+          });
+          res.on('end', () => {
+            console.error(`Protokoll: [SSE] Error response: ${errorBody}`);
+            
+            // If we get a 404, the session might be invalid
+            // Try to recover the session
+            if (res.statusCode === 404 && !this.recoveringSession) {
+              console.warn('Protokoll: [SSE] 404 error - session may be invalid, attempting recovery...');
+              this.recoverSession().catch((error) => {
+                console.error('Protokoll: [SSE] Failed to recover session:', error);
+              });
+            }
+          });
+          
           return;
         }
 
