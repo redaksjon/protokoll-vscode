@@ -16,6 +16,7 @@ export default defineConfig({
                 'out/**/*',
                 'node_modules/**/*',
                 'tests/**/*',
+                'src/test/**/*',
                 'src/**/*.d.ts',
                 // Type definitions only - no executable code
                 'src/types.ts',

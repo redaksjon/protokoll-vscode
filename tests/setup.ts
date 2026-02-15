@@ -71,8 +71,19 @@ const mockVscode = {
     }),
   },
   EventEmitter: class {
-    event = {};
-    fire = vi.fn();
+    private listeners: Array<(e: any) => void> = [];
+    event = (listener: (e: any) => void) => {
+      this.listeners.push(listener);
+      return { dispose: () => {
+        const index = this.listeners.indexOf(listener);
+        if (index > -1) {
+          this.listeners.splice(index, 1);
+        }
+      }};
+    };
+    fire = vi.fn((data?: any) => {
+      this.listeners.forEach(listener => listener(data));
+    });
   },
   TreeItemCollapsibleState: {
     None: 0,
