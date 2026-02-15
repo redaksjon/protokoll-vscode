@@ -2,7 +2,19 @@
  * Test setup - Mock VS Code API and HTTP modules
  */
 
-import { vi } from 'vitest';
+import { vi, afterEach } from 'vitest';
+
+// Global cleanup after each test to prevent memory leaks
+afterEach(() => {
+  // Clear all timers
+  vi.clearAllTimers();
+  // Clear all mocks
+  vi.clearAllMocks();
+  // Force garbage collection if available (Node.js with --expose-gc flag)
+  if (global.gc) {
+    global.gc();
+  }
+});
 
 // Mock vscode module
 const mockVscode = {
@@ -157,31 +169,5 @@ vi.mock('vscode', () => {
   return mockVscode;
 });
 
-// Mock http and https modules
-vi.mock('http', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('http')>();
-  const { mockHttpRequestFn } = await import('./helpers/httpMock');
-  return {
-    ...actual,
-    default: {
-      ...actual.default,
-      request: mockHttpRequestFn,
-      createServer: actual.createServer, // Use real createServer for mock MCP server
-    },
-    request: mockHttpRequestFn,
-    createServer: actual.createServer, // Use real createServer for mock MCP server
-  };
-});
-
-vi.mock('https', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('https')>();
-  const { mockHttpsRequestFn } = await import('./helpers/httpMock');
-  return {
-    ...actual,
-    default: {
-      ...actual.default,
-      request: mockHttpsRequestFn,
-    },
-    request: mockHttpsRequestFn,
-  };
-});
+// Don't mock http/https globally - let tests that need mocking do it themselves
+// This prevents issues with tests that use real HTTP servers (MockTransportServer)

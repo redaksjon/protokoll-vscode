@@ -27,6 +27,7 @@ export class MockTransportServer {
   private port = 0;
   private running = false;
   private verbose: boolean;
+  private connections: Set<http.ServerResponse> = new Set();
 
   constructor(config: MockServerConfig = {}) {
     this.verbose = config.verbose ?? false;
@@ -84,24 +85,51 @@ export class MockTransportServer {
       return;
     }
 
-    return new Promise((resolve, reject) => {
-      // Close all SSE connections
+    return new Promise((resolve) => {
+      // Close all SSE connections first
       this.sseManager.closeAll();
 
-      // Close HTTP server
-      this.httpServer!.close((error) => {
-        if (error) {
-          reject(error);
-        } else {
-          this.running = false;
-          this.httpServer = null;
-
-          if (this.verbose) {
-            console.log('[MockServer] Stopped');
+      // Force close all tracked connections
+      for (const conn of this.connections) {
+        try {
+          if (!conn.writableEnded) {
+            conn.end();
           }
-
-          resolve();
+        } catch (error) {
+          // Ignore errors when closing connections
         }
+      }
+      this.connections.clear();
+
+      // Close HTTP server with a timeout
+      const closeTimeout = setTimeout(() => {
+        // Force close if it takes too long
+        if (this.httpServer) {
+          // Destroy all remaining sockets
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (this.httpServer as any).closeAllConnections?.();
+        }
+        this.running = false;
+        this.httpServer = null;
+        resolve();
+      }, 1000);
+
+      this.httpServer!.close((error) => {
+        clearTimeout(closeTimeout);
+        if (error) {
+          // Don't reject on error, just log and resolve
+          if (this.verbose) {
+            console.warn('[MockServer] Error closing server:', error);
+          }
+        }
+        this.running = false;
+        this.httpServer = null;
+
+        if (this.verbose) {
+          console.log('[MockServer] Stopped');
+        }
+
+        resolve();
       });
     });
   }
@@ -254,6 +282,15 @@ export class MockTransportServer {
     req: IncomingMessage,
     res: ServerResponse
   ): Promise<void> {
+    // Track this connection
+    this.connections.add(res);
+    res.on('close', () => {
+      this.connections.delete(res);
+    });
+    res.on('finish', () => {
+      this.connections.delete(res);
+    });
+
     const url = new URL(req.url || '/', `http://${req.headers.host}`);
 
     // Health check endpoint

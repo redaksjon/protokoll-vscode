@@ -40,6 +40,9 @@ export class SseManager {
   private notificationHistory: NotificationEvent[] = [];
   private simulationRules = new Map<string, SimulationRule[]>();
   private messageCounters = new Map<string, number>();
+  
+  // Track keepalive intervals to ensure proper cleanup
+  private keepaliveIntervals = new Map<string, NodeJS.Timeout>();
 
   constructor(verbose = false) {
     this.verbose = verbose;
@@ -83,12 +86,20 @@ export class SseManager {
         this.recordEvent(sessionId, 'keepalive');
       } else {
         clearInterval(keepaliveInterval);
+        this.keepaliveIntervals.delete(sessionId);
       }
     }, 15000); // Ping every 15 seconds
+    
+    // Store the interval reference for proper cleanup
+    this.keepaliveIntervals.set(sessionId, keepaliveInterval);
 
     // Clean up on connection close
     response.on('close', () => {
-      clearInterval(keepaliveInterval);
+      const interval = this.keepaliveIntervals.get(sessionId);
+      if (interval) {
+        clearInterval(interval);
+        this.keepaliveIntervals.delete(sessionId);
+      }
       this.recordEvent(sessionId, 'disconnected');
       this.removeConnection(sessionId);
       if (this.verbose) {
@@ -108,6 +119,14 @@ export class SseManager {
     const connection = this.connections.get(sessionId);
     if (connection) {
       connection.connected = false;
+      
+      // Clear keepalive interval to prevent memory leak
+      const interval = this.keepaliveIntervals.get(sessionId);
+      if (interval) {
+        clearInterval(interval);
+        this.keepaliveIntervals.delete(sessionId);
+      }
+      
       try {
         connection.response.end();
       } catch (error) {
@@ -266,6 +285,13 @@ export class SseManager {
    * Close all connections
    */
   closeAll(): void {
+    // Clear all keepalive intervals first
+    for (const interval of this.keepaliveIntervals.values()) {
+      clearInterval(interval);
+    }
+    this.keepaliveIntervals.clear();
+    
+    // Then close all connections
     for (const sessionId of Array.from(this.connections.keys())) {
       this.removeConnection(sessionId);
     }

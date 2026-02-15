@@ -3,46 +3,46 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { OpenAIClient } from '../src/openaiClient';
-import { McpClient } from '../src/mcpClient';
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
 
-// Mock OpenAI
-vi.mock('openai', () => {
-  return {
-    default: vi.fn().mockImplementation(() => ({
-      chat: {
-        completions: {
-          create: vi.fn(),
-        },
+// Use vi.hoisted to ensure mock is set up before module resolution
+const { mockCreate, MockedOpenAI } = vi.hoisted(() => {
+  const mockCreate = vi.fn();
+  const MockedOpenAI = vi.fn(() => ({
+    chat: {
+      completions: {
+        create: mockCreate,
       },
-    })),
-  };
+    },
+  }));
+  return { mockCreate, MockedOpenAI };
 });
+
+// Mock OpenAI module
+vi.mock('openai', () => ({
+  default: MockedOpenAI,
+}));
+
+// Import after mocking
+import { OpenAIClient } from '../src/openaiClient';
+import { McpClient } from '../src/mcpClient';
 
 describe('OpenAIClient', () => {
   let client: OpenAIClient;
   let mockMcpClient: McpClient;
-  let mockOpenAI: any;
 
-  beforeEach(async () => {
-    const OpenAI = (await import('openai')).default;
-    mockOpenAI = {
-      chat: {
-        completions: {
-          create: vi.fn(),
-        },
-      },
-    };
-    (OpenAI as any).mockImplementation(() => mockOpenAI);
+  beforeEach(() => {
+    // Clear all mocks first
+    vi.clearAllMocks();
+    mockCreate.mockReset();
 
+    // Create the client - it will use the mock instance
     client = new OpenAIClient('test-api-key');
+    
     mockMcpClient = {
       listTools: vi.fn(),
       callTool: vi.fn(),
     } as any;
-
-    vi.clearAllMocks();
   });
 
   describe('constructor', () => {
@@ -178,7 +178,7 @@ describe('OpenAIClient', () => {
         },
       };
 
-      mockOpenAI.chat.completions.create.mockResolvedValue(mockStream);
+      mockCreate.mockResolvedValue(mockStream);
 
       const chunks: string[] = [];
       for await (const chunk of client.streamChat(mockMessages, [])) {
@@ -186,7 +186,7 @@ describe('OpenAIClient', () => {
       }
 
       expect(chunks).toEqual(['Hello ', 'there!']);
-      expect(mockOpenAI.chat.completions.create).toHaveBeenCalledWith({
+      expect(mockCreate).toHaveBeenCalledWith({
         model: 'gpt-5.2',
         messages: mockMessages,
         tools: undefined,
@@ -231,14 +231,14 @@ describe('OpenAIClient', () => {
         },
       };
 
-      mockOpenAI.chat.completions.create.mockResolvedValue(mockStream);
+      mockCreate.mockResolvedValue(mockStream);
 
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       for await (const _chunk of client.streamChat(mockMessages, mockTools)) {
         // Just consume the stream
       }
 
-      expect(mockOpenAI.chat.completions.create).toHaveBeenCalledWith({
+      expect(mockCreate).toHaveBeenCalledWith({
         model: 'gpt-5.2',
         messages: mockMessages,
         tools: mockTools,
@@ -294,7 +294,7 @@ describe('OpenAIClient', () => {
         },
       };
 
-      mockOpenAI.chat.completions.create.mockResolvedValue(mockStream);
+      mockCreate.mockResolvedValue(mockStream);
 
       const onToolCall = vi.fn();
       const chunks: string[] = [];
@@ -313,7 +313,7 @@ describe('OpenAIClient', () => {
         { role: 'user' as const, content: 'Hello' },
       ];
 
-      mockOpenAI.chat.completions.create.mockRejectedValue(new Error('API Error'));
+      mockCreate.mockRejectedValue(new Error('API Error'));
 
       await expect(async () => {
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -346,7 +346,7 @@ describe('OpenAIClient', () => {
         },
       };
 
-      mockOpenAI.chat.completions.create.mockResolvedValue(mockStream);
+      mockCreate.mockResolvedValue(mockStream);
 
       const chunks: string[] = [];
       for await (const chunk of client.streamChat(mockMessages, [])) {
