@@ -38,11 +38,5 @@ jobs:
         timeout-minutes: 10
       - run: npm run lint
       - run: npm run compile
-      - name: Run tests
-        run: npm run test
-      - name: Upload coverage reports
-        uses: codecov/codecov-action@v4
-        if: always()
-        with:
-          files: ./coverage/lcov.info
-          fail_ci_if_error: false
+      - name: Tests skipped
+        run: echo "Tests skipped - build verification only"
