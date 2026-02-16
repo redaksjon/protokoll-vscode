@@ -1634,202 +1634,270 @@ export class TranscriptDetailViewProvider {
     }
   }
 
-  private async handleCreateEntityFromSelection(selectedText: string, transcriptUri: string): Promise<void> {
-    if (!this._client) {
-      vscode.window.showErrorMessage('MCP client not initialized');
-      return;
+  private async getEntityDetails(entityType: string, entityId: string): Promise<{ id: string; name: string; type: string } | null> {
+    try {
+      const entityUri = `protokoll://entity/${entityType}/${encodeURIComponent(entityId)}`;
+      const entityContent = await this._client!.readResource(entityUri);
+      const entityData = this.parseEntityContent(entityContent.text);
+      return {
+        id: entityId,
+        name: entityData.name || entityId,
+        type: entityType
+      };
+    } catch (error) {
+      console.warn('Could not read entity:', entityType, entityId, error);
+      return null;
+    }
+  }
+
+  private async showEntityPicker(
+    selectedText: string,
+    transcriptPath: string
+  ): Promise<{ id: string; name: string; type: string; source: 'suggestion' | 'search' | 'create-new' } | undefined> {
+    interface EntityPickerItem extends vscode.QuickPickItem {
+      id?: string;
+      name?: string;
+      type?: string;
+      source?: 'suggestion' | 'search' | 'create-new';
+      score?: number;
     }
 
-    if (!selectedText || selectedText.trim().length === 0) {
+    const items: EntityPickerItem[] = [];
+    
+    // Step 1: Get weight model suggestions
+    try {
+      const predictions = await this._client!.callTool('protokoll_predict_entities', {
+        transcriptPath: this.convertToRelativePath(transcriptPath),
+        maxPredictions: 5
+      }) as { success?: boolean; predictions?: Array<{ entityId: string; score: number; source: string }> };
+      
+      if (predictions.success && predictions.predictions && predictions.predictions.length > 0) {
+        // Add separator for suggestions
+        items.push({
+          label: '$(sparkle) Suggested Entities',
+          kind: vscode.QuickPickItemKind.Separator
+        });
+        
+        // Add suggestion items
+        for (const pred of predictions.predictions) {
+          const entity = await this.getEntityDetails('person', pred.entityId) || 
+                         await this.getEntityDetails('project', pred.entityId) ||
+                         await this.getEntityDetails('term', pred.entityId) ||
+                         await this.getEntityDetails('company', pred.entityId);
+          if (entity) {
+            items.push({
+              id: entity.id,
+              name: entity.name,
+              type: entity.type,
+              source: 'suggestion',
+              score: pred.score,
+              label: `$(star) ${entity.name}`,
+              description: `${entity.type} • score: ${pred.score.toFixed(1)}`,
+              detail: 'Suggested based on transcript context'
+            });
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('Could not load entity suggestions:', error);
+    }
+    
+    // Step 2: Add entity type sections with create-new and existing entities
+    const entityTypes = [
+      { value: 'person', label: 'People', plural: 'people', icon: 'person' },
+      { value: 'project', label: 'Projects', plural: 'projects', icon: 'project' },
+      { value: 'company', label: 'Companies', plural: 'companies', icon: 'organization' },
+      { value: 'term', label: 'Terms', plural: 'terms', icon: 'symbol-key' }
+    ];
+    
+    for (const type of entityTypes) {
+      items.push({
+        label: `$(${type.icon}) ${type.label}`,
+        kind: vscode.QuickPickItemKind.Separator
+      });
+      
+      // Add 'Create New' option
+      items.push({
+        id: `create-${type.value}`,
+        name: selectedText,
+        type: type.value,
+        source: 'create-new',
+        label: `$(plus) Create new ${type.value}: "${selectedText}"`,
+        description: 'Create and map to new entity'
+      });
+      
+      // Add existing entities (first 5)
+      try {
+        const listResult = await this._client!.callTool(`protokoll_list_${type.plural}`, {
+          limit: 5
+        }) as { success?: boolean; [key: string]: unknown };
+        
+        const entityKey = type.plural;
+        if (listResult.success && listResult[entityKey]) {
+          for (const entity of listResult[entityKey] as Array<{ id: string; name: string }>) {
+            items.push({
+              id: entity.id,
+              name: entity.name,
+              type: type.value,
+              source: 'search',
+              label: entity.name,
+              description: type.value
+            });
+          }
+        }
+      } catch (error) {
+        console.warn(`Could not load ${type.plural} entities:`, error);
+      }
+    }
+    
+    const picker = vscode.window.createQuickPick<EntityPickerItem>();
+    picker.items = items;
+    picker.placeholder = `Correct "${selectedText}" to... (type to search)`;
+    picker.canSelectMany = false;
+    picker.title = 'Entity Correction';
+    picker.matchOnDescription = true;
+    picker.matchOnDetail = true;
+    
+    // Enable dynamic search
+    let searchTimeout: NodeJS.Timeout | undefined;
+    picker.onDidChangeValue(async (value) => {
+      if (searchTimeout) {
+        clearTimeout(searchTimeout);
+      }
+      
+      if (value.length > 2) {
+        searchTimeout = setTimeout(async () => {
+          // Search across all entity types
+          const searchItems: EntityPickerItem[] = [...items.filter(i => i.kind === vscode.QuickPickItemKind.Separator || i.source === 'create-new' || i.source === 'suggestion')];
+          
+          for (const type of entityTypes) {
+            try {
+              const searchResult = await this._client!.callTool(`protokoll_list_${type.plural}`, {
+                search: value,
+                limit: 10
+              }) as { success?: boolean; [key: string]: unknown };
+              
+              const entityKey = type.plural;
+              if (searchResult.success && searchResult[entityKey]) {
+                for (const entity of searchResult[entityKey] as Array<{ id: string; name: string }>) {
+                  // Don't duplicate if already in suggestions
+                  if (!searchItems.some(i => i.id === entity.id)) {
+                    searchItems.push({
+                      id: entity.id,
+                      name: entity.name,
+                      type: type.value,
+                      source: 'search',
+                      label: entity.name,
+                      description: `${type.value} (search result)`
+                    });
+                  }
+                }
+              }
+            } catch (error) {
+              console.warn(`Search failed for ${type.plural}:`, error);
+            }
+          }
+          
+          picker.items = searchItems;
+        }, 300); // Debounce search
+      } else if (value.length === 0) {
+        // Reset to original items
+        picker.items = items;
+      }
+    });
+    
+    return new Promise((resolve) => {
+      picker.onDidAccept(() => {
+        const selected = picker.selectedItems[0];
+        if (selected && selected.id && selected.name && selected.type && selected.source) {
+          resolve({ 
+            id: selected.id, 
+            name: selected.name, 
+            type: selected.type, 
+            source: selected.source 
+          });
+        } else {
+          resolve(undefined);
+        }
+        picker.dispose();
+      });
+      
+      picker.onDidHide(() => {
+        resolve(undefined);
+        picker.dispose();
+      });
+      
+      picker.show();
+    });
+  }
+
+  private async handleCorrectSelection(selectedText: string, transcriptUri: string): Promise<void> {
+    if (!this._client || !selectedText?.trim()) {
       vscode.window.showWarningMessage('No text selected');
       return;
     }
-
+    
     try {
-      // Show quick pick to select entity type
-      const entityTypes = [
-        { label: 'Person', value: 'person', tool: 'protokoll_add_person' },
-        { label: 'Project', value: 'project', tool: 'protokoll_add_project' },
-        { label: 'Company', value: 'company', tool: 'protokoll_add_company' },
-        { label: 'Term', value: 'term', tool: 'protokoll_add_term' },
-      ];
-
-      const selected = await vscode.window.showQuickPick(entityTypes, {
-        placeHolder: `Create ${selectedText} as...`,
-      });
-
-      if (!selected) {
-        return; // User cancelled
-      }
-
-      // Create the entity using the appropriate MCP tool
-      const entityName = selectedText.trim();
-      let entityId: string;
-      let result: { 
-        success?: boolean;
-        message?: string;
-        entity?: { id: string; name: string; type: string; [key: string]: unknown };
-        [key: string]: unknown;
-      };
-
-      let entityCreated = false;
-      let entityNameFromServer = entityName;
-
-      try {
-        switch (selected.value) {
-          case 'person':
-            result = await this._client.callTool('protokoll_add_person', {
-              name: entityName,
-            }) as { 
-              success?: boolean;
-              message?: string;
-              entity?: { id: string; name: string; type: string; [key: string]: unknown };
-              [key: string]: unknown;
-            };
-            entityId = result.entity?.id || this.slugify(entityName);
-            if (result.entity?.name) {
-              entityNameFromServer = String(result.entity.name);
-            }
-            entityCreated = true;
-            break;
-
-          case 'project':
-            result = await this._client.callTool('protokoll_add_project', {
-              name: entityName,
-            }) as { 
-              success?: boolean;
-              message?: string;
-              entity?: { id: string; name: string; type: string; [key: string]: unknown };
-              [key: string]: unknown;
-            };
-            entityId = result.entity?.id || this.slugify(entityName);
-            if (result.entity?.name) {
-              entityNameFromServer = String(result.entity.name);
-            }
-            entityCreated = true;
-            break;
-
-          case 'company':
-            result = await this._client.callTool('protokoll_add_company', {
-              name: entityName,
-            }) as { 
-              success?: boolean;
-              message?: string;
-              entity?: { id: string; name: string; type: string; [key: string]: unknown };
-              [key: string]: unknown;
-            };
-            entityId = result.entity?.id || this.slugify(entityName);
-            if (result.entity?.name) {
-              entityNameFromServer = String(result.entity.name);
-            }
-            entityCreated = true;
-            break;
-
-          case 'term':
-            result = await this._client.callTool('protokoll_add_term', {
-              name: entityName,
-            }) as { 
-              success?: boolean;
-              message?: string;
-              entity?: { id: string; name: string; type: string; [key: string]: unknown };
-              [key: string]: unknown;
-            };
-            entityId = result.entity?.id || this.slugify(entityName);
-            if (result.entity?.name) {
-              entityNameFromServer = String(result.entity.name);
-            }
-            entityCreated = true;
-            break;
-
-          default:
-            vscode.window.showErrorMessage(`Unknown entity type: ${selected.value}`);
-            return;
-        }
-      } catch (createError) {
-        // Check if the error is "already exists"
-        const errorMessage = createError instanceof Error ? createError.message : String(createError);
-        const alreadyExistsMatch = errorMessage.match(/already exists.*?["']([^"']+)["']/i) || 
-                                   errorMessage.match(/ID\s+["']([^"']+)["']\s+already exists/i);
-        
-        if (alreadyExistsMatch) {
-          // Entity already exists - extract ID and continue
-          entityId = alreadyExistsMatch[1];
-          entityCreated = false;
-          
-          // Try to read the entity to get its name
-          try {
-            const entityUri = `protokoll://entity/${selected.value}/${encodeURIComponent(entityId)}`;
-            const entityContent = await this._client.readResource(entityUri);
-            const entityData = this.parseEntityContent(entityContent.text);
-            if (entityData.name) {
-              entityNameFromServer = String(entityData.name);
-            }
-          } catch (readError) {
-            // If we can't read it, use the original name
-            console.warn('Protokoll: Could not read existing entity:', readError);
-          }
-        } else {
-          // Some other error - rethrow it
-          throw createError;
-        }
-      }
-
-      if (!entityId) {
-        vscode.window.showErrorMessage('Failed to create entity: No ID returned');
+      const currentTranscript = this._currentTranscripts.get(transcriptUri);
+      if (!currentTranscript) {
+        vscode.window.showErrorMessage('No transcript loaded');
         return;
       }
-
-      // Get current transcript to add entity reference
-      const currentTranscript = this._currentTranscripts.get(transcriptUri);
-      if (currentTranscript) {
-        const transcriptPath = currentTranscript.transcript.path || currentTranscript.transcript.filename;
-        
-        // Add entity reference using MCP tool
-        try {
-          // Build updated entities object from current transcript metadata
-          const entities = currentTranscript.transcript.entities || { people: [], projects: [], terms: [], companies: [] };
-          const typePlural = selected.value === 'person' ? 'people' : 
-                            selected.value === 'company' ? 'companies' :
-                            selected.value === 'term' ? 'terms' :
-                            selected.value === 'project' ? 'projects' : selected.value;
-          
-          // Add new entity if not already present
-          const entityList = entities[typePlural as keyof typeof entities] || [];
-          const entityExists = entityList.some((e: { id: string }) => e.id === entityId);
-          
-          if (!entityExists) {
-            const newEntity = { id: entityId, name: entityNameFromServer };
-            entities[typePlural as keyof typeof entities] = [...entityList, newEntity];
-            
-            // Update transcript entities using MCP tool
-            await this._client.callTool('protokoll_update_transcript_entity_references', {
-              transcriptPath: this.convertToRelativePath(transcriptPath),
-              entities: entities,
-            });
-          }
-        } catch (updateError) {
-          console.warn('Protokoll: Could not update transcript with entity reference:', updateError);
-          // Continue anyway - we'll still open the entity view
-        }
+      
+      const transcriptPath = currentTranscript.transcript.path || currentTranscript.transcript.filename;
+      const selectedEntity = await this.showEntityPicker(selectedText, transcriptPath);
+      
+      if (!selectedEntity) {
+        return; // User cancelled
       }
-
-      if (entityCreated) {
-        vscode.window.showInformationMessage(`Created ${selected.label.toLowerCase()}: ${entityNameFromServer}`);
+      
+      // Call unified correction tool
+      const correctionArgs: {
+        transcriptPath: string;
+        selectedText: string;
+        entityType: string;
+        entityName?: string;
+        entityId?: string;
+      } = {
+        transcriptPath: this.convertToRelativePath(transcriptPath),
+        selectedText: selectedText.trim(),
+        entityType: selectedEntity.type
+      };
+      
+      if (selectedEntity.source === 'create-new') {
+        correctionArgs.entityName = selectedEntity.name;
       } else {
-        vscode.window.showInformationMessage(`Associated transcript with existing ${selected.label.toLowerCase()}: ${entityNameFromServer}`);
+        correctionArgs.entityId = selectedEntity.id;
       }
-
-      // Navigate to the entity view
-      await this.handleOpenEntity(selected.value, entityId);
-
-      // Refresh the transcript view to show the new entity reference
-      await this.refreshTranscript(transcriptUri);
+      
+      const result = await this._client.callTool('protokoll_correct_to_entity', correctionArgs) as {
+        success?: boolean;
+        message?: string;
+        entity?: { id: string; name: string; type: string };
+        isNewEntity?: boolean;
+      };
+      
+      if (result.success && result.entity) {
+        const action = result.isNewEntity ? 'Created' : 'Mapped to existing';
+        vscode.window.showInformationMessage(
+          `${action} ${selectedEntity.type}: ${result.entity.name}`
+        );
+        
+        // Navigate to entity and refresh transcript
+        await this.handleOpenEntity(selectedEntity.type, result.entity.id);
+        await this.refreshTranscript(transcriptUri);
+      }
     } catch (error) {
-      console.error('Protokoll: [TRANSCRIPT VIEW] Error creating entity:', error);
+      console.error('Protokoll: [TRANSCRIPT VIEW] Error correcting selection:', error);
       vscode.window.showErrorMessage(
-        `Failed to create entity: ${error instanceof Error ? error.message : String(error)}`
+        `Correction failed: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+  }
+
+  private async handleCreateEntityFromSelection(selectedText: string, transcriptUri: string): Promise<void> {
+    // Delegate to unified correction handler
+    return this.handleCorrectSelection(selectedText, transcriptUri);
   }
 
   private slugify(text: string): string {
@@ -3606,7 +3674,7 @@ export class TranscriptDetailViewProvider {
             <div class="transcript-content" id="transcript-content-display">
                 ${this.markdownToHtml(transcriptText)}
             </div>
-            <button class="create-entity-button" id="create-entity-btn" onclick="createEntityFromSelection()">Create Entity</button>
+            <button class="create-entity-button" id="create-entity-btn" onclick="createEntityFromSelection()" title="Correct this text by creating new entity or mapping to existing">Correct Text</button>
         </div>
         ${content.rawTranscript ? `
         <div class="tab-content" id="raw-content">
