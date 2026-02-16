@@ -10,6 +10,10 @@ import { TranscriptDetailViewProvider, getTranscriptContentProvider, getEditable
 import { ConnectionStatusViewProvider } from './connectionStatusView';
 import { ChatViewProvider } from './chatView';
 import { ChatsViewProvider } from './chatsView';
+import { PeopleViewProvider } from './peopleView';
+import { TermsViewProvider } from './termsView';
+import { ProjectsViewProvider } from './projectsView';
+import { CompaniesViewProvider } from './companiesView';
 import type { Transcript, TranscriptContent } from './types';
 import { log, initLogger } from './logger';
 import { shouldPassContextDirectory, clearServerModeCache } from './serverMode';
@@ -20,6 +24,10 @@ let transcriptDetailViewProvider: TranscriptDetailViewProvider | null = null;
 let connectionStatusViewProvider: ConnectionStatusViewProvider | null = null;
 let chatViewProvider: ChatViewProvider | null = null;
 let chatsViewProvider: ChatsViewProvider | null = null;
+let peopleViewProvider: PeopleViewProvider | null = null;
+let termsViewProvider: TermsViewProvider | null = null;
+let projectsViewProvider: ProjectsViewProvider | null = null;
+let companiesViewProvider: CompaniesViewProvider | null = null;
 
 function getDefaultContextDirectory(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -86,14 +94,30 @@ export async function activate(context: vscode.ExtensionContext) {
         // Note: connectionStatusViewProvider is not yet initialized at this point
         // It will be set up later after view providers are created
         
-        // Subscribe to resource list change notifications (for transcript list)
+        // Subscribe to resource list change notifications (for transcript list and entity views)
         console.log('Protokoll: [EXTENSION] Registering notification handler for resources_changed');
         mcpClient.onNotification('notifications/resources_changed', async () => {
-          console.log('Protokoll: [EXTENSION] 📢 Received resources_changed notification, refreshing transcripts');
+          console.log('Protokoll: [EXTENSION] 📢 Received resources_changed notification, refreshing views');
+          
+          // Refresh transcripts view
           if (transcriptsViewProvider) {
             await transcriptsViewProvider.refresh();
           } else {
             console.warn('Protokoll: [EXTENSION] ⚠️ transcriptsViewProvider is null, cannot refresh');
+          }
+          
+          // Refresh entity views
+          if (peopleViewProvider) {
+            await peopleViewProvider.refresh();
+          }
+          if (termsViewProvider) {
+            await termsViewProvider.refresh();
+          }
+          if (projectsViewProvider) {
+            await projectsViewProvider.refresh();
+          }
+          if (companiesViewProvider) {
+            await companiesViewProvider.refresh();
           }
           
           // Also refresh any open transcript detail views, as they might need to update
@@ -291,6 +315,38 @@ export async function activate(context: vscode.ExtensionContext) {
     log('Protokoll: Transcripts view provider initialized without MCP client (will need configuration)');
   }
 
+  peopleViewProvider = new PeopleViewProvider(context);
+  if (mcpClient) {
+    peopleViewProvider.setClient(mcpClient);
+    log('Protokoll: People view provider initialized with MCP client');
+  } else {
+    log('Protokoll: People view provider initialized without MCP client (will need configuration)');
+  }
+
+  termsViewProvider = new TermsViewProvider(context);
+  if (mcpClient) {
+    termsViewProvider.setClient(mcpClient);
+    log('Protokoll: Terms view provider initialized with MCP client');
+  } else {
+    log('Protokoll: Terms view provider initialized without MCP client (will need configuration)');
+  }
+
+  projectsViewProvider = new ProjectsViewProvider(context);
+  if (mcpClient) {
+    projectsViewProvider.setClient(mcpClient);
+    log('Protokoll: Projects view provider initialized with MCP client');
+  } else {
+    log('Protokoll: Projects view provider initialized without MCP client (will need configuration)');
+  }
+
+  companiesViewProvider = new CompaniesViewProvider(context);
+  if (mcpClient) {
+    companiesViewProvider.setClient(mcpClient);
+    log('Protokoll: Companies view provider initialized with MCP client');
+  } else {
+    log('Protokoll: Companies view provider initialized without MCP client (will need configuration)');
+  }
+
   transcriptDetailViewProvider = new TranscriptDetailViewProvider(context.extensionUri);
   if (mcpClient) {
     transcriptDetailViewProvider.setClient(mcpClient);
@@ -426,6 +482,87 @@ export async function activate(context: vscode.ExtensionContext) {
       }
     } else if (e.visible && !mcpClient) {
       log('Protokoll: Transcripts view visible but no client yet, will refresh when connected');
+    }
+  });
+
+  // Register people tree view
+  log('Protokoll: Creating people tree view...');
+  const peopleTreeView = vscode.window.createTreeView('protokollPeople', {
+    treeDataProvider: peopleViewProvider,
+    showCollapseAll: false,
+  });
+  log('Protokoll: People tree view created', { visible: peopleTreeView.visible });
+
+  peopleViewProvider.setTreeView(peopleTreeView);
+
+  peopleTreeView.onDidChangeVisibility(async (e) => {
+    log('Protokoll: People onDidChangeVisibility fired', { visible: e.visible, hasClient: !!mcpClient, hasPeople: peopleViewProvider?.hasPeople() });
+    if (e.visible && peopleViewProvider && mcpClient) {
+      if (!peopleViewProvider.hasPeople()) {
+        log('Protokoll: People view became visible with no data, refreshing...');
+        await peopleViewProvider.refresh();
+        log('Protokoll: People auto-refresh on visibility completed');
+        
+        setTimeout(() => {
+          log('Protokoll: Firing delayed people tree refresh');
+          peopleViewProvider?.fireTreeDataChange();
+        }, 100);
+      } else {
+        log('Protokoll: People view visible but already has data, skipping refresh');
+      }
+    } else if (e.visible && !mcpClient) {
+      log('Protokoll: People view visible but no client yet, will refresh when connected');
+    }
+  });
+
+  // Register terms tree view
+  log('Protokoll: Creating terms tree view...');
+  const termsTreeView = vscode.window.createTreeView('protokollTerms', {
+    treeDataProvider: termsViewProvider,
+    showCollapseAll: false,
+  });
+  log('Protokoll: Terms tree view created', { visible: termsTreeView.visible });
+
+  termsViewProvider.setTreeView(termsTreeView);
+
+  termsTreeView.onDidChangeVisibility(async (e) => {
+    if (e.visible && termsViewProvider && mcpClient && !termsViewProvider.hasTerms()) {
+      await termsViewProvider.refresh();
+      setTimeout(() => termsViewProvider?.fireTreeDataChange(), 100);
+    }
+  });
+
+  // Register projects tree view
+  log('Protokoll: Creating projects tree view...');
+  const projectsTreeView = vscode.window.createTreeView('protokollProjects', {
+    treeDataProvider: projectsViewProvider,
+    showCollapseAll: false,
+  });
+  log('Protokoll: Projects tree view created', { visible: projectsTreeView.visible });
+
+  projectsViewProvider.setTreeView(projectsTreeView);
+
+  projectsTreeView.onDidChangeVisibility(async (e) => {
+    if (e.visible && projectsViewProvider && mcpClient && !projectsViewProvider.hasProjects()) {
+      await projectsViewProvider.refresh();
+      setTimeout(() => projectsViewProvider?.fireTreeDataChange(), 100);
+    }
+  });
+
+  // Register companies tree view
+  log('Protokoll: Creating companies tree view...');
+  const companiesTreeView = vscode.window.createTreeView('protokollCompanies', {
+    treeDataProvider: companiesViewProvider,
+    showCollapseAll: false,
+  });
+  log('Protokoll: Companies tree view created', { visible: companiesTreeView.visible });
+
+  companiesViewProvider.setTreeView(companiesTreeView);
+
+  companiesTreeView.onDidChangeVisibility(async (e) => {
+    if (e.visible && companiesViewProvider && mcpClient && !companiesViewProvider.hasCompanies()) {
+      await companiesViewProvider.refresh();
+      setTimeout(() => companiesViewProvider?.fireTreeDataChange(), 100);
     }
   });
 
@@ -642,6 +779,185 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
       await transcriptsViewProvider.refresh();
+    }
+  );
+
+  const refreshPeopleCommand = vscode.commands.registerCommand(
+    'protokoll.refreshPeople',
+    async () => {
+      if (!peopleViewProvider) {
+        return;
+      }
+      await peopleViewProvider.refresh();
+    }
+  );
+
+  const searchPeopleCommand = vscode.commands.registerCommand(
+    'protokoll.people.search',
+    async () => {
+      if (!peopleViewProvider) {
+        return;
+      }
+
+      const searchQuery = await vscode.window.showInputBox({
+        prompt: 'Search people by name, ID, or sounds-like variants',
+        placeHolder: 'Enter search query...',
+      });
+
+      if (searchQuery !== undefined) {
+        if (searchQuery === '') {
+          await peopleViewProvider.clearSearch();
+        } else {
+          await peopleViewProvider.setSearch(searchQuery);
+        }
+      }
+    }
+  );
+
+  const loadMorePeopleCommand = vscode.commands.registerCommand(
+    'protokoll.people.loadMore',
+    async () => {
+      if (!peopleViewProvider) {
+        return;
+      }
+      await peopleViewProvider.loadMore();
+    }
+  );
+
+  const refreshTermsCommand = vscode.commands.registerCommand(
+    'protokoll.refreshTerms',
+    async () => {
+      if (!termsViewProvider) {
+        return;
+      }
+      await termsViewProvider.refresh();
+    }
+  );
+
+  const searchTermsCommand = vscode.commands.registerCommand(
+    'protokoll.terms.search',
+    async () => {
+      if (!termsViewProvider) {
+        return;
+      }
+
+      const searchQuery = await vscode.window.showInputBox({
+        prompt: 'Search terms by name, ID, or sounds-like variants',
+        placeHolder: 'Enter search query...',
+      });
+
+      if (searchQuery !== undefined) {
+        if (searchQuery === '') {
+          await termsViewProvider.clearSearch();
+        } else {
+          await termsViewProvider.setSearch(searchQuery);
+        }
+      }
+    }
+  );
+
+  const loadMoreTermsCommand = vscode.commands.registerCommand(
+    'protokoll.terms.loadMore',
+    async () => {
+      if (!termsViewProvider) {
+        return;
+      }
+      await termsViewProvider.loadMore();
+    }
+  );
+
+  const refreshProjectsCommand = vscode.commands.registerCommand(
+    'protokoll.refreshProjects',
+    async () => {
+      if (!projectsViewProvider) {
+        return;
+      }
+      await projectsViewProvider.refresh();
+    }
+  );
+
+  const searchProjectsCommand = vscode.commands.registerCommand(
+    'protokoll.projects.search',
+    async () => {
+      if (!projectsViewProvider) {
+        return;
+      }
+
+      const searchQuery = await vscode.window.showInputBox({
+        prompt: 'Search projects by name or ID',
+        placeHolder: 'Enter search query...',
+      });
+
+      if (searchQuery !== undefined) {
+        if (searchQuery === '') {
+          await projectsViewProvider.clearSearch();
+        } else {
+          await projectsViewProvider.setSearch(searchQuery);
+        }
+      }
+    }
+  );
+
+  const loadMoreProjectsCommand = vscode.commands.registerCommand(
+    'protokoll.projects.loadMore',
+    async () => {
+      if (!projectsViewProvider) {
+        return;
+      }
+      await projectsViewProvider.loadMore();
+    }
+  );
+
+  const refreshCompaniesCommand = vscode.commands.registerCommand(
+    'protokoll.refreshCompanies',
+    async () => {
+      if (!companiesViewProvider) {
+        return;
+      }
+      await companiesViewProvider.refresh();
+    }
+  );
+
+  const searchCompaniesCommand = vscode.commands.registerCommand(
+    'protokoll.companies.search',
+    async () => {
+      if (!companiesViewProvider) {
+        return;
+      }
+
+      const searchQuery = await vscode.window.showInputBox({
+        prompt: 'Search companies by name, ID, or sounds-like variants',
+        placeHolder: 'Enter search query...',
+      });
+
+      if (searchQuery !== undefined) {
+        if (searchQuery === '') {
+          await companiesViewProvider.clearSearch();
+        } else {
+          await companiesViewProvider.setSearch(searchQuery);
+        }
+      }
+    }
+  );
+
+  const loadMoreCompaniesCommand = vscode.commands.registerCommand(
+    'protokoll.companies.loadMore',
+    async () => {
+      if (!companiesViewProvider) {
+        return;
+      }
+      await companiesViewProvider.loadMore();
+    }
+  );
+
+  const openEntityCommand = vscode.commands.registerCommand(
+    'protokoll.openEntity',
+    async (entityType: string, entityId: string) => {
+      if (!transcriptDetailViewProvider) {
+        vscode.window.showErrorMessage('Transcript detail view provider not initialized');
+        return;
+      }
+      await transcriptDetailViewProvider.handleOpenEntity(entityType, entityId);
     }
   );
 
@@ -1374,6 +1690,19 @@ export async function activate(context: vscode.ExtensionContext) {
     openTranscriptCommand,
     openTranscriptInNewTabCommand,
     refreshTranscriptsCommand,
+    refreshPeopleCommand,
+    searchPeopleCommand,
+    loadMorePeopleCommand,
+    refreshTermsCommand,
+    searchTermsCommand,
+    loadMoreTermsCommand,
+    refreshProjectsCommand,
+    searchProjectsCommand,
+    loadMoreProjectsCommand,
+    refreshCompaniesCommand,
+    searchCompaniesCommand,
+    loadMoreCompaniesCommand,
+    openEntityCommand,
     filterByProjectCommand,
     filterByStatusCommand,
     sortTranscriptsCommand,
@@ -1394,6 +1723,10 @@ export async function activate(context: vscode.ExtensionContext) {
     backArrowHandler,
     configWatcher,
     transcriptsTreeView,
+    peopleTreeView,
+    termsTreeView,
+    projectsTreeView,
+    companiesTreeView,
     chatsTreeView,
     connectionStatusTreeView,
     outputChannel // Register output channel so it can be disposed properly

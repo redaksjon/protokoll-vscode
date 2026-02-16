@@ -421,6 +421,9 @@ export class TranscriptDetailViewProvider {
           case 'createEntityFromSelection':
             await this.handleCreateEntityFromSelection(message.selectedText, message.transcriptUri || transcriptUri);
             break;
+          case 'loadEnhancementLog':
+            await this.handleLoadEnhancementLog(panel, message.transcriptPath);
+            break;
           case 'refreshTranscript': {
             await this.refreshTranscript(transcriptUri);
             const refreshPanel = this._panels.get(transcriptUri);
@@ -1150,7 +1153,7 @@ export class TranscriptDetailViewProvider {
     }
   }
 
-  private async handleOpenEntity(entityType: string, entityId: string): Promise<void> {
+  public async handleOpenEntity(entityType: string, entityId: string): Promise<void> {
     if (!this._client) {
       vscode.window.showErrorMessage('MCP client not initialized');
       return;
@@ -1199,6 +1202,12 @@ export class TranscriptDetailViewProvider {
             case 'refreshEntity':
               await this.refreshEntity(entityUri);
               break;
+            case 'loadRelatedTranscripts':
+              await this.handleLoadRelatedTranscripts(panel, message.entityType, message.entityId);
+              break;
+            case 'openTranscript':
+              await this.handleOpenTranscriptFromEntity(message.path);
+              break;
           }
         },
         null
@@ -1230,6 +1239,129 @@ export class TranscriptDetailViewProvider {
     } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to open entity: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * Load enhancement log for a transcript and send to webview
+   */
+  private async handleLoadEnhancementLog(
+    panel: vscode.WebviewPanel,
+    transcriptPath: string
+  ): Promise<void> {
+    if (!this._client) {
+      return;
+    }
+
+    try {
+      // Call protokoll_get_enhancement_log
+      const response = await this._client.callTool('protokoll_get_enhancement_log', {
+        transcriptPath,
+        limit: 100,
+      }) as {
+        entries?: Array<{
+          id: number;
+          timestamp: string;
+          phase: string;
+          action: string;
+          details?: Record<string, unknown>;
+          entities?: Array<{ id: string; name: string; type: string }>;
+        }>;
+        total?: number;
+      };
+
+      // Send enhancement log to webview
+      panel.webview.postMessage({
+        command: 'enhancementLog',
+        data: response,
+      });
+    } catch (error) {
+      console.error('Protokoll: Failed to load enhancement log', error);
+      // Send empty data on error
+      panel.webview.postMessage({
+        command: 'enhancementLog',
+        data: { entries: [], total: 0 },
+      });
+    }
+  }
+
+  /**
+   * Load related transcripts for an entity and send to webview
+   */
+  private async handleLoadRelatedTranscripts(
+    panel: vscode.WebviewPanel,
+    entityType: string,
+    entityId: string
+  ): Promise<void> {
+    if (!this._client) {
+      return;
+    }
+
+    try {
+      // Call protokoll_list_transcripts with entity filter
+      const response = await this._client.callTool('protokoll_list_transcripts', {
+        entityId,
+        entityType,
+        limit: 100, // Load up to 100 related transcripts
+      }) as {
+        transcripts?: Array<{
+          path: string;
+          title: string;
+          date: string | null;
+          project: string | null;
+        }>;
+      };
+
+      // Send transcripts to webview
+      panel.webview.postMessage({
+        command: 'relatedTranscripts',
+        transcripts: response.transcripts || [],
+      });
+    } catch (error) {
+      console.error('Protokoll Entity: Failed to load related transcripts', error);
+      // Send empty array on error
+      panel.webview.postMessage({
+        command: 'relatedTranscripts',
+        transcripts: [],
+      });
+    }
+  }
+
+  /**
+   * Open a transcript from entity view
+   */
+  private async handleOpenTranscriptFromEntity(transcriptPath: string): Promise<void> {
+    if (!this._client) {
+      return;
+    }
+
+    try {
+      // Read the transcript
+      const transcriptContent = await this._client.callTool('protokoll_read_transcript', {
+        transcriptPath,
+      }) as TranscriptContent;
+
+      // Build URI
+      const uri = `protokoll://transcript/${transcriptPath.replace(/\.pkl$/, '')}`;
+
+      // Construct a Transcript object from TranscriptContent
+      const transcript: Transcript = {
+        uri,
+        path: transcriptContent.path,
+        filename: transcriptPath.split('/').pop() || transcriptPath,
+        date: transcriptContent.metadata.date || new Date().toISOString(),
+        time: transcriptContent.metadata.time,
+        title: transcriptContent.title,
+        status: transcriptContent.metadata.status,
+        entities: transcriptContent.metadata.entities,
+      };
+
+      // Show transcript in detail view
+      await this.showTranscript(uri, transcript, vscode.ViewColumn.One, false);
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to open transcript: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
@@ -1502,202 +1634,270 @@ export class TranscriptDetailViewProvider {
     }
   }
 
-  private async handleCreateEntityFromSelection(selectedText: string, transcriptUri: string): Promise<void> {
-    if (!this._client) {
-      vscode.window.showErrorMessage('MCP client not initialized');
-      return;
+  private async getEntityDetails(entityType: string, entityId: string): Promise<{ id: string; name: string; type: string } | null> {
+    try {
+      const entityUri = `protokoll://entity/${entityType}/${encodeURIComponent(entityId)}`;
+      const entityContent = await this._client!.readResource(entityUri);
+      const entityData = this.parseEntityContent(entityContent.text);
+      return {
+        id: entityId,
+        name: entityData.name || entityId,
+        type: entityType
+      };
+    } catch (error) {
+      console.warn('Could not read entity:', entityType, entityId, error);
+      return null;
+    }
+  }
+
+  private async showEntityPicker(
+    selectedText: string,
+    transcriptPath: string
+  ): Promise<{ id: string; name: string; type: string; source: 'suggestion' | 'search' | 'create-new' } | undefined> {
+    interface EntityPickerItem extends vscode.QuickPickItem {
+      id?: string;
+      name?: string;
+      type?: string;
+      source?: 'suggestion' | 'search' | 'create-new';
+      score?: number;
     }
 
-    if (!selectedText || selectedText.trim().length === 0) {
+    const items: EntityPickerItem[] = [];
+    
+    // Step 1: Get weight model suggestions
+    try {
+      const predictions = await this._client!.callTool('protokoll_predict_entities', {
+        transcriptPath: this.convertToRelativePath(transcriptPath),
+        maxPredictions: 5
+      }) as { success?: boolean; predictions?: Array<{ entityId: string; score: number; source: string }> };
+      
+      if (predictions.success && predictions.predictions && predictions.predictions.length > 0) {
+        // Add separator for suggestions
+        items.push({
+          label: '$(sparkle) Suggested Entities',
+          kind: vscode.QuickPickItemKind.Separator
+        });
+        
+        // Add suggestion items
+        for (const pred of predictions.predictions) {
+          const entity = await this.getEntityDetails('person', pred.entityId) || 
+                         await this.getEntityDetails('project', pred.entityId) ||
+                         await this.getEntityDetails('term', pred.entityId) ||
+                         await this.getEntityDetails('company', pred.entityId);
+          if (entity) {
+            items.push({
+              id: entity.id,
+              name: entity.name,
+              type: entity.type,
+              source: 'suggestion',
+              score: pred.score,
+              label: `$(star) ${entity.name}`,
+              description: `${entity.type} • score: ${pred.score.toFixed(1)}`,
+              detail: 'Suggested based on transcript context'
+            });
+          }
+        }
+      }
+    } catch (error) {
+      console.warn('Could not load entity suggestions:', error);
+    }
+    
+    // Step 2: Add entity type sections with create-new and existing entities
+    const entityTypes = [
+      { value: 'person', label: 'People', plural: 'people', icon: 'person' },
+      { value: 'project', label: 'Projects', plural: 'projects', icon: 'project' },
+      { value: 'company', label: 'Companies', plural: 'companies', icon: 'organization' },
+      { value: 'term', label: 'Terms', plural: 'terms', icon: 'symbol-key' }
+    ];
+    
+    for (const type of entityTypes) {
+      items.push({
+        label: `$(${type.icon}) ${type.label}`,
+        kind: vscode.QuickPickItemKind.Separator
+      });
+      
+      // Add 'Create New' option
+      items.push({
+        id: `create-${type.value}`,
+        name: selectedText,
+        type: type.value,
+        source: 'create-new',
+        label: `$(plus) Create new ${type.value}: "${selectedText}"`,
+        description: 'Create and map to new entity'
+      });
+      
+      // Add existing entities (first 5)
+      try {
+        const listResult = await this._client!.callTool(`protokoll_list_${type.plural}`, {
+          limit: 5
+        }) as { success?: boolean; [key: string]: unknown };
+        
+        const entityKey = type.plural;
+        if (listResult.success && listResult[entityKey]) {
+          for (const entity of listResult[entityKey] as Array<{ id: string; name: string }>) {
+            items.push({
+              id: entity.id,
+              name: entity.name,
+              type: type.value,
+              source: 'search',
+              label: entity.name,
+              description: type.value
+            });
+          }
+        }
+      } catch (error) {
+        console.warn(`Could not load ${type.plural} entities:`, error);
+      }
+    }
+    
+    const picker = vscode.window.createQuickPick<EntityPickerItem>();
+    picker.items = items;
+    picker.placeholder = `Correct "${selectedText}" to... (type to search)`;
+    picker.canSelectMany = false;
+    picker.title = 'Entity Correction';
+    picker.matchOnDescription = true;
+    picker.matchOnDetail = true;
+    
+    // Enable dynamic search
+    let searchTimeout: NodeJS.Timeout | undefined;
+    picker.onDidChangeValue(async (value) => {
+      if (searchTimeout) {
+        clearTimeout(searchTimeout);
+      }
+      
+      if (value.length > 2) {
+        searchTimeout = setTimeout(async () => {
+          // Search across all entity types
+          const searchItems: EntityPickerItem[] = [...items.filter(i => i.kind === vscode.QuickPickItemKind.Separator || i.source === 'create-new' || i.source === 'suggestion')];
+          
+          for (const type of entityTypes) {
+            try {
+              const searchResult = await this._client!.callTool(`protokoll_list_${type.plural}`, {
+                search: value,
+                limit: 10
+              }) as { success?: boolean; [key: string]: unknown };
+              
+              const entityKey = type.plural;
+              if (searchResult.success && searchResult[entityKey]) {
+                for (const entity of searchResult[entityKey] as Array<{ id: string; name: string }>) {
+                  // Don't duplicate if already in suggestions
+                  if (!searchItems.some(i => i.id === entity.id)) {
+                    searchItems.push({
+                      id: entity.id,
+                      name: entity.name,
+                      type: type.value,
+                      source: 'search',
+                      label: entity.name,
+                      description: `${type.value} (search result)`
+                    });
+                  }
+                }
+              }
+            } catch (error) {
+              console.warn(`Search failed for ${type.plural}:`, error);
+            }
+          }
+          
+          picker.items = searchItems;
+        }, 300); // Debounce search
+      } else if (value.length === 0) {
+        // Reset to original items
+        picker.items = items;
+      }
+    });
+    
+    return new Promise((resolve) => {
+      picker.onDidAccept(() => {
+        const selected = picker.selectedItems[0];
+        if (selected && selected.id && selected.name && selected.type && selected.source) {
+          resolve({ 
+            id: selected.id, 
+            name: selected.name, 
+            type: selected.type, 
+            source: selected.source 
+          });
+        } else {
+          resolve(undefined);
+        }
+        picker.dispose();
+      });
+      
+      picker.onDidHide(() => {
+        resolve(undefined);
+        picker.dispose();
+      });
+      
+      picker.show();
+    });
+  }
+
+  private async handleCorrectSelection(selectedText: string, transcriptUri: string): Promise<void> {
+    if (!this._client || !selectedText?.trim()) {
       vscode.window.showWarningMessage('No text selected');
       return;
     }
-
+    
     try {
-      // Show quick pick to select entity type
-      const entityTypes = [
-        { label: 'Person', value: 'person', tool: 'protokoll_add_person' },
-        { label: 'Project', value: 'project', tool: 'protokoll_add_project' },
-        { label: 'Company', value: 'company', tool: 'protokoll_add_company' },
-        { label: 'Term', value: 'term', tool: 'protokoll_add_term' },
-      ];
-
-      const selected = await vscode.window.showQuickPick(entityTypes, {
-        placeHolder: `Create ${selectedText} as...`,
-      });
-
-      if (!selected) {
-        return; // User cancelled
-      }
-
-      // Create the entity using the appropriate MCP tool
-      const entityName = selectedText.trim();
-      let entityId: string;
-      let result: { 
-        success?: boolean;
-        message?: string;
-        entity?: { id: string; name: string; type: string; [key: string]: unknown };
-        [key: string]: unknown;
-      };
-
-      let entityCreated = false;
-      let entityNameFromServer = entityName;
-
-      try {
-        switch (selected.value) {
-          case 'person':
-            result = await this._client.callTool('protokoll_add_person', {
-              name: entityName,
-            }) as { 
-              success?: boolean;
-              message?: string;
-              entity?: { id: string; name: string; type: string; [key: string]: unknown };
-              [key: string]: unknown;
-            };
-            entityId = result.entity?.id || this.slugify(entityName);
-            if (result.entity?.name) {
-              entityNameFromServer = String(result.entity.name);
-            }
-            entityCreated = true;
-            break;
-
-          case 'project':
-            result = await this._client.callTool('protokoll_add_project', {
-              name: entityName,
-            }) as { 
-              success?: boolean;
-              message?: string;
-              entity?: { id: string; name: string; type: string; [key: string]: unknown };
-              [key: string]: unknown;
-            };
-            entityId = result.entity?.id || this.slugify(entityName);
-            if (result.entity?.name) {
-              entityNameFromServer = String(result.entity.name);
-            }
-            entityCreated = true;
-            break;
-
-          case 'company':
-            result = await this._client.callTool('protokoll_add_company', {
-              name: entityName,
-            }) as { 
-              success?: boolean;
-              message?: string;
-              entity?: { id: string; name: string; type: string; [key: string]: unknown };
-              [key: string]: unknown;
-            };
-            entityId = result.entity?.id || this.slugify(entityName);
-            if (result.entity?.name) {
-              entityNameFromServer = String(result.entity.name);
-            }
-            entityCreated = true;
-            break;
-
-          case 'term':
-            result = await this._client.callTool('protokoll_add_term', {
-              name: entityName,
-            }) as { 
-              success?: boolean;
-              message?: string;
-              entity?: { id: string; name: string; type: string; [key: string]: unknown };
-              [key: string]: unknown;
-            };
-            entityId = result.entity?.id || this.slugify(entityName);
-            if (result.entity?.name) {
-              entityNameFromServer = String(result.entity.name);
-            }
-            entityCreated = true;
-            break;
-
-          default:
-            vscode.window.showErrorMessage(`Unknown entity type: ${selected.value}`);
-            return;
-        }
-      } catch (createError) {
-        // Check if the error is "already exists"
-        const errorMessage = createError instanceof Error ? createError.message : String(createError);
-        const alreadyExistsMatch = errorMessage.match(/already exists.*?["']([^"']+)["']/i) || 
-                                   errorMessage.match(/ID\s+["']([^"']+)["']\s+already exists/i);
-        
-        if (alreadyExistsMatch) {
-          // Entity already exists - extract ID and continue
-          entityId = alreadyExistsMatch[1];
-          entityCreated = false;
-          
-          // Try to read the entity to get its name
-          try {
-            const entityUri = `protokoll://entity/${selected.value}/${encodeURIComponent(entityId)}`;
-            const entityContent = await this._client.readResource(entityUri);
-            const entityData = this.parseEntityContent(entityContent.text);
-            if (entityData.name) {
-              entityNameFromServer = String(entityData.name);
-            }
-          } catch (readError) {
-            // If we can't read it, use the original name
-            console.warn('Protokoll: Could not read existing entity:', readError);
-          }
-        } else {
-          // Some other error - rethrow it
-          throw createError;
-        }
-      }
-
-      if (!entityId) {
-        vscode.window.showErrorMessage('Failed to create entity: No ID returned');
+      const currentTranscript = this._currentTranscripts.get(transcriptUri);
+      if (!currentTranscript) {
+        vscode.window.showErrorMessage('No transcript loaded');
         return;
       }
-
-      // Get current transcript to add entity reference
-      const currentTranscript = this._currentTranscripts.get(transcriptUri);
-      if (currentTranscript) {
-        const transcriptPath = currentTranscript.transcript.path || currentTranscript.transcript.filename;
-        
-        // Add entity reference using MCP tool
-        try {
-          // Build updated entities object from current transcript metadata
-          const entities = currentTranscript.transcript.entities || { people: [], projects: [], terms: [], companies: [] };
-          const typePlural = selected.value === 'person' ? 'people' : 
-                            selected.value === 'company' ? 'companies' :
-                            selected.value === 'term' ? 'terms' :
-                            selected.value === 'project' ? 'projects' : selected.value;
-          
-          // Add new entity if not already present
-          const entityList = entities[typePlural as keyof typeof entities] || [];
-          const entityExists = entityList.some((e: { id: string }) => e.id === entityId);
-          
-          if (!entityExists) {
-            const newEntity = { id: entityId, name: entityNameFromServer };
-            entities[typePlural as keyof typeof entities] = [...entityList, newEntity];
-            
-            // Update transcript entities using MCP tool
-            await this._client.callTool('protokoll_update_transcript_entity_references', {
-              transcriptPath: this.convertToRelativePath(transcriptPath),
-              entities: entities,
-            });
-          }
-        } catch (updateError) {
-          console.warn('Protokoll: Could not update transcript with entity reference:', updateError);
-          // Continue anyway - we'll still open the entity view
-        }
+      
+      const transcriptPath = currentTranscript.transcript.path || currentTranscript.transcript.filename;
+      const selectedEntity = await this.showEntityPicker(selectedText, transcriptPath);
+      
+      if (!selectedEntity) {
+        return; // User cancelled
       }
-
-      if (entityCreated) {
-        vscode.window.showInformationMessage(`Created ${selected.label.toLowerCase()}: ${entityNameFromServer}`);
+      
+      // Call unified correction tool
+      const correctionArgs: {
+        transcriptPath: string;
+        selectedText: string;
+        entityType: string;
+        entityName?: string;
+        entityId?: string;
+      } = {
+        transcriptPath: this.convertToRelativePath(transcriptPath),
+        selectedText: selectedText.trim(),
+        entityType: selectedEntity.type
+      };
+      
+      if (selectedEntity.source === 'create-new') {
+        correctionArgs.entityName = selectedEntity.name;
       } else {
-        vscode.window.showInformationMessage(`Associated transcript with existing ${selected.label.toLowerCase()}: ${entityNameFromServer}`);
+        correctionArgs.entityId = selectedEntity.id;
       }
-
-      // Navigate to the entity view
-      await this.handleOpenEntity(selected.value, entityId);
-
-      // Refresh the transcript view to show the new entity reference
-      await this.refreshTranscript(transcriptUri);
+      
+      const result = await this._client.callTool('protokoll_correct_to_entity', correctionArgs) as {
+        success?: boolean;
+        message?: string;
+        entity?: { id: string; name: string; type: string };
+        isNewEntity?: boolean;
+      };
+      
+      if (result.success && result.entity) {
+        const action = result.isNewEntity ? 'Created' : 'Mapped to existing';
+        vscode.window.showInformationMessage(
+          `${action} ${selectedEntity.type}: ${result.entity.name}`
+        );
+        
+        // Navigate to entity and refresh transcript
+        await this.handleOpenEntity(selectedEntity.type, result.entity.id);
+        await this.refreshTranscript(transcriptUri);
+      }
     } catch (error) {
-      console.error('Protokoll: [TRANSCRIPT VIEW] Error creating entity:', error);
+      console.error('Protokoll: [TRANSCRIPT VIEW] Error correcting selection:', error);
       vscode.window.showErrorMessage(
-        `Failed to create entity: ${error instanceof Error ? error.message : String(error)}`
+        `Correction failed: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+  }
+
+  private async handleCreateEntityFromSelection(selectedText: string, transcriptUri: string): Promise<void> {
+    // Delegate to unified correction handler
+    return this.handleCorrectSelection(selectedText, transcriptUri);
   }
 
   private slugify(text: string): string {
@@ -2192,6 +2392,45 @@ export class TranscriptDetailViewProvider {
             margin-top: 8px;
             font-style: italic;
         }
+        .related-transcripts h2 {
+            color: var(--vscode-textLink-foreground);
+            margin-top: 0;
+            margin-bottom: 12px;
+        }
+        .related-transcripts-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        .related-transcript-item {
+            padding: 12px;
+            margin-bottom: 8px;
+            background-color: var(--vscode-editor-inactiveSelectionBackground);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .related-transcript-item:hover {
+            background-color: var(--vscode-list-hoverBackground);
+        }
+        .related-transcript-title {
+            font-weight: 600;
+            color: var(--vscode-textLink-foreground);
+            margin-bottom: 4px;
+        }
+        .related-transcript-meta {
+            font-size: 0.9em;
+            color: var(--vscode-descriptionForeground);
+        }
+        .loading {
+            color: var(--vscode-descriptionForeground);
+            font-style: italic;
+        }
+        .empty-state {
+            color: var(--vscode-descriptionForeground);
+            font-style: italic;
+        }
     </style>
 </head>
 <body>
@@ -2237,6 +2476,12 @@ export class TranscriptDetailViewProvider {
         ${this.markdownToHtml(remainingContent)}
     </div>
     ` : ''}
+    <div class="related-transcripts" id="related-transcripts" style="margin-top: 24px;">
+        <h2>Related Transcripts</h2>
+        <div id="related-transcripts-content">
+            <div class="loading">Loading related transcripts...</div>
+        </div>
+    </div>
     <div class="inline-chat-container" id="inline-chat-container">
         <div class="inline-chat-input-wrapper">
             <textarea 
@@ -2348,9 +2593,76 @@ export class TranscriptDetailViewProvider {
             }
         }
         
+        // Load related transcripts
+        function loadRelatedTranscripts() {
+            console.log('Protokoll Entity: Loading related transcripts for', entityType, entityId);
+            vscode.postMessage({
+                command: 'loadRelatedTranscripts',
+                entityType: entityType,
+                entityId: entityId
+            });
+        }
+        
+        // Handle messages from extension (e.g., related transcripts data)
+        window.addEventListener('message', event => {
+            const message = event.data;
+            switch (message.command) {
+                case 'relatedTranscripts':
+                    console.log('Protokoll Entity: Received related transcripts', message.transcripts);
+                    renderRelatedTranscripts(message.transcripts);
+                    break;
+            }
+        });
+        
+        function renderRelatedTranscripts(transcripts) {
+            const container = document.getElementById('related-transcripts-content');
+            if (!container) return;
+            
+            if (!transcripts || transcripts.length === 0) {
+                container.innerHTML = '<div class="empty-state">No transcripts reference this entity</div>';
+                return;
+            }
+            
+            const listHtml = '<ul class="related-transcripts-list">' +
+                transcripts.map(t => {
+                    const date = t.date ? new Date(t.date).toLocaleDateString() : '';
+                    const project = t.project ? \` • \${t.project}\` : '';
+                    return \`
+                        <li class="related-transcript-item" data-path="\${t.path}">
+                            <div class="related-transcript-title">\${escapeHtml(t.title)}</div>
+                            <div class="related-transcript-meta">\${date}\${project}</div>
+                        </li>
+                    \`;
+                }).join('') +
+                '</ul>';
+            
+            container.innerHTML = listHtml;
+            
+            // Add click handlers
+            const items = container.querySelectorAll('.related-transcript-item');
+            items.forEach(item => {
+                item.addEventListener('click', () => {
+                    const path = item.getAttribute('data-path');
+                    if (path) {
+                        vscode.postMessage({
+                            command: 'openTranscript',
+                            path: path
+                        });
+                    }
+                });
+            });
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
         // Run setup immediately (script is at end of body, DOM should be ready)
         setupInlineChatListeners();
         setupRefreshButton();
+        loadRelatedTranscripts();
         
         // Also run on DOMContentLoaded as backup
         if (document.readyState === 'loading') {
@@ -2792,6 +3104,58 @@ export class TranscriptDetailViewProvider {
         }
         .tab-content.active {
             display: block;
+        }
+        .enhancement-timeline {
+            margin-top: 16px;
+        }
+        .enhancement-phase {
+            margin-bottom: 24px;
+        }
+        .enhancement-phase-header {
+            font-weight: 600;
+            font-size: 1.1em;
+            color: var(--vscode-textLink-foreground);
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        .enhancement-step {
+            margin-bottom: 12px;
+            padding: 12px;
+            background-color: var(--vscode-editor-inactiveSelectionBackground);
+            border-left: 3px solid var(--vscode-textLink-foreground);
+            border-radius: 4px;
+        }
+        .enhancement-step-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+            user-select: none;
+        }
+        .enhancement-step-action {
+            font-weight: 600;
+            color: var(--vscode-foreground);
+        }
+        .enhancement-step-timestamp {
+            font-size: 0.85em;
+            color: var(--vscode-descriptionForeground);
+        }
+        .enhancement-step-details {
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid var(--vscode-panel-border);
+            display: none;
+        }
+        .enhancement-step-details.expanded {
+            display: block;
+        }
+        .enhancement-step-details pre {
+            background-color: var(--vscode-textCodeBlock-background);
+            padding: 8px;
+            border-radius: 3px;
+            font-size: 0.85em;
+            overflow-x: auto;
         }
         .edit-button {
             background-color: var(--vscode-button-background);
@@ -3300,6 +3664,7 @@ export class TranscriptDetailViewProvider {
         <div class="content-tabs">
             <button class="content-tab active" id="enhanced-tab" onclick="switchTab('enhanced')">Enhanced</button>
             <button class="content-tab ${content.rawTranscript ? '' : 'disabled'}" id="raw-tab" onclick="switchTab('raw')" ${content.rawTranscript ? '' : 'disabled'}>Original</button>
+            <button class="content-tab" id="enhancement-tab" onclick="switchTab('enhancement')">Enhancement</button>
         </div>
         <div class="tab-content active" id="enhanced-content">
             <div style="display: flex; gap: 8px; margin-bottom: 16px;">
@@ -3309,7 +3674,7 @@ export class TranscriptDetailViewProvider {
             <div class="transcript-content" id="transcript-content-display">
                 ${this.markdownToHtml(transcriptText)}
             </div>
-            <button class="create-entity-button" id="create-entity-btn" onclick="createEntityFromSelection()">Create Entity</button>
+            <button class="create-entity-button" id="create-entity-btn" onclick="createEntityFromSelection()" title="Correct this text by creating new entity or mapping to existing">Correct Text</button>
         </div>
         ${content.rawTranscript ? `
         <div class="tab-content" id="raw-content">
@@ -3325,6 +3690,11 @@ export class TranscriptDetailViewProvider {
             ` : ''}
         </div>
         ` : ''}
+        <div class="tab-content" id="enhancement-content">
+            <div id="enhancement-log-container">
+                <div class="loading">Loading enhancement log...</div>
+            </div>
+        </div>
     </div>
     ${this.renderEntityReferences(entityReferences)}
     <script>
@@ -3349,6 +3719,8 @@ export class TranscriptDetailViewProvider {
             }
         }
 
+        let enhancementLogLoaded = false;
+        
         function switchTab(tabName) {
             // Update tab buttons
             document.querySelectorAll('.content-tab').forEach(tab => {
@@ -3367,8 +3739,111 @@ export class TranscriptDetailViewProvider {
             if (activeContent) {
                 activeContent.classList.add('active');
             }
+            
+            // Lazy load enhancement log when tab is first opened
+            if (tabName === 'enhancement' && !enhancementLogLoaded) {
+                loadEnhancementLog();
+                enhancementLogLoaded = true;
+            }
         }
 
+        function loadEnhancementLog() {
+            console.log('Loading enhancement log for transcript:', transcriptPath);
+            vscode.postMessage({
+                command: 'loadEnhancementLog',
+                transcriptPath: transcriptPath
+            });
+        }
+        
+        function renderEnhancementLog(data) {
+            const container = document.getElementById('enhancement-log-container');
+            if (!container) return;
+            
+            if (!data.entries || data.entries.length === 0) {
+                container.innerHTML = '<div class="empty-state">No enhancement data available for this transcript</div>';
+                return;
+            }
+            
+            // Group entries by phase
+            const byPhase = {
+                transcribe: [],
+                enhance: [],
+                'simple-replace': []
+            };
+            
+            data.entries.forEach(entry => {
+                if (byPhase[entry.phase]) {
+                    byPhase[entry.phase].push(entry);
+                }
+            });
+            
+            let html = '<div class="enhancement-timeline">';
+            
+            // Render each phase
+            const phaseLabels = {
+                transcribe: 'Transcription',
+                enhance: 'Enhancement',
+                'simple-replace': 'Corrections'
+            };
+            
+            for (const [phase, entries] of Object.entries(byPhase)) {
+                if (entries.length === 0) continue;
+                
+                html += \`
+                    <div class="enhancement-phase">
+                        <div class="enhancement-phase-header">\${phaseLabels[phase] || phase}</div>
+                \`;
+                
+                entries.forEach(entry => {
+                    const timestamp = new Date(entry.timestamp).toLocaleTimeString();
+                    const detailsJson = entry.details ? JSON.stringify(entry.details, null, 2) : null;
+                    
+                    html += \`
+                        <div class="enhancement-step">
+                            <div class="enhancement-step-header" onclick="toggleStepDetails(\${entry.id})">
+                                <span class="enhancement-step-action">\${escapeHtml(entry.action)}</span>
+                                <span class="enhancement-step-timestamp">\${timestamp}</span>
+                            </div>
+                            \${detailsJson ? \`
+                            <div class="enhancement-step-details" id="step-details-\${entry.id}">
+                                <pre>\${escapeHtml(detailsJson)}</pre>
+                            </div>
+                            \` : ''}
+                        </div>
+                    \`;
+                });
+                
+                html += '</div>';
+            }
+            
+            html += '</div>';
+            container.innerHTML = html;
+        }
+        
+        function toggleStepDetails(stepId) {
+            const details = document.getElementById('step-details-' + stepId);
+            if (details) {
+                details.classList.toggle('expanded');
+            }
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        // Handle messages from extension
+        window.addEventListener('message', event => {
+            const message = event.data;
+            switch (message.command) {
+                case 'enhancementLog':
+                    console.log('Received enhancement log data', message.data);
+                    renderEnhancementLog(message.data);
+                    break;
+            }
+        });
+        
         function changeProject() {
             vscode.postMessage({
                 command: 'changeProject',

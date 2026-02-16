@@ -2,7 +2,7 @@
   "name": "protokoll-vscode",
   "displayName": "Protokoll",
   "description": "VS Code extension for viewing Protokoll transcripts and entities via HTTP MCP server",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/redaksjon/protokoll-vscode.git"
@@ -149,6 +149,74 @@
         "title": "Create Note",
         "icon": "$(file-add)",
         "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.refreshPeople",
+        "title": "Refresh People",
+        "icon": "$(refresh)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.people.search",
+        "title": "Search People",
+        "icon": "$(search)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.people.loadMore",
+        "title": "Load More People",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.refreshTerms",
+        "title": "Refresh Terms",
+        "icon": "$(refresh)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.terms.search",
+        "title": "Search Terms",
+        "icon": "$(search)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.terms.loadMore",
+        "title": "Load More Terms",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.refreshProjects",
+        "title": "Refresh Projects",
+        "icon": "$(refresh)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.projects.search",
+        "title": "Search Projects",
+        "icon": "$(search)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.projects.loadMore",
+        "title": "Load More Projects",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.refreshCompanies",
+        "title": "Refresh Companies",
+        "icon": "$(refresh)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.companies.search",
+        "title": "Search Companies",
+        "icon": "$(search)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.companies.loadMore",
+        "title": "Load More Companies",
+        "category": "Protokoll"
       }
     ],
     "views": {
@@ -156,6 +224,22 @@
         {
           "id": "protokollTranscripts",
           "name": "Transcripts"
+        },
+        {
+          "id": "protokollPeople",
+          "name": "People"
+        },
+        {
+          "id": "protokollTerms",
+          "name": "Terms"
+        },
+        {
+          "id": "protokollProjects",
+          "name": "Projects"
+        },
+        {
+          "id": "protokollCompanies",
+          "name": "Companies"
         },
         {
           "id": "protokollChats",
@@ -192,6 +276,46 @@
         {
           "command": "protokoll.startNewSession",
           "when": "view == protokollTranscripts",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.refreshPeople",
+          "when": "view == protokollPeople",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.people.search",
+          "when": "view == protokollPeople",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.refreshTerms",
+          "when": "view == protokollTerms",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.terms.search",
+          "when": "view == protokollTerms",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.refreshProjects",
+          "when": "view == protokollProjects",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.projects.search",
+          "when": "view == protokollProjects",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.refreshCompanies",
+          "when": "view == protokollCompanies",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.companies.search",
+          "when": "view == protokollCompanies",
           "group": "navigation"
         },
         {
