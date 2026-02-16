@@ -421,6 +421,9 @@ export class TranscriptDetailViewProvider {
           case 'createEntityFromSelection':
             await this.handleCreateEntityFromSelection(message.selectedText, message.transcriptUri || transcriptUri);
             break;
+          case 'loadEnhancementLog':
+            await this.handleLoadEnhancementLog(panel, message.transcriptPath);
+            break;
           case 'refreshTranscript': {
             await this.refreshTranscript(transcriptUri);
             const refreshPanel = this._panels.get(transcriptUri);
@@ -1150,7 +1153,7 @@ export class TranscriptDetailViewProvider {
     }
   }
 
-  private async handleOpenEntity(entityType: string, entityId: string): Promise<void> {
+  public async handleOpenEntity(entityType: string, entityId: string): Promise<void> {
     if (!this._client) {
       vscode.window.showErrorMessage('MCP client not initialized');
       return;
@@ -1199,6 +1202,12 @@ export class TranscriptDetailViewProvider {
             case 'refreshEntity':
               await this.refreshEntity(entityUri);
               break;
+            case 'loadRelatedTranscripts':
+              await this.handleLoadRelatedTranscripts(panel, message.entityType, message.entityId);
+              break;
+            case 'openTranscript':
+              await this.handleOpenTranscriptFromEntity(message.path);
+              break;
           }
         },
         null
@@ -1230,6 +1239,129 @@ export class TranscriptDetailViewProvider {
     } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to open entity: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * Load enhancement log for a transcript and send to webview
+   */
+  private async handleLoadEnhancementLog(
+    panel: vscode.WebviewPanel,
+    transcriptPath: string
+  ): Promise<void> {
+    if (!this._client) {
+      return;
+    }
+
+    try {
+      // Call protokoll_get_enhancement_log
+      const response = await this._client.callTool('protokoll_get_enhancement_log', {
+        transcriptPath,
+        limit: 100,
+      }) as {
+        entries?: Array<{
+          id: number;
+          timestamp: string;
+          phase: string;
+          action: string;
+          details?: Record<string, unknown>;
+          entities?: Array<{ id: string; name: string; type: string }>;
+        }>;
+        total?: number;
+      };
+
+      // Send enhancement log to webview
+      panel.webview.postMessage({
+        command: 'enhancementLog',
+        data: response,
+      });
+    } catch (error) {
+      console.error('Protokoll: Failed to load enhancement log', error);
+      // Send empty data on error
+      panel.webview.postMessage({
+        command: 'enhancementLog',
+        data: { entries: [], total: 0 },
+      });
+    }
+  }
+
+  /**
+   * Load related transcripts for an entity and send to webview
+   */
+  private async handleLoadRelatedTranscripts(
+    panel: vscode.WebviewPanel,
+    entityType: string,
+    entityId: string
+  ): Promise<void> {
+    if (!this._client) {
+      return;
+    }
+
+    try {
+      // Call protokoll_list_transcripts with entity filter
+      const response = await this._client.callTool('protokoll_list_transcripts', {
+        entityId,
+        entityType,
+        limit: 100, // Load up to 100 related transcripts
+      }) as {
+        transcripts?: Array<{
+          path: string;
+          title: string;
+          date: string | null;
+          project: string | null;
+        }>;
+      };
+
+      // Send transcripts to webview
+      panel.webview.postMessage({
+        command: 'relatedTranscripts',
+        transcripts: response.transcripts || [],
+      });
+    } catch (error) {
+      console.error('Protokoll Entity: Failed to load related transcripts', error);
+      // Send empty array on error
+      panel.webview.postMessage({
+        command: 'relatedTranscripts',
+        transcripts: [],
+      });
+    }
+  }
+
+  /**
+   * Open a transcript from entity view
+   */
+  private async handleOpenTranscriptFromEntity(transcriptPath: string): Promise<void> {
+    if (!this._client) {
+      return;
+    }
+
+    try {
+      // Read the transcript
+      const transcriptContent = await this._client.callTool('protokoll_read_transcript', {
+        transcriptPath,
+      }) as TranscriptContent;
+
+      // Build URI
+      const uri = `protokoll://transcript/${transcriptPath.replace(/\.pkl$/, '')}`;
+
+      // Construct a Transcript object from TranscriptContent
+      const transcript: Transcript = {
+        uri,
+        path: transcriptContent.path,
+        filename: transcriptPath.split('/').pop() || transcriptPath,
+        date: transcriptContent.metadata.date || new Date().toISOString(),
+        time: transcriptContent.metadata.time,
+        title: transcriptContent.title,
+        status: transcriptContent.metadata.status,
+        entities: transcriptContent.metadata.entities,
+      };
+
+      // Show transcript in detail view
+      await this.showTranscript(uri, transcript, vscode.ViewColumn.One, false);
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to open transcript: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
@@ -2192,6 +2324,45 @@ export class TranscriptDetailViewProvider {
             margin-top: 8px;
             font-style: italic;
         }
+        .related-transcripts h2 {
+            color: var(--vscode-textLink-foreground);
+            margin-top: 0;
+            margin-bottom: 12px;
+        }
+        .related-transcripts-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        .related-transcript-item {
+            padding: 12px;
+            margin-bottom: 8px;
+            background-color: var(--vscode-editor-inactiveSelectionBackground);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .related-transcript-item:hover {
+            background-color: var(--vscode-list-hoverBackground);
+        }
+        .related-transcript-title {
+            font-weight: 600;
+            color: var(--vscode-textLink-foreground);
+            margin-bottom: 4px;
+        }
+        .related-transcript-meta {
+            font-size: 0.9em;
+            color: var(--vscode-descriptionForeground);
+        }
+        .loading {
+            color: var(--vscode-descriptionForeground);
+            font-style: italic;
+        }
+        .empty-state {
+            color: var(--vscode-descriptionForeground);
+            font-style: italic;
+        }
     </style>
 </head>
 <body>
@@ -2237,6 +2408,12 @@ export class TranscriptDetailViewProvider {
         ${this.markdownToHtml(remainingContent)}
     </div>
     ` : ''}
+    <div class="related-transcripts" id="related-transcripts" style="margin-top: 24px;">
+        <h2>Related Transcripts</h2>
+        <div id="related-transcripts-content">
+            <div class="loading">Loading related transcripts...</div>
+        </div>
+    </div>
     <div class="inline-chat-container" id="inline-chat-container">
         <div class="inline-chat-input-wrapper">
             <textarea 
@@ -2348,9 +2525,76 @@ export class TranscriptDetailViewProvider {
             }
         }
         
+        // Load related transcripts
+        function loadRelatedTranscripts() {
+            console.log('Protokoll Entity: Loading related transcripts for', entityType, entityId);
+            vscode.postMessage({
+                command: 'loadRelatedTranscripts',
+                entityType: entityType,
+                entityId: entityId
+            });
+        }
+        
+        // Handle messages from extension (e.g., related transcripts data)
+        window.addEventListener('message', event => {
+            const message = event.data;
+            switch (message.command) {
+                case 'relatedTranscripts':
+                    console.log('Protokoll Entity: Received related transcripts', message.transcripts);
+                    renderRelatedTranscripts(message.transcripts);
+                    break;
+            }
+        });
+        
+        function renderRelatedTranscripts(transcripts) {
+            const container = document.getElementById('related-transcripts-content');
+            if (!container) return;
+            
+            if (!transcripts || transcripts.length === 0) {
+                container.innerHTML = '<div class="empty-state">No transcripts reference this entity</div>';
+                return;
+            }
+            
+            const listHtml = '<ul class="related-transcripts-list">' +
+                transcripts.map(t => {
+                    const date = t.date ? new Date(t.date).toLocaleDateString() : '';
+                    const project = t.project ? \` • \${t.project}\` : '';
+                    return \`
+                        <li class="related-transcript-item" data-path="\${t.path}">
+                            <div class="related-transcript-title">\${escapeHtml(t.title)}</div>
+                            <div class="related-transcript-meta">\${date}\${project}</div>
+                        </li>
+                    \`;
+                }).join('') +
+                '</ul>';
+            
+            container.innerHTML = listHtml;
+            
+            // Add click handlers
+            const items = container.querySelectorAll('.related-transcript-item');
+            items.forEach(item => {
+                item.addEventListener('click', () => {
+                    const path = item.getAttribute('data-path');
+                    if (path) {
+                        vscode.postMessage({
+                            command: 'openTranscript',
+                            path: path
+                        });
+                    }
+                });
+            });
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
         // Run setup immediately (script is at end of body, DOM should be ready)
         setupInlineChatListeners();
         setupRefreshButton();
+        loadRelatedTranscripts();
         
         // Also run on DOMContentLoaded as backup
         if (document.readyState === 'loading') {
@@ -2792,6 +3036,58 @@ export class TranscriptDetailViewProvider {
         }
         .tab-content.active {
             display: block;
+        }
+        .enhancement-timeline {
+            margin-top: 16px;
+        }
+        .enhancement-phase {
+            margin-bottom: 24px;
+        }
+        .enhancement-phase-header {
+            font-weight: 600;
+            font-size: 1.1em;
+            color: var(--vscode-textLink-foreground);
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        .enhancement-step {
+            margin-bottom: 12px;
+            padding: 12px;
+            background-color: var(--vscode-editor-inactiveSelectionBackground);
+            border-left: 3px solid var(--vscode-textLink-foreground);
+            border-radius: 4px;
+        }
+        .enhancement-step-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+            user-select: none;
+        }
+        .enhancement-step-action {
+            font-weight: 600;
+            color: var(--vscode-foreground);
+        }
+        .enhancement-step-timestamp {
+            font-size: 0.85em;
+            color: var(--vscode-descriptionForeground);
+        }
+        .enhancement-step-details {
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid var(--vscode-panel-border);
+            display: none;
+        }
+        .enhancement-step-details.expanded {
+            display: block;
+        }
+        .enhancement-step-details pre {
+            background-color: var(--vscode-textCodeBlock-background);
+            padding: 8px;
+            border-radius: 3px;
+            font-size: 0.85em;
+            overflow-x: auto;
         }
         .edit-button {
             background-color: var(--vscode-button-background);
@@ -3300,6 +3596,7 @@ export class TranscriptDetailViewProvider {
         <div class="content-tabs">
             <button class="content-tab active" id="enhanced-tab" onclick="switchTab('enhanced')">Enhanced</button>
             <button class="content-tab ${content.rawTranscript ? '' : 'disabled'}" id="raw-tab" onclick="switchTab('raw')" ${content.rawTranscript ? '' : 'disabled'}>Original</button>
+            <button class="content-tab" id="enhancement-tab" onclick="switchTab('enhancement')">Enhancement</button>
         </div>
         <div class="tab-content active" id="enhanced-content">
             <div style="display: flex; gap: 8px; margin-bottom: 16px;">
@@ -3325,6 +3622,11 @@ export class TranscriptDetailViewProvider {
             ` : ''}
         </div>
         ` : ''}
+        <div class="tab-content" id="enhancement-content">
+            <div id="enhancement-log-container">
+                <div class="loading">Loading enhancement log...</div>
+            </div>
+        </div>
     </div>
     ${this.renderEntityReferences(entityReferences)}
     <script>
@@ -3349,6 +3651,8 @@ export class TranscriptDetailViewProvider {
             }
         }
 
+        let enhancementLogLoaded = false;
+        
         function switchTab(tabName) {
             // Update tab buttons
             document.querySelectorAll('.content-tab').forEach(tab => {
@@ -3367,8 +3671,111 @@ export class TranscriptDetailViewProvider {
             if (activeContent) {
                 activeContent.classList.add('active');
             }
+            
+            // Lazy load enhancement log when tab is first opened
+            if (tabName === 'enhancement' && !enhancementLogLoaded) {
+                loadEnhancementLog();
+                enhancementLogLoaded = true;
+            }
         }
 
+        function loadEnhancementLog() {
+            console.log('Loading enhancement log for transcript:', transcriptPath);
+            vscode.postMessage({
+                command: 'loadEnhancementLog',
+                transcriptPath: transcriptPath
+            });
+        }
+        
+        function renderEnhancementLog(data) {
+            const container = document.getElementById('enhancement-log-container');
+            if (!container) return;
+            
+            if (!data.entries || data.entries.length === 0) {
+                container.innerHTML = '<div class="empty-state">No enhancement data available for this transcript</div>';
+                return;
+            }
+            
+            // Group entries by phase
+            const byPhase = {
+                transcribe: [],
+                enhance: [],
+                'simple-replace': []
+            };
+            
+            data.entries.forEach(entry => {
+                if (byPhase[entry.phase]) {
+                    byPhase[entry.phase].push(entry);
+                }
+            });
+            
+            let html = '<div class="enhancement-timeline">';
+            
+            // Render each phase
+            const phaseLabels = {
+                transcribe: 'Transcription',
+                enhance: 'Enhancement',
+                'simple-replace': 'Corrections'
+            };
+            
+            for (const [phase, entries] of Object.entries(byPhase)) {
+                if (entries.length === 0) continue;
+                
+                html += \`
+                    <div class="enhancement-phase">
+                        <div class="enhancement-phase-header">\${phaseLabels[phase] || phase}</div>
+                \`;
+                
+                entries.forEach(entry => {
+                    const timestamp = new Date(entry.timestamp).toLocaleTimeString();
+                    const detailsJson = entry.details ? JSON.stringify(entry.details, null, 2) : null;
+                    
+                    html += \`
+                        <div class="enhancement-step">
+                            <div class="enhancement-step-header" onclick="toggleStepDetails(\${entry.id})">
+                                <span class="enhancement-step-action">\${escapeHtml(entry.action)}</span>
+                                <span class="enhancement-step-timestamp">\${timestamp}</span>
+                            </div>
+                            \${detailsJson ? \`
+                            <div class="enhancement-step-details" id="step-details-\${entry.id}">
+                                <pre>\${escapeHtml(detailsJson)}</pre>
+                            </div>
+                            \` : ''}
+                        </div>
+                    \`;
+                });
+                
+                html += '</div>';
+            }
+            
+            html += '</div>';
+            container.innerHTML = html;
+        }
+        
+        function toggleStepDetails(stepId) {
+            const details = document.getElementById('step-details-' + stepId);
+            if (details) {
+                details.classList.toggle('expanded');
+            }
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        // Handle messages from extension
+        window.addEventListener('message', event => {
+            const message = event.data;
+            switch (message.command) {
+                case 'enhancementLog':
+                    console.log('Received enhancement log data', message.data);
+                    renderEnhancementLog(message.data);
+                    break;
+            }
+        });
+        
         function changeProject() {
             vscode.postMessage({
                 command: 'changeProject',
