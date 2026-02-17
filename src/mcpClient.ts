@@ -98,11 +98,32 @@ export class McpClient {
   /**
    * Send a JSON-RPC request with automatic session recovery
    */
+  /**
+   * Extract JSON-RPC response from SSE-formatted response body.
+   * The server may respond to POST requests with text/event-stream format,
+   * where JSON-RPC messages are wrapped in SSE "event: message" / "data: ..." lines.
+   */
+  private parseSSEResponse(sseText: string): JsonRpcResponse {
+    const dataLines: string[] = [];
+    for (const line of sseText.split('\n')) {
+      if (line.startsWith('data:')) {
+        dataLines.push(line.substring(5).trim());
+      }
+      // Skip event:, id:, comment (:), and blank lines
+    }
+    if (dataLines.length === 0) {
+      throw new Error(`No data lines found in SSE response: ${sseText.substring(0, 200)}`);
+    }
+    const jsonStr = dataLines.join('');
+    return JSON.parse(jsonStr);
+  }
+
   private async sendRequest(request: JsonRpcRequest, retryOnSessionError: boolean = true): Promise<JsonRpcResponse> {
     return new Promise((resolve, reject) => {
       const url = new URL(`${this.serverUrl}/mcp`);
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
       };
       if (this.sessionId) {
         headers['Mcp-Session-Id'] = this.sessionId;
@@ -173,13 +194,20 @@ export class McpClient {
           return;
         }
 
+        // Determine response format from Content-Type header
+        const contentType = res.headers['content-type'] || '';
+        const isSSE = contentType.includes('text/event-stream');
+
         let data = '';
         res.on('data', (chunk) => {
           data += chunk.toString();
         });
         res.on('end', async () => {
           try {
-            const responseData: JsonRpcResponse = JSON.parse(data);
+            // Parse response based on Content-Type
+            const responseData: JsonRpcResponse = isSSE
+              ? this.parseSSEResponse(data)
+              : JSON.parse(data);
             
             // Check for session errors in JSON-RPC response
             if (retryOnSessionError && !this.recoveringSession && this.isSessionError(null, responseData)) {
@@ -320,22 +348,18 @@ export class McpClient {
   }
 
   /**
-   * List transcripts from a directory
-   * If directory is not provided, uses the server's configured outputDirectory
+   * List transcripts from the server's configured output directory.
+   * The server knows its own output directory from protokoll.yaml -- the client
+   * never sends a directory parameter.
    */
-  async listTranscripts(directory?: string, options?: {
+  async listTranscripts(options?: {
     startDate?: string;
     endDate?: string;
     limit?: number;
     offset?: number;
     projectId?: string;
   }): Promise<TranscriptsListResponse> {
-    // Build the transcripts list URI
     const params = new URLSearchParams();
-    // Only include directory if provided (server will use configured outputDirectory as fallback)
-    if (directory) {
-      params.set('directory', directory);
-    }
     if (options?.startDate) {
       params.set('startDate', options.startDate);
     }
@@ -520,6 +544,7 @@ export class McpClient {
           'Cache-Control': 'no-cache', // eslint-disable-line @typescript-eslint/naming-convention
           'Mcp-Session-Id': this.sessionId,
         },
+        timeout: 0, // Disable timeout for SSE connections
       };
 
       const req = httpModule.request(options, (res) => {
@@ -653,6 +678,12 @@ export class McpClient {
   private handleSSEEvent(eventType: string, data: string): void {
     console.log('Protokoll: [SSE] 📨 Received SSE event');
     console.log(`Protokoll: [SSE] Event type: ${eventType}`);
+    
+    // Skip comment events (they don't have JSON data)
+    if (eventType === 'comment') {
+      console.log(`Protokoll: [SSE] 💬 Comment: ${data}`);
+      return;
+    }
     
     try {
       // Parse JSON-RPC notification format

@@ -247,20 +247,9 @@ export async function activate(context: vscode.ExtensionContext) {
         mcpClient.onSessionRecovered(async () => {
           console.log('Protokoll: [EXTENSION] Session recovered, re-subscribing to transcripts list...');
           try {
-            const config = vscode.workspace.getConfiguration('protokoll');
-            const transcriptsDir = config.get<string>('transcriptsDirectory', '');
             if (mcpClient) {
-              let transcriptsListUri: string;
-              if (transcriptsDir) {
-                const params = new URLSearchParams();
-                params.set('directory', transcriptsDir);
-                transcriptsListUri = `protokoll://transcripts?${params.toString()}`;
-              } else {
-                // No directory configured - use server's default outputDirectory
-                transcriptsListUri = 'protokoll://transcripts';
-              }
-              await mcpClient.subscribeToResource(transcriptsListUri);
-              console.log(`Protokoll: [EXTENSION] ✅ Re-subscribed to transcripts list after recovery`);
+              await mcpClient.subscribeToResource('protokoll://transcripts');
+              console.log('Protokoll: [EXTENSION] ✅ Re-subscribed to transcripts list after recovery');
             }
           } catch (error) {
             console.warn('Protokoll: [EXTENSION] ⚠️ Failed to re-subscribe after recovery:', error);
@@ -1635,25 +1624,8 @@ export async function activate(context: vscode.ExtensionContext) {
     // Subscribe to transcripts list changes
     try {
       console.log('Protokoll: [EXTENSION] Setting up subscription to transcripts list...');
-      // Get the transcripts list URI
-      // If directory is not configured, subscribe without it (server will use configured outputDirectory)
-      const config = vscode.workspace.getConfiguration('protokoll');
-      const transcriptsDir = config.get<string>('transcriptsDirectory', '');
-      console.log(`Protokoll: [EXTENSION] Transcripts directory from config: ${transcriptsDir || '(empty - will use server default)'}`);
-      
-      let transcriptsListUri: string;
-      if (transcriptsDir) {
-        const params = new URLSearchParams();
-        params.set('directory', transcriptsDir);
-        transcriptsListUri = `protokoll://transcripts?${params.toString()}`;
-      } else {
-        // No directory configured - use server's default outputDirectory
-        transcriptsListUri = 'protokoll://transcripts';
-      }
-      
-      console.log(`Protokoll: [EXTENSION] Subscribing to transcripts list URI: ${transcriptsListUri}`);
-      await mcpClient.subscribeToResource(transcriptsListUri);
-      console.log(`Protokoll: [EXTENSION] ✅ Successfully subscribed to transcripts list: ${transcriptsListUri}`);
+      await mcpClient.subscribeToResource('protokoll://transcripts');
+      console.log('Protokoll: [EXTENSION] ✅ Successfully subscribed to transcripts list');
     } catch (error) {
       console.error('Protokoll: [EXTENSION] ❌ Failed to subscribe to transcripts list:', error);
     }
