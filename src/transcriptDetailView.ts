@@ -215,12 +215,8 @@ export class TranscriptDetailViewProvider {
         console.log(`Protokoll: [TRANSCRIPT VIEW] Transcript might have been renamed, searching for new URI...`);
         try {
           // Try to find the transcript by matching date/time or other metadata
-          const config = vscode.workspace.getConfiguration('protokoll');
-          const transcriptsDir = config.get<string>('transcriptsDirectory', '');
-          if (transcriptsDir && this._client) {
-            // Pass directory only if set (empty string means use server default)
-            const directory = transcriptsDir || undefined;
-            const transcriptsList = await this._client.listTranscripts(directory, { limit: 100 });
+          if (this._client) {
+            const transcriptsList = await this._client.listTranscripts({ limit: 100 });
             
             // Try to find a matching transcript by date/time
             const matchingTranscript = transcriptsList.transcripts.find(t => {

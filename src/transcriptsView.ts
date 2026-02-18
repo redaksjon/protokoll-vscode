@@ -20,7 +20,6 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
   private client: McpClient | null = null;
   private transcripts: Transcript[] = [];
-  private directory: string = '';
   private selectedProjectFilter: string | null = null; // Project ID to filter by
   private selectedStatusFilters: Set<string> = new Set(['initial', 'enhanced', 'reviewed', 'in_progress', 'closed']); // Statuses to show (archived excluded by default)
   private sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc' = 'date-desc'; // Default: date descending
@@ -88,6 +87,9 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     log('TranscriptsViewProvider.setClient called', { hasClient: !!client });
     const hadClient = !!this.client;
     this.client = client;
+    
+    // Reset auto-load guard when client changes (reconnection should allow fresh load)
+    this._hasAttemptedLoad = false;
     
     // If we just got a client and the tree view is visible, fire a change event
     // to trigger getChildren which will auto-load data
@@ -166,11 +168,9 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     return this.sortOrder;
   }
 
-  async refresh(directory?: string): Promise<void> {
+  async refresh(): Promise<void> {
     log('TranscriptsViewProvider.refresh called', { 
       hasClient: !!this.client, 
-      directory, 
-      currentDirectory: this.directory,
       currentTranscriptsCount: this.transcripts.length 
     });
     
@@ -180,63 +180,11 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     }
 
     try {
-      if (directory) {
-        this.directory = directory;
-      }
-
-      if (!this.directory) {
-        // Try to discover transcripts from server resources first
-        try {
-          const resources = await this.client.listResources();
-          const transcriptsResource = resources.resources.find(
-            (r) => r.uri.startsWith('protokoll://transcripts') || r.name.toLowerCase().includes('transcript')
-          );
-
-          if (transcriptsResource) {
-            // Parse directory from protokoll:// URI
-            const uri = transcriptsResource.uri;
-            if (uri.includes('?')) {
-              const queryPart = uri.split('?')[1];
-              const params = new URLSearchParams(queryPart);
-              const dir = params.get('directory');
-              if (dir) {
-                this.directory = dir;
-              }
-            }
-          }
-        } catch {
-          // If resource discovery fails, continue to config/user input
-        }
-
-        // If still no directory, try config or ask user
-        if (!this.directory) {
-          const config = vscode.workspace.getConfiguration('protokoll');
-          const defaultDir = config.get<string>('transcriptsDirectory', '');
-          
-          if (!defaultDir) {
-            const input = await vscode.window.showInputBox({
-              prompt: 'Enter the transcripts directory path',
-              placeHolder: '/path/to/transcripts',
-            });
-            
-            if (input) {
-              this.directory = input;
-              await config.update('transcriptsDirectory', input, true);
-            } else {
-              return;
-            }
-          } else {
-            this.directory = defaultDir;
-          }
-        }
-      }
-
-      // Pass directory only if set (empty string means use server default)
-      // Use this.directory directly, or undefined if empty (server will use its default)
-      const directoryToUse = this.directory || undefined;
-      log('TranscriptsViewProvider.refresh: Calling listTranscripts', { directoryToUse, projectFilter: this.selectedProjectFilter });
+      // The server knows its own output directory from protokoll.yaml configuration.
+      // The client never sends a directory -- it just asks for transcripts.
+      log('TranscriptsViewProvider.refresh: Calling listTranscripts', { projectFilter: this.selectedProjectFilter });
       
-      const response: TranscriptsListResponse = await this.client.listTranscripts(directoryToUse, {
+      const response: TranscriptsListResponse = await this.client.listTranscripts({
         limit: 100,
         projectId: this.selectedProjectFilter || undefined,
       });
@@ -271,6 +219,7 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   }
 
   private _isLoading = false;
+  private _hasAttemptedLoad = false;
 
   async getChildren(element?: TranscriptItem): Promise<TranscriptItem[]> {
     log('TranscriptsViewProvider.getChildren called', { 
@@ -278,12 +227,17 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
       elementType: element?.type,
       transcriptsCount: this.transcripts.length,
       hasClient: !!this.client,
-      isLoading: this._isLoading
+      isLoading: this._isLoading,
+      hasAttemptedLoad: this._hasAttemptedLoad
     });
     
-    // Auto-load transcripts if we have no data yet and have a client
-    if (!element && this.transcripts.length === 0 && this.client && !this._isLoading) {
+    // Auto-load transcripts if we have no data yet, have a client, and haven't already tried.
+    // The _hasAttemptedLoad flag prevents an infinite loop when the server returns 0 transcripts:
+    // refresh() fires _onDidChangeTreeData which re-triggers getChildren(), and without this
+    // guard we'd loop forever when transcripts.length stays 0.
+    if (!element && this.transcripts.length === 0 && this.client && !this._isLoading && !this._hasAttemptedLoad) {
       this._isLoading = true;
+      this._hasAttemptedLoad = true;
       log('TranscriptsViewProvider.getChildren: Starting auto-load');
       try {
         await this.refresh();
