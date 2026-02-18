@@ -151,6 +151,12 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.people.add",
+        "title": "Add Person",
+        "icon": "$(add)",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.refreshPeople",
         "title": "Refresh People",
         "icon": "$(refresh)",
@@ -165,6 +171,12 @@
       {
         "command": "protokoll.people.loadMore",
         "title": "Load More People",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.terms.add",
+        "title": "Add Term",
+        "icon": "$(add)",
         "category": "Protokoll"
       },
       {
@@ -185,6 +197,12 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.projects.add",
+        "title": "Add Project",
+        "icon": "$(add)",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.refreshProjects",
         "title": "Refresh Projects",
         "icon": "$(refresh)",
@@ -199,6 +217,12 @@
       {
         "command": "protokoll.projects.loadMore",
         "title": "Load More Projects",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.companies.add",
+        "title": "Add Company",
+        "icon": "$(add)",
         "category": "Protokoll"
       },
       {
@@ -279,6 +303,11 @@
           "group": "navigation"
         },
         {
+          "command": "protokoll.people.add",
+          "when": "view == protokollPeople",
+          "group": "navigation"
+        },
+        {
           "command": "protokoll.refreshPeople",
           "when": "view == protokollPeople",
           "group": "navigation"
@@ -286,6 +315,11 @@
         {
           "command": "protokoll.people.search",
           "when": "view == protokollPeople",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.terms.add",
+          "when": "view == protokollTerms",
           "group": "navigation"
         },
         {
@@ -299,6 +333,11 @@
           "group": "navigation"
         },
         {
+          "command": "protokoll.projects.add",
+          "when": "view == protokollProjects",
+          "group": "navigation"
+        },
+        {
           "command": "protokoll.refreshProjects",
           "when": "view == protokollProjects",
           "group": "navigation"
@@ -306,6 +345,11 @@
         {
           "command": "protokoll.projects.search",
           "when": "view == protokollProjects",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.companies.add",
+          "when": "view == protokollCompanies",
           "group": "navigation"
         },
         {

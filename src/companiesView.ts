@@ -92,6 +92,7 @@ export class CompaniesViewProvider implements vscode.TreeDataProvider<CompanyIte
   private searchQuery: string = '';
   private treeView: vscode.TreeView<CompanyItem> | null = null;
   private _isLoading = false;
+  private _hasAttemptedLoad = false;
 
   constructor(private context: vscode.ExtensionContext) {}
 
@@ -104,6 +105,8 @@ export class CompaniesViewProvider implements vscode.TreeDataProvider<CompanyIte
     log('CompaniesViewProvider.setClient called', { hasClient: !!client });
     const hadClient = !!this.client;
     this.client = client;
+    
+    this._hasAttemptedLoad = false;
     
     if (!hadClient && client && this.treeView?.visible) {
       log('CompaniesViewProvider.setClient: Client set while view visible, firing change event');
@@ -216,6 +219,7 @@ export class CompaniesViewProvider implements vscode.TreeDataProvider<CompanyIte
     } else {
       this.companies = response.companies;
     }
+    this.companies.sort((a, b) => a.name.localeCompare(b.name));
     
     this.total = response.total;
     this.updateTitle();
@@ -238,11 +242,13 @@ export class CompaniesViewProvider implements vscode.TreeDataProvider<CompanyIte
       elementType: element?.type,
       companiesCount: this.companies.length,
       hasClient: !!this.client,
-      isLoading: this._isLoading
+      isLoading: this._isLoading,
+      hasAttemptedLoad: this._hasAttemptedLoad
     });
     
-    if (!element && this.companies.length === 0 && this.client && !this._isLoading) {
+    if (!element && this.companies.length === 0 && this.client && !this._isLoading && !this._hasAttemptedLoad) {
       this._isLoading = true;
+      this._hasAttemptedLoad = true;
       log('CompaniesViewProvider.getChildren: Starting auto-load');
       try {
         await this.refresh();

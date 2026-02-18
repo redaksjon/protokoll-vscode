@@ -95,6 +95,7 @@ export class TermsViewProvider implements vscode.TreeDataProvider<TermItem> {
   private searchQuery: string = '';
   private treeView: vscode.TreeView<TermItem> | null = null;
   private _isLoading = false;
+  private _hasAttemptedLoad = false;
 
   constructor(private context: vscode.ExtensionContext) {}
 
@@ -107,6 +108,8 @@ export class TermsViewProvider implements vscode.TreeDataProvider<TermItem> {
     log('TermsViewProvider.setClient called', { hasClient: !!client });
     const hadClient = !!this.client;
     this.client = client;
+    
+    this._hasAttemptedLoad = false;
     
     if (!hadClient && client && this.treeView?.visible) {
       log('TermsViewProvider.setClient: Client set while view visible, firing change event');
@@ -219,6 +222,7 @@ export class TermsViewProvider implements vscode.TreeDataProvider<TermItem> {
     } else {
       this.terms = response.terms;
     }
+    this.terms.sort((a, b) => a.name.localeCompare(b.name));
     
     this.total = response.total;
     this.updateTitle();
@@ -241,11 +245,13 @@ export class TermsViewProvider implements vscode.TreeDataProvider<TermItem> {
       elementType: element?.type,
       termsCount: this.terms.length,
       hasClient: !!this.client,
-      isLoading: this._isLoading
+      isLoading: this._isLoading,
+      hasAttemptedLoad: this._hasAttemptedLoad
     });
     
-    if (!element && this.terms.length === 0 && this.client && !this._isLoading) {
+    if (!element && this.terms.length === 0 && this.client && !this._isLoading && !this._hasAttemptedLoad) {
       this._isLoading = true;
+      this._hasAttemptedLoad = true;
       log('TermsViewProvider.getChildren: Starting auto-load');
       try {
         await this.refresh();

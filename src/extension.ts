@@ -939,6 +939,184 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  interface EntityQuickPickItem extends vscode.QuickPickItem {
+    entityId?: string;
+    action: 'existing' | 'create';
+  }
+
+  async function showEntityPicker(opts: {
+    entityType: string;
+    listTool: string;
+    listKey: string;
+    addTool: string;
+    addArgKey: string;
+    addExtraArgs?: Record<string, unknown>;
+    placeholder: string;
+    createLabel: (input: string) => string;
+    itemDescription?: (entity: { name: string; [key: string]: unknown }) => string | undefined;
+    refreshView?: () => Promise<void>;
+  }): Promise<void> {
+    if (!mcpClient) {
+      vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
+      return;
+    }
+
+    const quickPick = vscode.window.createQuickPick<EntityQuickPickItem>();
+    quickPick.placeholder = opts.placeholder;
+    quickPick.matchOnDescription = true;
+
+    let searchTimeout: ReturnType<typeof setTimeout> | undefined;
+
+    const loadItems = async (query: string) => {
+      quickPick.busy = true;
+      try {
+        const args: Record<string, unknown> = { limit: 50, offset: 0 };
+        if (query) { args.search = query; }
+        const response = await mcpClient!.callTool(opts.listTool, args) as { [key: string]: { id: string; name: string; [k: string]: unknown }[] };
+        const entities = (response[opts.listKey] || []) as { id: string; name: string; [k: string]: unknown }[];
+
+        const items: EntityQuickPickItem[] = [];
+
+        if (query.trim()) {
+          items.push({
+            label: `$(add) ${opts.createLabel(query.trim())}`,
+            action: 'create',
+            alwaysShow: true,
+          });
+        }
+
+        for (const entity of entities) {
+          items.push({
+            label: entity.name,
+            description: opts.itemDescription?.(entity) || '',
+            entityId: entity.id,
+            action: 'existing',
+          });
+        }
+
+        if (!query.trim() && items.length === 0) {
+          items.push({
+            label: 'Type to search or create...',
+            action: 'create',
+            description: 'No entities found',
+          });
+        }
+
+        quickPick.items = items;
+      } catch {
+        // Keep current items on error
+      } finally {
+        quickPick.busy = false;
+      }
+    };
+
+    // Initial load
+    await loadItems('');
+
+    quickPick.onDidChangeValue((value) => {
+      if (searchTimeout) { clearTimeout(searchTimeout); }
+      searchTimeout = setTimeout(() => loadItems(value), 200);
+    });
+
+    quickPick.onDidAccept(async () => {
+      const selected = quickPick.selectedItems[0];
+      if (!selected) { return; }
+      quickPick.hide();
+
+      if (selected.action === 'existing' && selected.entityId) {
+        if (transcriptDetailViewProvider) {
+          await transcriptDetailViewProvider.handleOpenEntity(opts.entityType, selected.entityId);
+        }
+      } else if (selected.action === 'create') {
+        const name = quickPick.value.trim();
+        if (!name) { return; }
+        try {
+          const addArgs: Record<string, unknown> = { [opts.addArgKey]: name, ...opts.addExtraArgs };
+          const result = await mcpClient!.callTool(opts.addTool, addArgs) as { success: boolean; entity?: { id: string } };
+          if (result.success && result.entity?.id) {
+            vscode.window.showInformationMessage(`${opts.entityType.charAt(0).toUpperCase() + opts.entityType.slice(1)} "${name}" added`);
+            if (opts.refreshView) { await opts.refreshView(); }
+            if (transcriptDetailViewProvider) {
+              await transcriptDetailViewProvider.handleOpenEntity(opts.entityType, result.entity.id);
+            }
+          }
+        } catch (error) {
+          vscode.window.showErrorMessage(
+            `Failed to add ${opts.entityType}: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      }
+    });
+
+    quickPick.onDidHide(() => {
+      if (searchTimeout) { clearTimeout(searchTimeout); }
+      quickPick.dispose();
+    });
+
+    quickPick.show();
+  }
+
+  const addPersonCommand = vscode.commands.registerCommand(
+    'protokoll.people.add',
+    () => showEntityPicker({
+      entityType: 'person',
+      listTool: 'protokoll_list_people',
+      listKey: 'people',
+      addTool: 'protokoll_add_person',
+      addArgKey: 'name',
+      placeholder: 'Search for an existing person or type a name to create one...',
+      createLabel: (input) => `Create new person "${input}"`,
+      itemDescription: (e) => [e.role, e.company].filter(Boolean).join(' at ') || undefined,
+      refreshView: () => peopleViewProvider?.refresh() ?? Promise.resolve(),
+    })
+  );
+
+  const addTermCommand = vscode.commands.registerCommand(
+    'protokoll.terms.add',
+    () => showEntityPicker({
+      entityType: 'term',
+      listTool: 'protokoll_list_terms',
+      listKey: 'terms',
+      addTool: 'protokoll_add_term',
+      addArgKey: 'term',
+      placeholder: 'Search for an existing term or type to create one...',
+      createLabel: (input) => `Create new term "${input}"`,
+      itemDescription: (e) => [e.expansion, e.domain].filter(Boolean).join(' - ') || undefined,
+      refreshView: () => termsViewProvider?.refresh() ?? Promise.resolve(),
+    })
+  );
+
+  const addProjectCommand = vscode.commands.registerCommand(
+    'protokoll.projects.add',
+    () => showEntityPicker({
+      entityType: 'project',
+      listTool: 'protokoll_list_projects',
+      listKey: 'projects',
+      addTool: 'protokoll_add_project',
+      addArgKey: 'name',
+      addExtraArgs: { useSmartAssist: false },
+      placeholder: 'Search for an existing project or type a name to create one...',
+      createLabel: (input) => `Create new project "${input}"`,
+      itemDescription: (e) => e.contextType ? String(e.contextType) : undefined,
+      refreshView: () => projectsViewProvider?.refresh() ?? Promise.resolve(),
+    })
+  );
+
+  const addCompanyCommand = vscode.commands.registerCommand(
+    'protokoll.companies.add',
+    () => showEntityPicker({
+      entityType: 'company',
+      listTool: 'protokoll_list_companies',
+      listKey: 'companies',
+      addTool: 'protokoll_add_company',
+      addArgKey: 'name',
+      placeholder: 'Search for an existing company or type a name to create one...',
+      createLabel: (input) => `Create new company "${input}"`,
+      itemDescription: (e) => [e.fullName, e.industry].filter(Boolean).join(' - ') || undefined,
+      refreshView: () => companiesViewProvider?.refresh() ?? Promise.resolve(),
+    })
+  );
+
   const openEntityCommand = vscode.commands.registerCommand(
     'protokoll.openEntity',
     async (entityType: string, entityId: string) => {
@@ -1674,6 +1852,10 @@ export async function activate(context: vscode.ExtensionContext) {
     refreshCompaniesCommand,
     searchCompaniesCommand,
     loadMoreCompaniesCommand,
+    addPersonCommand,
+    addTermCommand,
+    addProjectCommand,
+    addCompanyCommand,
     openEntityCommand,
     filterByProjectCommand,
     filterByStatusCommand,

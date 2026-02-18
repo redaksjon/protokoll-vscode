@@ -95,6 +95,7 @@ export class PeopleViewProvider implements vscode.TreeDataProvider<PersonItem> {
   private searchQuery: string = '';
   private treeView: vscode.TreeView<PersonItem> | null = null;
   private _isLoading = false;
+  private _hasAttemptedLoad = false;
 
   constructor(private context: vscode.ExtensionContext) {}
 
@@ -108,7 +109,8 @@ export class PeopleViewProvider implements vscode.TreeDataProvider<PersonItem> {
     const hadClient = !!this.client;
     this.client = client;
     
-    // If we just got a client and the tree view is visible, fire a change event
+    this._hasAttemptedLoad = false;
+    
     if (!hadClient && client && this.treeView?.visible) {
       log('PeopleViewProvider.setClient: Client set while view visible, firing change event');
       this._onDidChangeTreeData.fire();
@@ -246,6 +248,7 @@ export class PeopleViewProvider implements vscode.TreeDataProvider<PersonItem> {
     } else {
       this.people = response.people;
     }
+    this.people.sort((a, b) => a.name.localeCompare(b.name));
     
     this.total = response.total;
     this.updateTitle();
@@ -269,12 +272,13 @@ export class PeopleViewProvider implements vscode.TreeDataProvider<PersonItem> {
       elementType: element?.type,
       peopleCount: this.people.length,
       hasClient: !!this.client,
-      isLoading: this._isLoading
+      isLoading: this._isLoading,
+      hasAttemptedLoad: this._hasAttemptedLoad
     });
     
-    // Auto-load people if we have no data yet and have a client
-    if (!element && this.people.length === 0 && this.client && !this._isLoading) {
+    if (!element && this.people.length === 0 && this.client && !this._isLoading && !this._hasAttemptedLoad) {
       this._isLoading = true;
+      this._hasAttemptedLoad = true;
       log('PeopleViewProvider.getChildren: Starting auto-load');
       try {
         await this.refresh();
