@@ -47,6 +47,11 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.loadMoreTranscripts",
+        "title": "Load More Transcripts",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.filterByProject",
         "title": "Filter by Project",
         "icon": "$(filter)",
@@ -83,6 +88,16 @@
       {
         "command": "protokoll.moveSelectedToProject",
         "title": "Move Selected to Project",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.changeTranscriptStatus",
+        "title": "Change Status",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.changeSelectedTranscriptsStatus",
+        "title": "Change Selected Status",
         "category": "Protokoll"
       },
       {
@@ -408,6 +423,16 @@
           "command": "protokoll.moveSelectedToProject",
           "when": "view == protokollTranscripts",
           "group": "z_commands"
+        },
+        {
+          "command": "protokoll.changeTranscriptStatus",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "z_commands"
+        },
+        {
+          "command": "protokoll.changeSelectedTranscriptsStatus",
+          "when": "view == protokollTranscripts",
+          "group": "z_commands"
         }
       ]
     },
@@ -470,6 +495,7 @@
     "docs:preview": "cd docs && npm run preview"
   },
   "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.90.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
@@ -481,6 +507,7 @@
     "vitest": "^2.0.0"
   },
   "dependencies": {
+    "js-yaml": "^4.1.1",
     "openai": "^6.22.0"
   }
 }

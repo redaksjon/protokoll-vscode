@@ -177,6 +177,10 @@ export async function activate(context: vscode.ExtensionContext) {
           if (params.uri.startsWith('protokoll://transcript/')) {
             console.log('Protokoll: [EXTENSION] This is an individual transcript URI, refreshing if open');
             console.log(`Protokoll: [EXTENSION] Notification URI: ${params.uri}`);
+            // Refresh transcripts list so status changes (e.g. archived) are reflected when filters exclude that status
+            if (transcriptsViewProvider) {
+              await transcriptsViewProvider.refresh();
+            }
             if (transcriptDetailViewProvider) {
               // Refresh the transcript view if it's open
               const currentTranscript = transcriptDetailViewProvider.getCurrentTranscript(params.uri);
@@ -362,6 +366,14 @@ export async function activate(context: vscode.ExtensionContext) {
     // Set transcript detail provider reference for context fallback
     chatViewProvider.setTranscriptDetailProvider(transcriptDetailViewProvider);
   }
+
+  // When a transcript's metadata changes (e.g. status), refresh the transcripts list
+  // so it reflects filter changes (e.g. archived transcript disappears when archived is excluded)
+  transcriptDetailViewProvider.setOnTranscriptChanged(async () => {
+    if (transcriptsViewProvider) {
+      await transcriptsViewProvider.refresh();
+    }
+  });
 
   // Initialize chats view provider
   chatsViewProvider = new ChatsViewProvider();
@@ -768,6 +780,16 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
       await transcriptsViewProvider.refresh();
+    }
+  );
+
+  const loadMoreTranscriptsCommand = vscode.commands.registerCommand(
+    'protokoll.loadMoreTranscripts',
+    async () => {
+      if (!transcriptsViewProvider) {
+        return;
+      }
+      await transcriptsViewProvider.loadMore();
     }
   );
 
@@ -1481,6 +1503,108 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   }
 
+  const changeTranscriptStatusCommand = vscode.commands.registerCommand(
+    'protokoll.changeTranscriptStatus',
+    async (item: TranscriptItem) => {
+      if (!mcpClient) {
+        vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
+        return;
+      }
+
+      if (!item || !item.transcript) {
+        vscode.window.showErrorMessage('No transcript selected.');
+        return;
+      }
+
+      await changeTranscriptsStatus([item], mcpClient, transcriptsViewProvider);
+    }
+  );
+
+  const changeSelectedTranscriptsStatusCommand = vscode.commands.registerCommand(
+    'protokoll.changeSelectedTranscriptsStatus',
+    async () => {
+      if (!mcpClient) {
+        vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
+        return;
+      }
+
+      if (!transcriptsViewProvider) {
+        vscode.window.showErrorMessage('Transcripts view provider not initialized.');
+        return;
+      }
+
+      const selectedItems = transcriptsViewProvider.getSelectedItems();
+      if (selectedItems.length === 0) {
+        vscode.window.showWarningMessage('No transcripts selected. Select one or more transcripts to change status.');
+        return;
+      }
+
+      await changeTranscriptsStatus(selectedItems, mcpClient, transcriptsViewProvider);
+    }
+  );
+
+  // Helper function to change transcript status
+  async function changeTranscriptsStatus(
+    items: TranscriptItem[],
+    client: McpClient,
+    provider: TranscriptsViewProvider | null
+  ): Promise<void> {
+    const statuses = [
+      { id: 'initial', label: 'Initial', icon: '📝' },
+      { id: 'enhanced', label: 'Enhanced', icon: '✨' },
+      { id: 'reviewed', label: 'Reviewed', icon: '👀' },
+      { id: 'in_progress', label: 'In Progress', icon: '🔄' },
+      { id: 'closed', label: 'Closed', icon: '✅' },
+      { id: 'archived', label: 'Archived', icon: '📦' },
+    ];
+
+    const statusItems = statuses.map(s => ({
+      label: `${s.icon} ${s.label}`,
+      description: s.id,
+      id: s.id,
+    }));
+
+    const selected = await vscode.window.showQuickPick(statusItems, {
+      placeHolder: `Select new status for ${items.length} transcript${items.length > 1 ? 's' : ''}`,
+      title: 'Change transcript status',
+    });
+
+    if (!selected) {
+      return; // User cancelled
+    }
+
+    const errors: string[] = [];
+    for (const item of items) {
+      if (!item.transcript) {
+        continue;
+      }
+      try {
+        const transcriptPath = item.transcript.path || item.transcript.filename;
+        await client.callTool('protokoll_edit_transcript', {
+          transcriptPath: transcriptPath,
+          status: selected.id,
+        });
+      } catch (error) {
+        const transcriptName = item.transcript.title || item.transcript.filename;
+        errors.push(`${transcriptName}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    if (errors.length > 0) {
+      vscode.window.showWarningMessage(
+        `Updated status for ${items.length - errors.length} of ${items.length} transcript(s). Errors: ${errors.join('; ')}`
+      );
+    } else {
+      vscode.window.showInformationMessage(
+        `Protokoll: Set ${items.length} transcript${items.length > 1 ? 's' : ''} to "${selected.label}"`
+      );
+    }
+
+    if (provider) {
+      await provider.refresh();
+    }
+  }
+
   const copyTranscriptCommand = vscode.commands.registerCommand(
     'protokoll.copyTranscript',
     async (item: TranscriptItem) => {
@@ -1840,6 +1964,7 @@ export async function activate(context: vscode.ExtensionContext) {
     openTranscriptCommand,
     openTranscriptInNewTabCommand,
     refreshTranscriptsCommand,
+    loadMoreTranscriptsCommand,
     refreshPeopleCommand,
     searchPeopleCommand,
     loadMorePeopleCommand,
@@ -1864,6 +1989,8 @@ export async function activate(context: vscode.ExtensionContext) {
     renameTranscriptCommand,
     moveToProjectCommand,
     moveSelectedToProjectCommand,
+    changeTranscriptStatusCommand,
+    changeSelectedTranscriptsStatusCommand,
     copyTranscriptCommand,
     openTranscriptToSideCommand,
     openTranscriptWithCommand,
