@@ -10,7 +10,7 @@ import * as fs from 'fs';
 import * as yaml from 'js-yaml';
 import { McpClient } from './mcpClient';
 import { ChatViewProvider } from './chatView';
-import type { Transcript, TranscriptContent } from './types';
+import type { Transcript, TranscriptContent, TranscriptStatus } from './types';
 import { shouldPassContextDirectory } from './serverMode';
 
 /**
@@ -128,15 +128,16 @@ export class TranscriptDetailViewProvider {
   private _updatingTranscripts: Set<string> = new Set(); // Track transcripts being updated
   private _entityLastFetched: Map<string, Date> = new Map(); // Track when entities were last fetched
   private _transcriptLastFetched: Map<string, Date> = new Map(); // Track when transcripts were last fetched
-  private _onTranscriptChanged?: () => void | Promise<void>;
+  private _onTranscriptChanged?: (transcriptUri?: string, updates?: Partial<Transcript>) => void | Promise<void>;
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
 
   /**
-   * Set callback to run when a transcript's metadata changes (e.g. status).
-   * Used to refresh the transcripts list so it reflects filter changes (e.g. archived excluded).
+   * Called when a transcript's metadata changes (e.g. status) to update the list view.
+   * When transcriptUri and updates are provided, enables in-place list updates
+   * without a full re-fetch.
    */
-  setOnTranscriptChanged(callback: () => void | Promise<void>): void {
+  setOnTranscriptChanged(callback: (transcriptUri?: string, updates?: Partial<Transcript>) => void | Promise<void>): void {
     this._onTranscriptChanged = callback;
   }
 
@@ -916,8 +917,8 @@ export class TranscriptDetailViewProvider {
         await this.refreshTranscript(transcriptUri);
       }, 500);
 
-      // Refresh the transcripts list so it reflects the new status (e.g. archived transcript disappears when archived is excluded)
-      await this._onTranscriptChanged?.();
+      // Update the transcripts list — pass URI and new status for in-place update
+      await this._onTranscriptChanged?.(transcriptUri, { status: selected.value as TranscriptStatus });
     } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to change status: ${error instanceof Error ? error.message : String(error)}`

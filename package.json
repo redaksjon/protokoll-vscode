@@ -166,6 +166,18 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.uploadAudio",
+        "title": "Upload Audio",
+        "icon": "$(cloud-upload)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.openDashboard",
+        "title": "Open Dashboard",
+        "icon": "$(dashboard)",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.people.add",
         "title": "Add Person",
         "icon": "$(add)",
@@ -314,6 +326,11 @@
         },
         {
           "command": "protokoll.startNewSession",
+          "when": "view == protokollTranscripts",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.uploadAudio",
           "when": "view == protokollTranscripts",
           "group": "navigation"
         },
@@ -471,6 +488,11 @@
           "default": "",
           "description": "Default directory path for transcripts",
           "markdownDescription": "Default directory path for transcripts (optional, will prompt if not set)"
+        },
+        "protokoll.dashboard.autoOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically open the Protokoll Dashboard when the extension activates."
         }
       }
     }
@@ -483,6 +505,7 @@
     "lint:fix": "eslint src --ext ts --fix",
     "test": "NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' vitest run --coverage",
     "test:fast": "NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' vitest run --coverage --exclude='tests/extension.test.ts' --exclude='tests/mcpClient.test.ts' --exclude='tests/openaiClient.test.ts' --exclude='tests/transcriptsView.test.ts'",
+    "test:no-cov": "vitest run",
     "test:watch": "NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' vitest watch",
     "build": "npm run lint && npm run compile",
     "clean": "rm -rf out",

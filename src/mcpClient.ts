@@ -515,6 +515,65 @@ export class McpClient {
   }
 
   /**
+   * Get the current upload queue status.
+   * Returns pending, processing, and recently completed transcripts.
+   */
+  async getQueueStatus(): Promise<{
+    pending: Array<{ uuid: string; filename: string; uploadedAt: string }>;
+    processing: Array<{ uuid: string; filename: string; startedAt: string }>;
+    recent: Array<{ uuid: string; filename: string; completedAt: string; status: string }>;
+    totalPending: number;
+  }> {
+    const result = await this.callTool('protokoll_queue_status', {});
+    return JSON.parse(typeof result === 'string' ? result : JSON.stringify(result));
+  }
+
+  /**
+   * Get transcript details by UUID (or 8-char prefix).
+   */
+  async getTranscriptByUuid(uuid: string, includeContent: boolean = false): Promise<{
+    found: boolean;
+    uuid?: string;
+    filePath?: string;
+    metadata?: unknown;
+    content?: string;
+    error?: string;
+  }> {
+    const result = await this.callTool('protokoll_get_transcript_by_uuid', { uuid, includeContent });
+    return JSON.parse(typeof result === 'string' ? result : JSON.stringify(result));
+  }
+
+  /**
+   * Retry a failed transcription. Resets status from 'error' back to 'uploaded'.
+   */
+  async retryTranscription(uuid: string): Promise<{ success: boolean; error?: string }> {
+    const result = await this.callTool('protokoll_retry_transcription', { uuid });
+    return JSON.parse(typeof result === 'string' ? result : JSON.stringify(result));
+  }
+
+  /**
+   * Cancel a pending or in-progress transcription.
+   */
+  async cancelTranscription(uuid: string): Promise<{ success: boolean; error?: string }> {
+    const result = await this.callTool('protokoll_cancel_transcription', { uuid });
+    return JSON.parse(typeof result === 'string' ? result : JSON.stringify(result));
+  }
+
+  /**
+   * Get background worker status.
+   */
+  async getWorkerStatus(): Promise<{
+    isRunning: boolean;
+    currentTask?: string;
+    totalProcessed: number;
+    lastProcessed?: string;
+    uptime: number;
+  }> {
+    const result = await this.callTool('protokoll_worker_status', {});
+    return JSON.parse(typeof result === 'string' ? result : JSON.stringify(result));
+  }
+
+  /**
    * Start Server-Sent Events connection to receive notifications
    */
   private startSSEConnection(): void {
