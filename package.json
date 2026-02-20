@@ -2,7 +2,7 @@
   "name": "protokoll-vscode",
   "displayName": "Protokoll",
   "description": "VS Code extension for viewing Protokoll transcripts and entities via HTTP MCP server",
-  "version": "0.1.5",
+  "version": "0.1.6-dev.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/redaksjon/protokoll-vscode.git"
@@ -47,6 +47,11 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.loadMoreTranscripts",
+        "title": "Load More Transcripts",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.filterByProject",
         "title": "Filter by Project",
         "icon": "$(filter)",
@@ -83,6 +88,16 @@
       {
         "command": "protokoll.moveSelectedToProject",
         "title": "Move Selected to Project",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.changeTranscriptStatus",
+        "title": "Change Status",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.changeSelectedTranscriptsStatus",
+        "title": "Change Selected Status",
         "category": "Protokoll"
       },
       {
@@ -151,6 +166,24 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.uploadAudio",
+        "title": "Upload Audio",
+        "icon": "$(cloud-upload)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.openDashboard",
+        "title": "Open Dashboard",
+        "icon": "$(dashboard)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.people.add",
+        "title": "Add Person",
+        "icon": "$(add)",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.refreshPeople",
         "title": "Refresh People",
         "icon": "$(refresh)",
@@ -165,6 +198,12 @@
       {
         "command": "protokoll.people.loadMore",
         "title": "Load More People",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.terms.add",
+        "title": "Add Term",
+        "icon": "$(add)",
         "category": "Protokoll"
       },
       {
@@ -185,6 +224,12 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.projects.add",
+        "title": "Add Project",
+        "icon": "$(add)",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.refreshProjects",
         "title": "Refresh Projects",
         "icon": "$(refresh)",
@@ -199,6 +244,12 @@
       {
         "command": "protokoll.projects.loadMore",
         "title": "Load More Projects",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.companies.add",
+        "title": "Add Company",
+        "icon": "$(add)",
         "category": "Protokoll"
       },
       {
@@ -279,6 +330,16 @@
           "group": "navigation"
         },
         {
+          "command": "protokoll.uploadAudio",
+          "when": "view == protokollTranscripts",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.people.add",
+          "when": "view == protokollPeople",
+          "group": "navigation"
+        },
+        {
           "command": "protokoll.refreshPeople",
           "when": "view == protokollPeople",
           "group": "navigation"
@@ -286,6 +347,11 @@
         {
           "command": "protokoll.people.search",
           "when": "view == protokollPeople",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.terms.add",
+          "when": "view == protokollTerms",
           "group": "navigation"
         },
         {
@@ -299,6 +365,11 @@
           "group": "navigation"
         },
         {
+          "command": "protokoll.projects.add",
+          "when": "view == protokollProjects",
+          "group": "navigation"
+        },
+        {
           "command": "protokoll.refreshProjects",
           "when": "view == protokollProjects",
           "group": "navigation"
@@ -306,6 +377,11 @@
         {
           "command": "protokoll.projects.search",
           "when": "view == protokollProjects",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.companies.add",
+          "when": "view == protokollCompanies",
           "group": "navigation"
         },
         {
@@ -364,6 +440,16 @@
           "command": "protokoll.moveSelectedToProject",
           "when": "view == protokollTranscripts",
           "group": "z_commands"
+        },
+        {
+          "command": "protokoll.changeTranscriptStatus",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "z_commands"
+        },
+        {
+          "command": "protokoll.changeSelectedTranscriptsStatus",
+          "when": "view == protokollTranscripts",
+          "group": "z_commands"
         }
       ]
     },
@@ -402,6 +488,11 @@
           "default": "",
           "description": "Default directory path for transcripts",
           "markdownDescription": "Default directory path for transcripts (optional, will prompt if not set)"
+        },
+        "protokoll.dashboard.autoOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically open the Protokoll Dashboard when the extension activates."
         }
       }
     }
@@ -414,6 +505,7 @@
     "lint:fix": "eslint src --ext ts --fix",
     "test": "NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' vitest run --coverage",
     "test:fast": "NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' vitest run --coverage --exclude='tests/extension.test.ts' --exclude='tests/mcpClient.test.ts' --exclude='tests/openaiClient.test.ts' --exclude='tests/transcriptsView.test.ts'",
+    "test:no-cov": "vitest run",
     "test:watch": "NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' vitest watch",
     "build": "npm run lint && npm run compile",
     "clean": "rm -rf out",
@@ -426,6 +518,7 @@
     "docs:preview": "cd docs && npm run preview"
   },
   "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.90.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
@@ -437,6 +530,7 @@
     "vitest": "^2.0.0"
   },
   "dependencies": {
+    "js-yaml": "^4.1.1",
     "openai": "^6.22.0"
   }
 }

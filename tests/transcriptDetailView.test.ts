@@ -617,53 +617,6 @@ description: A person`;
         });
     });
 
-    describe('parseValue', () => {
-        it('should parse boolean true', () => {
-            const result = (provider as any).parseValue('true');
-            expect(result).toBe(true);
-        });
-
-        it('should parse boolean false', () => {
-            const result = (provider as any).parseValue('false');
-            expect(result).toBe(false);
-        });
-
-        it('should parse integer', () => {
-            const result = (provider as any).parseValue('123');
-            expect(result).toBe(123);
-        });
-
-        it('should parse negative integer', () => {
-            const result = (provider as any).parseValue('-456');
-            expect(result).toBe(-456);
-        });
-
-        it('should parse float', () => {
-            const result = (provider as any).parseValue('123.45');
-            expect(result).toBe(123.45);
-        });
-
-        it('should remove double quotes', () => {
-            const result = (provider as any).parseValue('"test"');
-            expect(result).toBe('test');
-        });
-
-        it('should remove single quotes', () => {
-            const result = (provider as any).parseValue("'test'");
-            expect(result).toBe('test');
-        });
-
-        it('should remove backticks', () => {
-            const result = (provider as any).parseValue('`test`');
-            expect(result).toBe('test');
-        });
-
-        it('should return string as-is for non-special values', () => {
-            const result = (provider as any).parseValue('regular text');
-            expect(result).toBe('regular text');
-        });
-    });
-
     describe('formatDate', () => {
         it('should format valid date string', () => {
             const result = (provider as any).formatDate('2026-01-31T20:32:00Z');

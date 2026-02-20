@@ -148,3 +148,36 @@ export interface McpResource {
 export interface McpResourcesListResponse {
   resources: McpResource[];
 }
+
+/**
+ * Queue status item for upload/transcription tracking
+ */
+export interface QueueStatusItem {
+  uuid: string;
+  filename: string;
+  uploadedAt?: string;
+  startedAt?: string;
+  completedAt?: string;
+  status?: string;
+}
+
+/**
+ * Upload queue status from protokoll_queue_status
+ */
+export interface QueueStatus {
+  pending: QueueStatusItem[];
+  processing: QueueStatusItem[];
+  recent: QueueStatusItem[];
+  totalPending: number;
+}
+
+/**
+ * Background worker status from protokoll_worker_status
+ */
+export interface WorkerStatus {
+  isRunning: boolean;
+  currentTask?: string;
+  totalProcessed: number;
+  lastProcessed?: string;
+  uptime: number;
+}

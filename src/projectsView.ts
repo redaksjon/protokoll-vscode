@@ -99,6 +99,7 @@ export class ProjectsViewProvider implements vscode.TreeDataProvider<ProjectItem
   private includeInactive: boolean = false;
   private treeView: vscode.TreeView<ProjectItem> | null = null;
   private _isLoading = false;
+  private _hasAttemptedLoad = false;
 
   constructor(private context: vscode.ExtensionContext) {}
 
@@ -111,6 +112,8 @@ export class ProjectsViewProvider implements vscode.TreeDataProvider<ProjectItem
     log('ProjectsViewProvider.setClient called', { hasClient: !!client });
     const hadClient = !!this.client;
     this.client = client;
+    
+    this._hasAttemptedLoad = false;
     
     if (!hadClient && client && this.treeView?.visible) {
       log('ProjectsViewProvider.setClient: Client set while view visible, firing change event');
@@ -232,6 +235,7 @@ export class ProjectsViewProvider implements vscode.TreeDataProvider<ProjectItem
     } else {
       this.projects = response.projects;
     }
+    this.projects.sort((a, b) => a.name.localeCompare(b.name));
     
     this.total = response.total;
     this.updateTitle();
@@ -254,11 +258,13 @@ export class ProjectsViewProvider implements vscode.TreeDataProvider<ProjectItem
       elementType: element?.type,
       projectsCount: this.projects.length,
       hasClient: !!this.client,
-      isLoading: this._isLoading
+      isLoading: this._isLoading,
+      hasAttemptedLoad: this._hasAttemptedLoad
     });
     
-    if (!element && this.projects.length === 0 && this.client && !this._isLoading) {
+    if (!element && this.projects.length === 0 && this.client && !this._isLoading && !this._hasAttemptedLoad) {
       this._isLoading = true;
+      this._hasAttemptedLoad = true;
       log('ProjectsViewProvider.getChildren: Starting auto-load');
       try {
         await this.refresh();

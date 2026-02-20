@@ -7,9 +7,10 @@ import * as vscode from 'vscode';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as yaml from 'js-yaml';
 import { McpClient } from './mcpClient';
 import { ChatViewProvider } from './chatView';
-import type { Transcript, TranscriptContent } from './types';
+import type { Transcript, TranscriptContent, TranscriptStatus } from './types';
 import { shouldPassContextDirectory } from './serverMode';
 
 /**
@@ -127,8 +128,18 @@ export class TranscriptDetailViewProvider {
   private _updatingTranscripts: Set<string> = new Set(); // Track transcripts being updated
   private _entityLastFetched: Map<string, Date> = new Map(); // Track when entities were last fetched
   private _transcriptLastFetched: Map<string, Date> = new Map(); // Track when transcripts were last fetched
+  private _onTranscriptChanged?: (transcriptUri?: string, updates?: Partial<Transcript>) => void | Promise<void>;
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
+
+  /**
+   * Called when a transcript's metadata changes (e.g. status) to update the list view.
+   * When transcriptUri and updates are provided, enables in-place list updates
+   * without a full re-fetch.
+   */
+  setOnTranscriptChanged(callback: (transcriptUri?: string, updates?: Partial<Transcript>) => void | Promise<void>): void {
+    this._onTranscriptChanged = callback;
+  }
 
   setChatProvider(chatProvider: ChatViewProvider): void {
     this._chatProvider = chatProvider;
@@ -572,7 +583,7 @@ export class TranscriptDetailViewProvider {
               },
             ] as Array<vscode.QuickPickItem & { id: string | null; isCreateNew?: boolean; active?: boolean }>)
           : []),
-        ...allProjects.map(p => ({
+        ...[...allProjects].sort((a, b) => a.name.localeCompare(b.name)).map(p => ({
           label: p.active === false ? `$(circle-slash) ${p.name}` : p.name,
           description: p.active === false ? `${p.id} (inactive)` : p.id,
           id: p.id,
@@ -905,6 +916,9 @@ export class TranscriptDetailViewProvider {
       setTimeout(async () => {
         await this.refreshTranscript(transcriptUri);
       }, 500);
+
+      // Update the transcripts list — pass URI and new status for in-place update
+      await this._onTranscriptChanged?.(transcriptUri, { status: selected.value as TranscriptStatus });
     } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to change status: ${error instanceof Error ? error.message : String(error)}`
@@ -1181,9 +1195,12 @@ export class TranscriptDetailViewProvider {
         }
       );
 
+      // Resolve project names for relationship display
+      const projectNameMap = await this.fetchProjectNameMap();
+
       // Display entity content with last fetched time
       const lastFetched = this._entityLastFetched.get(entityUri);
-      panel.webview.html = this.getEntityContent(entityType, entityId, content.text, entityData, lastFetched);
+      panel.webview.html = this.getEntityContent(entityType, entityId, content.text, entityData, lastFetched, projectNameMap);
 
       // Track entity panel
       this._entityPanels.set(entityUri, panel);
@@ -1198,11 +1215,20 @@ export class TranscriptDetailViewProvider {
             case 'refreshEntity':
               await this.refreshEntity(entityUri);
               break;
+            case 'editEntity':
+              await this.handleEditEntity(entityType, entityId, entityUri, message.fields, panel);
+              break;
             case 'loadRelatedTranscripts':
               await this.handleLoadRelatedTranscripts(panel, message.entityType, message.entityId);
               break;
             case 'openTranscript':
               await this.handleOpenTranscriptFromEntity(message.path);
+              break;
+            case 'addProjectRelationship':
+              await this.handleAddProjectRelationship(entityType, entityId, entityUri);
+              break;
+            case 'removeProjectRelationship':
+              await this.handleRemoveProjectRelationship(entityType, entityId, entityUri, message.targetUri, message.relationship);
               break;
           }
         },
@@ -1395,9 +1421,16 @@ export class TranscriptDetailViewProvider {
       // Parse entity content
       const entityData = this.parseEntityContent(content.text);
       
+      // Resolve project names for relationship display
+      const projectNameMap = await this.fetchProjectNameMap();
+
       // Update panel HTML with fresh content
       const lastFetched = this._entityLastFetched.get(entityUri);
-      panel.webview.html = this.getEntityContent(entityType, entityId, content.text, entityData, lastFetched);
+      panel.webview.html = this.getEntityContent(entityType, entityId, content.text, entityData, lastFetched, projectNameMap);
+
+      // Update panel tab title in case the entity name changed
+      const refreshedName = entityData.name || entityId;
+      panel.title = `${this.capitalizeFirst(entityType)}: ${refreshedName}`;
       
       // Notify webview that refresh is complete
       panel.webview.postMessage({ command: 'refreshComplete' });
@@ -1408,6 +1441,168 @@ export class TranscriptDetailViewProvider {
       vscode.window.showErrorMessage(
         `Failed to refresh entity: ${error instanceof Error ? error.message : String(error)}`
       );
+    }
+  }
+
+  private async handleEditEntity(
+    entityType: string,
+    entityId: string,
+    entityUri: string,
+    fields: Record<string, unknown>,
+    panel: vscode.WebviewPanel
+  ): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      panel.webview.postMessage({ command: 'editResult', success: false, error: 'MCP client not initialized' });
+      return;
+    }
+
+    try {
+      const toolMap: Record<string, string> = {
+        person: 'protokoll_edit_person',
+        project: 'protokoll_edit_project',
+        term: 'protokoll_edit_term',
+        company: 'protokoll_edit_company',
+      };
+
+      const toolName = toolMap[entityType];
+      if (!toolName) {
+        throw new Error(`Editing not supported for entity type: ${entityType}`);
+      }
+
+      const args: Record<string, unknown> = { id: entityId };
+
+      if (fields.name !== undefined) {
+        args.name = fields.name;
+      }
+      if (fields.description !== undefined) {
+        // Person uses "context" field, other entity types use "description"
+        if (entityType === 'person') {
+          args.context = fields.description;
+        } else {
+          args.description = fields.description;
+        }
+      }
+
+      // Entity-specific fields pass through directly
+      const directFields = [
+        'role', 'company', 'firstName', 'lastName',       // person
+        'expansion', 'domain',                              // term
+        'fullName', 'industry',                             // company
+      ];
+      for (const key of directFields) {
+        if (fields[key] !== undefined) {
+          args[key] = fields[key];
+        }
+      }
+
+      // sounds_like manipulation
+      if (fields.add_sounds_like !== undefined) {
+        args.add_sounds_like = fields.add_sounds_like;
+      }
+      if (fields.remove_sounds_like !== undefined) {
+        args.remove_sounds_like = fields.remove_sounds_like;
+      }
+
+      await this._client.callTool(toolName, args);
+
+      panel.webview.postMessage({ command: 'editResult', success: true });
+
+      // Refresh the entity view with updated data
+      await this.refreshEntity(entityUri);
+
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.error(`Protokoll: [ENTITY VIEW] ❌ Failed to edit entity ${entityUri}:`, error);
+      vscode.window.showErrorMessage(`Failed to update entity: ${errorMsg}`);
+      panel.webview.postMessage({ command: 'editResult', success: false, error: errorMsg });
+    }
+  }
+
+  private async handleAddProjectRelationship(
+    entityType: string,
+    entityId: string,
+    entityUri: string,
+  ): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    try {
+      const projectResult = await this._client.callTool('protokoll_list_projects', { limit: 100 }) as {
+        projects?: Array<{ id: string; name: string }>;
+      };
+
+      if (typeof projectResult === 'string' || !projectResult.projects || projectResult.projects.length === 0) {
+        vscode.window.showInformationMessage('No projects available to associate with.');
+        return;
+      }
+
+      const projectItems: vscode.QuickPickItem[] = projectResult.projects
+        .slice()
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map(p => ({
+          label: p.name,
+          description: p.id,
+        }));
+
+      const placeHolder = entityType === 'term'
+        ? 'Select a project to associate this term with'
+        : 'Select a project to associate this person with';
+
+      const selected = await vscode.window.showQuickPick(projectItems, {
+        title: 'Associate with Project',
+        placeHolder,
+      });
+
+      if (!selected || !selected.description) {
+        return;
+      }
+
+      const relationship = entityType === 'term' ? 'used_in' : 'works_on';
+
+      await this._client.callTool('protokoll_add_relationship', {
+        entityType,
+        entityId,
+        targetType: 'project',
+        targetId: selected.description,
+        relationship,
+      });
+
+      await this.refreshEntity(entityUri);
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.error(`Protokoll: [ENTITY VIEW] ❌ Failed to add project relationship:`, error);
+      vscode.window.showErrorMessage(`Failed to associate project: ${errorMsg}`);
+    }
+  }
+
+  private async handleRemoveProjectRelationship(
+    entityType: string,
+    entityId: string,
+    entityUri: string,
+    targetUri: string,
+    relationship: string,
+  ): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    try {
+      await this._client.callTool('protokoll_remove_relationship', {
+        entityType,
+        entityId,
+        targetUri,
+        relationship,
+      });
+
+      await this.refreshEntity(entityUri);
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.error(`Protokoll: [ENTITY VIEW] ❌ Failed to remove project relationship:`, error);
+      vscode.window.showErrorMessage(`Failed to remove project association: ${errorMsg}`);
     }
   }
 
@@ -1844,29 +2039,41 @@ export class TranscriptDetailViewProvider {
       const selectedEntity = await this.showEntityPicker(selectedText, transcriptPath);
       
       if (!selectedEntity) {
-        return; // User cancelled
+        return;
       }
       
-      // Call unified correction tool
-      const correctionArgs: {
-        transcriptPath: string;
-        selectedText: string;
-        entityType: string;
-        entityName?: string;
-        entityId?: string;
-      } = {
+      const correctionArgs: Record<string, unknown> = {
         transcriptPath: this.convertToRelativePath(transcriptPath),
         selectedText: selectedText.trim(),
         entityType: selectedEntity.type
       };
       
       if (selectedEntity.source === 'create-new') {
-        correctionArgs.entityName = selectedEntity.name;
+        if (selectedEntity.type === 'person') {
+          const personDetails = await this.promptForPersonDetails(selectedText.trim());
+          if (!personDetails) {
+            return;
+          }
+          correctionArgs.entityName = personDetails.fullName;
+          if (personDetails.firstName) { correctionArgs.firstName = personDetails.firstName; }
+          if (personDetails.lastName) { correctionArgs.lastName = personDetails.lastName; }
+          if (personDetails.description) { correctionArgs.description = personDetails.description; }
+          if (personDetails.projectId) { correctionArgs.projectId = personDetails.projectId; }
+        } else {
+          correctionArgs.entityName = selectedEntity.name;
+        }
       } else {
         correctionArgs.entityId = selectedEntity.id;
       }
       
-      const result = await this._client.callTool('protokoll_correct_to_entity', correctionArgs) as {
+      const rawResult = await this._client.callTool('protokoll_correct_to_entity', correctionArgs);
+      
+      if (typeof rawResult === 'string') {
+        vscode.window.showErrorMessage(`Correction failed: ${rawResult}`);
+        return;
+      }
+      
+      const result = rawResult as {
         success?: boolean;
         message?: string;
         entity?: { id: string; name: string; type: string };
@@ -1879,9 +2086,12 @@ export class TranscriptDetailViewProvider {
           `${action} ${selectedEntity.type}: ${result.entity.name}`
         );
         
-        // Navigate to entity and refresh transcript
         await this.handleOpenEntity(selectedEntity.type, result.entity.id);
         await this.refreshTranscript(transcriptUri);
+      } else {
+        vscode.window.showErrorMessage(
+          `Correction failed: ${result.message || 'Unknown error'}`
+        );
       }
     } catch (error) {
       console.error('Protokoll: [TRANSCRIPT VIEW] Error correcting selection:', error);
@@ -1889,6 +2099,73 @@ export class TranscriptDetailViewProvider {
         `Correction failed: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+  }
+
+  private async promptForPersonDetails(selectedText: string): Promise<{
+    fullName: string;
+    firstName?: string;
+    lastName?: string;
+    description?: string;
+    projectId?: string;
+  } | undefined> {
+    const fullName = await vscode.window.showInputBox({
+      title: 'New Person: Full Name',
+      prompt: 'Enter the full name for this person',
+      value: selectedText,
+      placeHolder: 'e.g. Gerald Smith',
+      validateInput: (value) => value.trim() ? null : 'Name is required',
+    });
+    
+    if (!fullName) {
+      return undefined;
+    }
+    
+    const nameParts = fullName.trim().split(/\s+/);
+    const firstName = nameParts.length > 1 ? nameParts[0] : undefined;
+    const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : undefined;
+    
+    let projectId: string | undefined;
+    try {
+      const projectResult = await this._client!.callTool('protokoll_list_projects', { limit: 50 }) as {
+        success?: boolean;
+        projects?: Array<{ id: string; name: string }>;
+      };
+      
+      if (typeof projectResult !== 'string' && projectResult.success && projectResult.projects && projectResult.projects.length > 0) {
+        const projectItems: vscode.QuickPickItem[] = [
+          { label: '$(dash) None', description: 'No project association' },
+          ...[...projectResult.projects].sort((a, b) => a.name.localeCompare(b.name)).map(p => ({
+            label: p.name,
+            description: p.id,
+          }))
+        ];
+        
+        const selectedProject = await vscode.window.showQuickPick(projectItems, {
+          title: 'New Person: Project Association (optional)',
+          placeHolder: 'Associate this person with a project?',
+        });
+        
+        if (selectedProject && selectedProject.description && selectedProject.description !== 'No project association') {
+          projectId = selectedProject.description;
+        }
+      }
+    } catch {
+      // Projects not available, skip
+    }
+    
+    const description = await vscode.window.showInputBox({
+      title: 'New Person: Description (optional)',
+      prompt: 'Add a brief description or context for this person',
+      placeHolder: 'e.g. VP of Engineering at Acme Corp',
+    });
+    
+    return {
+      fullName: fullName.trim(),
+      firstName,
+      lastName,
+      description: description?.trim() || undefined,
+      projectId,
+    };
   }
 
   private async handleCreateEntityFromSelection(selectedText: string, transcriptUri: string): Promise<void> {
@@ -1917,179 +2194,17 @@ export class TranscriptDetailViewProvider {
     topics?: string[];
     [key: string]: unknown;
   } {
-    const data: {
-      name?: string;
-      id?: string;
-      type?: string;
-      updatedAt?: string;
-      source?: string;
-      description?: string;
-      classification?: Record<string, unknown>;
-      topics?: string[];
-      [key: string]: unknown;
-    } = {};
-
-    // Parse YAML-like content
-    const lines = content.split('\n');
-    let currentKey: string | null = null;
-    let currentValue: string[] = [];
-    let inMultiline = false;
-    let inList = false;
-    let multilineIndent = 0;
-    let listIndent = 0;
-    const listItems: string[] = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const trimmed = line.trim();
-      const lineIndent = line.match(/^(\s*)/)?.[1].length || 0;
-
-      // Check for list item: "  - item"
-      const listItemMatch = line.match(/^(\s*)-\s+(.+)$/);
-      
-      if (listItemMatch && currentKey && !inMultiline) {
-        const itemIndent = listItemMatch[1].length;
-        
-        // If we're starting a list or continuing one
-        if (!inList || (inList && itemIndent >= listIndent)) {
-          inList = true;
-          listIndent = itemIndent;
-          listItems.push(listItemMatch[2].trim());
-          continue;
-        } else {
-          // List ended, save it
-          if (listItems.length > 0) {
-            data[currentKey] = [...listItems];
-            listItems.length = 0;
-            inList = false;
-          }
-          currentKey = null;
-        }
+    try {
+      const parsed = yaml.load(content);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
       }
-
-      // Check for key-value pairs: "key: value"
-      const kvMatch = line.match(/^(\s*)([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)$/);
-      
-      if (kvMatch && !inMultiline) {
-        // Save previous key-value if exists
-        if (currentKey) {
-          if (inList && listItems.length > 0) {
-            data[currentKey] = [...listItems];
-            listItems.length = 0;
-            inList = false;
-          } else if (!inList) {
-            const value = currentValue.join('\n').trim();
-            if (value) {
-              data[currentKey] = this.parseValue(value);
-            }
-          }
-        }
-
-        const indent = kvMatch[1].length;
-        currentKey = kvMatch[2];
-        const value = kvMatch[3].trim();
-        currentValue = [];
-
-        // Check for multiline indicators: >, |, >-
-        if (value.match(/^[>|]/)) {
-          inMultiline = true;
-          multilineIndent = indent;
-          // Remove the multiline indicator
-          const multilineValue = value.replace(/^[>|-]+\s*/, '');
-          if (multilineValue) {
-            currentValue.push(multilineValue);
-          }
-        } else if (value) {
-          data[currentKey] = this.parseValue(value);
-          currentKey = null;
-        }
-        // If value is empty, might be a list or multiline starting on next line
-      } else if (inMultiline && currentKey) {
-        // Continue multiline value
-        // Check if this line is at the same or less indent level (end of multiline)
-        if (trimmed && lineIndent <= multilineIndent && kvMatch) {
-          // End of multiline, save and start new key
-          const value = currentValue.join('\n').trim();
-          if (value) {
-            data[currentKey] = this.parseValue(value);
-          }
-          currentKey = null;
-          currentValue = [];
-          inMultiline = false;
-          
-          // Re-process this line as a new key-value
-          i--;
-          continue;
-        } else if (trimmed || currentValue.length > 0) {
-          // Remove leading indentation from multiline content
-          const content = line.substring(Math.min(multilineIndent + 2, line.length));
-          currentValue.push(content);
-        }
-      } else if (trimmed && currentKey && !inList && !inMultiline) {
-        // Continuation of a value (shouldn't happen often with YAML)
-        currentValue.push(trimmed);
-      } else if (trimmed && !currentKey && !kvMatch && !listItemMatch) {
-        // Line that doesn't match any pattern - might be content after all metadata
-        // We'll handle this in the remaining content section
-      }
+    } catch {
+      // fall through to empty object if content is not valid YAML
     }
-
-    // Save last key-value if exists
-    if (currentKey) {
-      if (inList && listItems.length > 0) {
-        data[currentKey] = [...listItems];
-      } else if (!inList) {
-        const value = currentValue.join('\n').trim();
-        if (value) {
-          data[currentKey] = this.parseValue(value);
-        }
-      }
-    }
-
-    // Also try to parse topics as a fallback if not already parsed
-    if (!data.topics || (Array.isArray(data.topics) && data.topics.length === 0)) {
-      const topicsMatch = content.match(/topics:\s*\n((?:\s*-\s*[^\n]+\n?)+)/);
-      if (topicsMatch) {
-        const topicLines = topicsMatch[1].match(/^\s*-\s*(.+)$/gm);
-        if (topicLines) {
-          data.topics = topicLines.map(line => line.replace(/^\s*-\s*/, '').trim());
-        }
-      }
-    }
-
-    return data;
+    return {};
   }
 
-  private parseValue(value: string): unknown {
-    // Try to parse as boolean
-    if (value === 'true') {
-      return true;
-    }
-    if (value === 'false') {
-      return false;
-    }
-    
-    // Try to parse as number
-    if (/^-?\d+$/.test(value)) {
-      return parseInt(value, 10);
-    }
-    if (/^-?\d+\.\d+$/.test(value)) {
-      return parseFloat(value);
-    }
-    
-    // Remove quotes if present
-    if ((value.startsWith('"') && value.endsWith('"')) || 
-        (value.startsWith("'") && value.endsWith("'"))) {
-      return value.slice(1, -1);
-    }
-    
-    // Remove backticks if present
-    if (value.startsWith('`') && value.endsWith('`')) {
-      return value.slice(1, -1);
-    }
-    
-    return value;
-  }
 
   private capitalizeFirst(str: string): string {
     return str.charAt(0).toUpperCase() + str.slice(1);
@@ -2104,6 +2219,24 @@ export class TranscriptDetailViewProvider {
     }
   }
 
+  private async fetchProjectNameMap(): Promise<Map<string, string>> {
+    const map = new Map<string, string>();
+    if (!this._client) { return map; }
+    try {
+      const result = await this._client.callTool('protokoll_list_projects', { limit: 200 }) as {
+        projects?: Array<{ id: string; name: string }>;
+      };
+      if (typeof result !== 'string' && result.projects) {
+        for (const p of result.projects) {
+          map.set(p.id, p.name);
+        }
+      }
+    } catch {
+      // Non-critical -- fall back to showing IDs
+    }
+    return map;
+  }
+
   private getEntityContent(entityType: string, entityId: string, content: string, entityData?: {
     name?: string;
     id?: string;
@@ -2114,7 +2247,7 @@ export class TranscriptDetailViewProvider {
     classification?: Record<string, unknown>;
     topics?: string[];
     [key: string]: unknown;
-  }, lastFetched?: Date): string {
+  }, lastFetched?: Date, projectNameMap?: Map<string, string>): string {
     // Parse entity data if not provided
     if (!entityData) {
       entityData = this.parseEntityContent(content);
@@ -2122,32 +2255,61 @@ export class TranscriptDetailViewProvider {
 
     const entityName = entityData.name || entityId;
     const entityIdDisplay = entityData.id || entityId;
+    const data = entityData as Record<string, unknown>;
     
-    // Extract description and other content
-    const description = entityData.description || '';
+    // Extract description - person entities use "context" field, others use "description"
+    const description = entityData.description || data.context as string || '';
     const topics = entityData.topics || [];
+
+    // Extract entity-specific fields
+    const soundsLike: string[] = Array.isArray(data.sounds_like) ? data.sounds_like as string[] : [];
+    const role = (data.role as string) || '';
+    const company = (data.company as string) || '';
+
+    // Extract project relationships for person entities
+    const relationships: Array<{uri: string; relationship: string; notes?: string}> =
+        Array.isArray(data.relationships) ? data.relationships as Array<{uri: string; relationship: string; notes?: string}> : [];
+    const projectRelationships = relationships.filter(r => r.uri?.startsWith('redaksjon://project/'));
+    const projectIds = projectRelationships.map(r => {
+      const match = r.uri.match(/^redaksjon:\/\/project\/(.+)$/);
+      return { id: match ? match[1] : r.uri, relationship: r.relationship, uri: r.uri };
+    });
+    const expansion = (data.expansion as string) || '';
+    const domain = (data.domain as string) || '';
+    const fullName = (data.fullName as string) || '';
+    const industry = (data.industry as string) || '';
     
     // Remove already-parsed fields from content to get remaining content
     let remainingContent = content;
     if (description) {
-      // Try to remove the description section
       remainingContent = remainingContent.replace(
         new RegExp(`description:\\s*[>|-]?\\s*${description.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 's'),
         ''
       );
     }
 
+    // Build editable fields config based on entity type
+    type FieldDef = { key: string; label: string; value: string; editParam: string };
+    const editableFields: FieldDef[] = [];
+    if (entityType === 'person') {
+      editableFields.push(
+        { key: 'role', label: 'Role', value: role, editParam: 'role' },
+        { key: 'company', label: 'Company', value: company, editParam: 'company' },
+      );
+    } else if (entityType === 'term') {
+      editableFields.push(
+        { key: 'expansion', label: 'Expansion', value: expansion, editParam: 'expansion' },
+        { key: 'domain', label: 'Domain', value: domain, editParam: 'domain' },
+      );
+    } else if (entityType === 'company') {
+      editableFields.push(
+        { key: 'fullName', label: 'Full Name', value: fullName, editParam: 'fullName' },
+        { key: 'industry', label: 'Industry', value: industry, editParam: 'industry' },
+      );
+    }
+
     // Format metadata section
     const metadataRows: string[] = [];
-    
-    if (entityIdDisplay) {
-      metadataRows.push(`
-        <div class="metadata-row">
-          <div class="metadata-label">ID:</div>
-          <div class="metadata-value"><code>${this.escapeHtml(String(entityIdDisplay))}</code></div>
-        </div>
-      `);
-    }
     
     if (entityData.type) {
       metadataRows.push(`
@@ -2167,14 +2329,7 @@ export class TranscriptDetailViewProvider {
       `);
     }
     
-    if (entityData.source) {
-      metadataRows.push(`
-        <div class="metadata-row">
-          <div class="metadata-label">Source:</div>
-          <div class="metadata-value"><code>${this.escapeHtml(String(entityData.source))}</code></div>
-        </div>
-      `);
-    }
+    // Source field intentionally hidden from client view
 
     if (entityData.classification) {
       const classificationStr = JSON.stringify(entityData.classification, null, 2);
@@ -2208,9 +2363,16 @@ export class TranscriptDetailViewProvider {
         }
         .entity-header h1 {
             margin-top: 8px;
-            margin-bottom: 16px;
+            margin-bottom: 4px;
             color: var(--vscode-textLink-foreground);
             font-size: 1.8em;
+        }
+        .entity-id {
+            font-size: 0.75em;
+            color: var(--vscode-descriptionForeground);
+            font-family: var(--vscode-editor-font-family);
+            opacity: 0.7;
+            margin-bottom: 12px;
         }
         .entity-type {
             display: inline-block;
@@ -2360,9 +2522,6 @@ export class TranscriptDetailViewProvider {
             position: relative;
         }
         .refresh-button {
-            position: absolute;
-            top: 0;
-            right: 0;
             background-color: var(--vscode-button-secondaryBackground);
             color: var(--vscode-button-secondaryForeground);
             border: 1px solid var(--vscode-button-border);
@@ -2393,31 +2552,45 @@ export class TranscriptDetailViewProvider {
             margin-top: 0;
             margin-bottom: 12px;
         }
-        .related-transcripts-list {
-            list-style: none;
-            padding: 0;
-            margin: 0;
-        }
-        .related-transcript-item {
-            padding: 12px;
-            margin-bottom: 8px;
-            background-color: var(--vscode-editor-inactiveSelectionBackground);
+        .related-transcripts-table {
+            width: 100%;
+            border-collapse: collapse;
             border: 1px solid var(--vscode-panel-border);
             border-radius: 4px;
-            cursor: pointer;
-            transition: background-color 0.2s;
+            overflow: hidden;
         }
-        .related-transcript-item:hover {
+        .related-transcripts-table th {
+            text-align: left;
+            padding: 8px 12px;
+            font-weight: 600;
+            font-size: 0.85em;
+            color: var(--vscode-descriptionForeground);
+            background-color: var(--vscode-editor-inactiveSelectionBackground);
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        .related-transcripts-table td {
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        .related-transcripts-table tr:last-child td {
+            border-bottom: none;
+        }
+        .related-transcripts-table tr.related-transcript-row {
+            cursor: pointer;
+            transition: background-color 0.15s;
+        }
+        .related-transcripts-table tr.related-transcript-row:hover {
             background-color: var(--vscode-list-hoverBackground);
         }
         .related-transcript-title {
-            font-weight: 600;
+            font-weight: 500;
             color: var(--vscode-textLink-foreground);
-            margin-bottom: 4px;
         }
-        .related-transcript-meta {
+        .related-transcript-date,
+        .related-transcript-project {
             font-size: 0.9em;
             color: var(--vscode-descriptionForeground);
+            white-space: nowrap;
         }
         .loading {
             color: var(--vscode-descriptionForeground);
@@ -2427,22 +2600,325 @@ export class TranscriptDetailViewProvider {
             color: var(--vscode-descriptionForeground);
             font-style: italic;
         }
+        .edit-button {
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: background-color 0.2s;
+        }
+        .edit-button:hover {
+            background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .header-buttons {
+            position: absolute;
+            top: 0;
+            right: 0;
+            display: flex;
+            gap: 8px;
+        }
+        .edit-name-input {
+            font-size: 1.8em;
+            font-weight: bold;
+            color: var(--vscode-textLink-foreground);
+            background: var(--vscode-input-background);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 4px;
+            padding: 4px 8px;
+            width: 100%;
+            box-sizing: border-box;
+            font-family: var(--vscode-font-family);
+            outline: none;
+            margin-top: 8px;
+            margin-bottom: 4px;
+        }
+        .edit-name-input:focus {
+            border-color: var(--vscode-focusBorder);
+        }
+        .edit-description-area {
+            width: 100%;
+            min-height: 120px;
+            background: var(--vscode-input-background);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 4px;
+            padding: 12px;
+            color: var(--vscode-input-foreground);
+            font-family: var(--vscode-font-family);
+            font-size: var(--vscode-font-size);
+            line-height: 1.6;
+            resize: vertical;
+            outline: none;
+            box-sizing: border-box;
+        }
+        .edit-description-area:focus {
+            border-color: var(--vscode-focusBorder);
+        }
+        .edit-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .save-button {
+            background-color: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            padding: 6px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+            transition: background-color 0.2s;
+        }
+        .save-button:hover {
+            background-color: var(--vscode-button-hoverBackground);
+        }
+        .save-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .cancel-button {
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            padding: 6px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+            transition: background-color 0.2s;
+        }
+        .cancel-button:hover {
+            background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .edit-status {
+            font-size: 0.85em;
+            margin-left: 12px;
+            display: flex;
+            align-items: center;
+        }
+        .edit-status.saving {
+            color: var(--vscode-descriptionForeground);
+        }
+        .edit-status.error {
+            color: var(--vscode-errorForeground);
+        }
+        .edit-status.success {
+            color: var(--vscode-testing-iconPassed);
+        }
+        .hidden { display: none !important; }
+        .entity-fields {
+            margin-bottom: 24px;
+        }
+        .entity-fields h2 {
+            color: var(--vscode-textLink-foreground);
+            margin-top: 0;
+            margin-bottom: 12px;
+        }
+        .field-row {
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+            gap: 12px;
+        }
+        .field-label {
+            font-weight: 600;
+            min-width: 100px;
+            color: var(--vscode-descriptionForeground);
+            flex-shrink: 0;
+        }
+        .field-value {
+            color: var(--vscode-foreground);
+            flex: 1;
+        }
+        .field-value.empty {
+            color: var(--vscode-descriptionForeground);
+            font-style: italic;
+        }
+        .field-input {
+            flex: 1;
+            background: var(--vscode-input-background);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 4px;
+            padding: 4px 8px;
+            color: var(--vscode-input-foreground);
+            font-family: var(--vscode-font-family);
+            font-size: var(--vscode-font-size);
+            outline: none;
+        }
+        .field-input:focus {
+            border-color: var(--vscode-focusBorder);
+        }
+        .sounds-like-section {
+            margin-bottom: 24px;
+        }
+        .sounds-like-section h2 {
+            color: var(--vscode-textLink-foreground);
+            margin-top: 0;
+            margin-bottom: 12px;
+        }
+        .sounds-like-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+        .sounds-like-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            background-color: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 0.85em;
+        }
+        .sounds-like-tag .remove-tag {
+            display: none;
+            cursor: pointer;
+            opacity: 0.7;
+            font-size: 1.1em;
+            line-height: 1;
+            padding: 0 2px;
+            border: none;
+            background: none;
+            color: inherit;
+        }
+        .sounds-like-tag .remove-tag:hover {
+            opacity: 1;
+        }
+        .editing .sounds-like-tag .remove-tag {
+            display: inline-flex;
+        }
+        .sounds-like-add {
+            display: none;
+            gap: 6px;
+            align-items: center;
+            margin-top: 8px;
+        }
+        .editing .sounds-like-add {
+            display: flex;
+        }
+        .sounds-like-add-input {
+            flex: 1;
+            max-width: 300px;
+            background: var(--vscode-input-background);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 4px;
+            padding: 4px 8px;
+            color: var(--vscode-input-foreground);
+            font-family: var(--vscode-font-family);
+            font-size: var(--vscode-font-size);
+            outline: none;
+        }
+        .sounds-like-add-input:focus {
+            border-color: var(--vscode-focusBorder);
+        }
+        .sounds-like-add-btn {
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85em;
+        }
+        .sounds-like-add-btn:hover {
+            background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .empty-sounds {
+            color: var(--vscode-descriptionForeground);
+            font-style: italic;
+        }
+        .projects-section {
+            margin-bottom: 24px;
+        }
+        .projects-section h2 {
+            color: var(--vscode-textLink-foreground);
+            margin-top: 0;
+            margin-bottom: 12px;
+        }
+        .project-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+        .project-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            background-color: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 0.85em;
+        }
+        .project-tag .relationship-type {
+            opacity: 0.7;
+            font-size: 0.9em;
+        }
+        .project-tag .remove-project {
+            display: inline-flex;
+            cursor: pointer;
+            opacity: 0.7;
+            font-size: 1.1em;
+            line-height: 1;
+            padding: 0 2px;
+            border: none;
+            background: none;
+            color: inherit;
+        }
+        .project-tag .remove-project:hover {
+            opacity: 1;
+        }
+        .empty-projects {
+            color: var(--vscode-descriptionForeground);
+            font-style: italic;
+        }
+        .add-project-btn {
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85em;
+            margin-top: 8px;
+        }
+        .add-project-btn:hover {
+            background-color: var(--vscode-button-secondaryHoverBackground);
+        }
     </style>
 </head>
 <body>
     <div class="entity-header">
-        <button class="refresh-button" id="refresh-button" title="Refresh entity data">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M8 2V6L10 4M8 14V10L6 12M2 8H6L4 10M14 8H10L12 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5" fill="none"/>
-            </svg>
-            Refresh
-        </button>
+        <div class="header-buttons">
+            <button class="edit-button" id="edit-button" title="Edit entity">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M11.5 1.5L14.5 4.5L5 14H2V11L11.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path d="M9.5 3.5L12.5 6.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                </svg>
+                Edit
+            </button>
+            <button class="refresh-button" id="refresh-button" title="Refresh entity data">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M8 2V6L10 4M8 14V10L6 12M2 8H6L4 10M14 8H10L12 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                </svg>
+                Refresh
+            </button>
+        </div>
         <div class="entity-type">${this.escapeHtml(entityType)}</div>
-        <h1>${this.escapeHtml(entityName)}</h1>
+        <h1 id="entity-name-display">${this.escapeHtml(entityName)}</h1>
+        <input type="text" class="edit-name-input hidden" id="edit-name-input" value="${this.escapeHtml(entityName)}" />
+        ${entityIdDisplay ? `<div class="entity-id">${this.escapeHtml(String(entityIdDisplay))}</div>` : ''}
         ${lastFetched ? `<div class="last-fetched">Last fetched: ${this.escapeHtml(this.formatDate(lastFetched.toISOString()))}</div>` : ''}
     </div>
-    ${metadataRows.length > 0 ? `
+    ${metadataRows.length > 0 || topics.length > 0 ? `
     <div class="metadata">
         ${metadataRows.join('')}
         ${topics.length > 0 ? `
@@ -2459,14 +2935,62 @@ export class TranscriptDetailViewProvider {
         ` : ''}
     </div>
     ` : ''}
-    ${description ? `
-    <div class="description">
-        <h2>Description</h2>
-        <div class="entity-content">
-            ${this.markdownToHtml(description)}
+    ${editableFields.length > 0 ? `
+    <div class="entity-fields" id="entity-fields-section">
+        <h2>Details</h2>
+        ${editableFields.map(f => `
+        <div class="field-row">
+            <div class="field-label">${this.escapeHtml(f.label)}:</div>
+            <div class="field-value${f.value ? '' : ' empty'}" id="field-display-${f.key}">${f.value ? this.escapeHtml(f.value) : 'Not set'}</div>
+            <input type="text" class="field-input hidden" id="field-input-${f.key}" value="${this.escapeHtml(f.value)}" placeholder="${this.escapeHtml(f.label)}" data-field-key="${f.key}" data-edit-param="${f.editParam}" />
         </div>
+        `).join('')}
     </div>
     ` : ''}
+    <div class="sounds-like-section" id="sounds-like-section">
+        <h2>Sounds Like</h2>
+        <div class="sounds-like-tags" id="sounds-like-tags">
+            ${soundsLike.length > 0 ? soundsLike.map(s => `
+            <span class="sounds-like-tag" data-value="${this.escapeHtml(s)}">
+                ${this.escapeHtml(s)}
+                <button class="remove-tag" title="Remove">&times;</button>
+            </span>
+            `).join('') : '<span class="empty-sounds" id="empty-sounds">No sounds_like variants</span>'}
+        </div>
+        <div class="sounds-like-add">
+            <input type="text" class="sounds-like-add-input" id="sounds-like-add-input" placeholder="Add variant..." />
+            <button class="sounds-like-add-btn" id="sounds-like-add-btn">Add</button>
+        </div>
+    </div>
+    ${(entityType === 'person' || entityType === 'term') ? `
+    <div class="projects-section" id="projects-section">
+        <h2>Projects</h2>
+        <div class="project-tags" id="project-tags">
+            ${projectIds.length > 0 ? projectIds.map(p => {
+              const displayName = projectNameMap?.get(p.id) || p.id;
+              return `
+            <span class="project-tag" data-uri="${this.escapeHtml(p.uri)}" data-relationship="${this.escapeHtml(p.relationship)}" data-id="${this.escapeHtml(p.id)}">
+                ${this.escapeHtml(displayName)}
+                <span class="relationship-type">(${this.escapeHtml(p.relationship)})</span>
+                <button class="remove-project" title="Remove association">&times;</button>
+            </span>`;
+            }).join('') : '<span class="empty-projects" id="empty-projects">No project associations</span>'}
+        </div>
+        <button class="add-project-btn" id="add-project-btn">Associate Project...</button>
+    </div>
+    ` : ''}
+    <div class="description" id="description-section">
+        <h2>Description</h2>
+        <div class="entity-content" id="description-display">
+            ${description ? this.markdownToHtml(description) : '<span class="empty-state">No description</span>'}
+        </div>
+        <textarea class="edit-description-area hidden" id="edit-description-input">${this.escapeHtml(description)}</textarea>
+    </div>
+    <div class="edit-actions hidden" id="edit-actions">
+        <button class="save-button" id="save-edit-button">Save</button>
+        <button class="cancel-button" id="cancel-edit-button">Cancel</button>
+        <span class="edit-status hidden" id="edit-status"></span>
+    </div>
     ${remainingContent.trim() && remainingContent !== content ? `
     <div class="entity-content" style="margin-top: 24px;">
         ${this.markdownToHtml(remainingContent)}
@@ -2588,6 +3112,232 @@ export class TranscriptDetailViewProvider {
                 });
             }
         }
+
+        let isEditing = false;
+        const originalName = ${JSON.stringify(entityName)};
+        const originalDescription = ${JSON.stringify(description)};
+        const editableFieldDefs = ${JSON.stringify(editableFields)};
+        const originalFieldValues = {};
+        editableFieldDefs.forEach(f => { originalFieldValues[f.key] = f.value; });
+        let currentSoundsLike = ${JSON.stringify(soundsLike)};
+        let soundsLikeAdded = [];
+        let soundsLikeRemoved = [];
+
+        function setupEditButton() {
+            const editButton = document.getElementById('edit-button');
+            if (editButton) {
+                editButton.addEventListener('click', function() {
+                    if (!isEditing) enterEditMode();
+                });
+            }
+
+            const saveButton = document.getElementById('save-edit-button');
+            if (saveButton) {
+                saveButton.addEventListener('click', function() { saveEdit(); });
+            }
+
+            const cancelButton = document.getElementById('cancel-edit-button');
+            if (cancelButton) {
+                cancelButton.addEventListener('click', function() { cancelEdit(); });
+            }
+
+            // Sounds-like add button
+            const addSlBtn = document.getElementById('sounds-like-add-btn');
+            const addSlInput = document.getElementById('sounds-like-add-input');
+            if (addSlBtn) {
+                addSlBtn.addEventListener('click', function() { addSoundsLikeFromInput(); });
+            }
+            if (addSlInput) {
+                addSlInput.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter') { e.preventDefault(); addSoundsLikeFromInput(); }
+                });
+            }
+
+            // Sounds-like remove buttons (via delegation)
+            const tagsContainer = document.getElementById('sounds-like-tags');
+            if (tagsContainer) {
+                tagsContainer.addEventListener('click', function(e) {
+                    const btn = e.target.closest('.remove-tag');
+                    if (btn) {
+                        const tag = btn.closest('.sounds-like-tag');
+                        if (tag) removeSoundsLikeTag(tag.dataset.value);
+                    }
+                });
+            }
+        }
+
+        function enterEditMode() {
+            isEditing = true;
+            document.body.classList.add('editing');
+            const nameDisplay = document.getElementById('entity-name-display');
+            const nameInput = document.getElementById('edit-name-input');
+            const descDisplay = document.getElementById('description-display');
+            const descInput = document.getElementById('edit-description-input');
+            const editActions = document.getElementById('edit-actions');
+            const editButton = document.getElementById('edit-button');
+            const editStatus = document.getElementById('edit-status');
+
+            if (nameDisplay) nameDisplay.classList.add('hidden');
+            if (nameInput) { nameInput.classList.remove('hidden'); nameInput.focus(); }
+            if (descDisplay) descDisplay.classList.add('hidden');
+            if (descInput) descInput.classList.remove('hidden');
+            if (editActions) editActions.classList.remove('hidden');
+            if (editButton) editButton.classList.add('hidden');
+            if (editStatus) { editStatus.classList.add('hidden'); editStatus.textContent = ''; }
+
+            // Show field inputs, hide display values
+            editableFieldDefs.forEach(f => {
+                const display = document.getElementById('field-display-' + f.key);
+                const input = document.getElementById('field-input-' + f.key);
+                if (display) display.classList.add('hidden');
+                if (input) input.classList.remove('hidden');
+            });
+
+            // Reset sounds-like tracking
+            soundsLikeAdded = [];
+            soundsLikeRemoved = [];
+        }
+
+        function cancelEdit() {
+            isEditing = false;
+            document.body.classList.remove('editing');
+            const nameDisplay = document.getElementById('entity-name-display');
+            const nameInput = document.getElementById('edit-name-input');
+            const descDisplay = document.getElementById('description-display');
+            const descInput = document.getElementById('edit-description-input');
+            const editActions = document.getElementById('edit-actions');
+            const editButton = document.getElementById('edit-button');
+
+            if (nameInput) nameInput.value = originalName;
+            if (descInput) descInput.value = originalDescription;
+            if (nameDisplay) nameDisplay.classList.remove('hidden');
+            if (nameInput) nameInput.classList.add('hidden');
+            if (descDisplay) descDisplay.classList.remove('hidden');
+            if (descInput) descInput.classList.add('hidden');
+            if (editActions) editActions.classList.add('hidden');
+            if (editButton) editButton.classList.remove('hidden');
+
+            // Restore field inputs
+            editableFieldDefs.forEach(f => {
+                const display = document.getElementById('field-display-' + f.key);
+                const input = document.getElementById('field-input-' + f.key);
+                if (input) input.value = originalFieldValues[f.key] || '';
+                if (display) display.classList.remove('hidden');
+                if (input) input.classList.add('hidden');
+            });
+
+            // Restore sounds-like tags
+            soundsLikeAdded = [];
+            soundsLikeRemoved = [];
+            renderSoundsLikeTags(currentSoundsLike);
+        }
+
+        function saveEdit() {
+            const nameInput = document.getElementById('edit-name-input');
+            const descInput = document.getElementById('edit-description-input');
+            const saveButton = document.getElementById('save-edit-button');
+            const cancelButton = document.getElementById('cancel-edit-button');
+            const editStatus = document.getElementById('edit-status');
+
+            const newName = nameInput ? nameInput.value.trim() : '';
+            const newDescription = descInput ? descInput.value.trim() : '';
+
+            if (!newName) {
+                if (editStatus) {
+                    editStatus.textContent = 'Name cannot be empty';
+                    editStatus.className = 'edit-status error';
+                    editStatus.classList.remove('hidden');
+                }
+                return;
+            }
+
+            const fields = {};
+            if (newName !== originalName) fields.name = newName;
+            if (newDescription !== originalDescription) fields.description = newDescription;
+
+            // Collect entity-specific field changes
+            editableFieldDefs.forEach(f => {
+                const input = document.getElementById('field-input-' + f.key);
+                if (input) {
+                    const newVal = input.value.trim();
+                    if (newVal !== (originalFieldValues[f.key] || '')) {
+                        fields[f.editParam] = newVal;
+                    }
+                }
+            });
+
+            // Collect sounds_like changes
+            if (soundsLikeAdded.length > 0) fields.add_sounds_like = soundsLikeAdded;
+            if (soundsLikeRemoved.length > 0) fields.remove_sounds_like = soundsLikeRemoved;
+
+            if (Object.keys(fields).length === 0) {
+                cancelEdit();
+                return;
+            }
+
+            if (saveButton) saveButton.disabled = true;
+            if (cancelButton) cancelButton.disabled = true;
+            if (editStatus) {
+                editStatus.textContent = 'Saving...';
+                editStatus.className = 'edit-status saving';
+                editStatus.classList.remove('hidden');
+            }
+
+            vscode.postMessage({
+                command: 'editEntity',
+                entityType: entityType,
+                entityId: entityId,
+                fields: fields
+            });
+        }
+
+        function addSoundsLikeFromInput() {
+            const input = document.getElementById('sounds-like-add-input');
+            if (!input) return;
+            const value = input.value.trim();
+            if (!value) return;
+
+            // Check for duplicates in current working set
+            const workingSet = currentSoundsLike
+                .filter(s => !soundsLikeRemoved.includes(s))
+                .concat(soundsLikeAdded);
+            if (workingSet.includes(value)) {
+                input.value = '';
+                return;
+            }
+
+            soundsLikeAdded.push(value);
+            input.value = '';
+            renderSoundsLikeTags(workingSet.concat([value]));
+        }
+
+        function removeSoundsLikeTag(value) {
+            if (!isEditing) return;
+            if (soundsLikeAdded.includes(value)) {
+                soundsLikeAdded = soundsLikeAdded.filter(s => s !== value);
+            } else {
+                soundsLikeRemoved.push(value);
+            }
+            const workingSet = currentSoundsLike
+                .filter(s => !soundsLikeRemoved.includes(s))
+                .concat(soundsLikeAdded);
+            renderSoundsLikeTags(workingSet);
+        }
+
+        function renderSoundsLikeTags(tags) {
+            const container = document.getElementById('sounds-like-tags');
+            if (!container) return;
+            if (tags.length === 0) {
+                container.innerHTML = '<span class="empty-sounds" id="empty-sounds">No sounds_like variants</span>';
+                return;
+            }
+            container.innerHTML = tags.map(s =>
+                '<span class="sounds-like-tag" data-value="' + escapeHtml(s) + '">' +
+                    escapeHtml(s) +
+                    '<button class="remove-tag" title="Remove">&times;</button>' +
+                '</span>'
+            ).join('');
+        }
         
         // Load related transcripts
         function loadRelatedTranscripts() {
@@ -2599,7 +3349,7 @@ export class TranscriptDetailViewProvider {
             });
         }
         
-        // Handle messages from extension (e.g., related transcripts data)
+        // Handle messages from extension (e.g., related transcripts data, edit results)
         window.addEventListener('message', event => {
             const message = event.data;
             switch (message.command) {
@@ -2607,6 +3357,27 @@ export class TranscriptDetailViewProvider {
                     console.log('Protokoll Entity: Received related transcripts', message.transcripts);
                     renderRelatedTranscripts(message.transcripts);
                     break;
+                case 'editResult': {
+                    const editStatus = document.getElementById('edit-status');
+                    const saveButton = document.getElementById('save-edit-button');
+                    const cancelButton = document.getElementById('cancel-edit-button');
+                    if (message.success) {
+                        if (editStatus) {
+                            editStatus.textContent = 'Saved';
+                            editStatus.className = 'edit-status success';
+                            editStatus.classList.remove('hidden');
+                        }
+                    } else {
+                        if (editStatus) {
+                            editStatus.textContent = message.error || 'Save failed';
+                            editStatus.className = 'edit-status error';
+                            editStatus.classList.remove('hidden');
+                        }
+                        if (saveButton) saveButton.disabled = false;
+                        if (cancelButton) cancelButton.disabled = false;
+                    }
+                    break;
+                }
             }
         });
         
@@ -2619,26 +3390,28 @@ export class TranscriptDetailViewProvider {
                 return;
             }
             
-            const listHtml = '<ul class="related-transcripts-list">' +
+            const tableHtml = '<table class="related-transcripts-table">' +
+                '<thead><tr><th>Title</th><th>Date</th><th>Project</th></tr></thead>' +
+                '<tbody>' +
                 transcripts.map(t => {
                     const date = t.date ? new Date(t.date).toLocaleDateString() : '';
-                    const project = t.project ? \` • \${t.project}\` : '';
+                    const project = t.project ? escapeHtml(t.project) : '';
                     return \`
-                        <li class="related-transcript-item" data-path="\${t.path}">
-                            <div class="related-transcript-title">\${escapeHtml(t.title)}</div>
-                            <div class="related-transcript-meta">\${date}\${project}</div>
-                        </li>
+                        <tr class="related-transcript-row" data-path="\${t.path}">
+                            <td class="related-transcript-title">\${escapeHtml(t.title)}</td>
+                            <td class="related-transcript-date">\${date}</td>
+                            <td class="related-transcript-project">\${project}</td>
+                        </tr>
                     \`;
                 }).join('') +
-                '</ul>';
+                '</tbody></table>';
             
-            container.innerHTML = listHtml;
+            container.innerHTML = tableHtml;
             
-            // Add click handlers
-            const items = container.querySelectorAll('.related-transcript-item');
-            items.forEach(item => {
-                item.addEventListener('click', () => {
-                    const path = item.getAttribute('data-path');
+            const rows = container.querySelectorAll('.related-transcript-row');
+            rows.forEach(row => {
+                row.addEventListener('click', () => {
+                    const path = row.getAttribute('data-path');
                     if (path) {
                         vscode.postMessage({
                             command: 'openTranscript',
@@ -2649,6 +3422,32 @@ export class TranscriptDetailViewProvider {
             });
         }
         
+        function setupProjectAssociation() {
+            const addBtn = document.getElementById('add-project-btn');
+            if (addBtn) {
+                addBtn.addEventListener('click', function() {
+                    vscode.postMessage({ command: 'addProjectRelationship' });
+                });
+            }
+
+            const tagsContainer = document.getElementById('project-tags');
+            if (tagsContainer) {
+                tagsContainer.addEventListener('click', function(e) {
+                    const btn = e.target.closest('.remove-project');
+                    if (btn) {
+                        const tag = btn.closest('.project-tag');
+                        if (tag) {
+                            vscode.postMessage({
+                                command: 'removeProjectRelationship',
+                                targetUri: tag.dataset.uri,
+                                relationship: tag.dataset.relationship,
+                            });
+                        }
+                    }
+                });
+            }
+        }
+
         function escapeHtml(text) {
             const div = document.createElement('div');
             div.textContent = text;
@@ -2658,6 +3457,8 @@ export class TranscriptDetailViewProvider {
         // Run setup immediately (script is at end of body, DOM should be ready)
         setupInlineChatListeners();
         setupRefreshButton();
+        setupEditButton();
+        setupProjectAssociation();
         loadRelatedTranscripts();
         
         // Also run on DOMContentLoaded as backup
@@ -2665,6 +3466,8 @@ export class TranscriptDetailViewProvider {
             document.addEventListener('DOMContentLoaded', function() {
                 setupInlineChatListeners();
                 setupRefreshButton();
+                setupEditButton();
+                setupProjectAssociation();
             });
         }
         
@@ -2684,10 +3487,11 @@ export class TranscriptDetailViewProvider {
   }
 
   public getWebviewContent(transcript: Transcript, content: TranscriptContent, lastFetched?: Date): string {
-    // Server returns structured JSON - use metadata directly, no parsing needed
-    const transcriptText = content.content || '*No content available*';
-    const tags = content.metadata.tags || [];
-    
+    // Normalize content: handle legacy/raw format (uri, mimeType, text) vs structured (metadata, content)
+    const metadata = content.metadata ?? {};
+    const transcriptText = content.content ?? (content as { text?: string }).text ?? '*No content available*';
+    const tags = metadata.tags ?? [];
+
     // Entity references come directly from server
     const entityReferences: {
       projects?: Array<{ id: string; name: string }>;
@@ -2695,20 +3499,20 @@ export class TranscriptDetailViewProvider {
       terms?: Array<{ id: string; name: string }>;
       companies?: Array<{ id: string; name: string }>;
     } = {
-      projects: content.metadata.entities?.projects || [],
-      people: content.metadata.entities?.people || [],
-      terms: content.metadata.entities?.terms || [],
-      companies: content.metadata.entities?.companies || [],
+      projects: metadata.entities?.projects ?? [],
+      people: metadata.entities?.people ?? [],
+      terms: metadata.entities?.terms ?? [],
+      companies: metadata.entities?.companies ?? [],
     };
-    
+
     // Add project from metadata if available and not already in entity references
-    if (content.metadata.projectId && content.metadata.project) {
-      const projectExists = entityReferences.projects?.some(p => p.id === content.metadata.projectId);
+    if (metadata.projectId && metadata.project) {
+      const projectExists = entityReferences.projects?.some(p => p.id === metadata.projectId);
       if (!projectExists) {
-        entityReferences.projects = entityReferences.projects || [];
+        entityReferences.projects = entityReferences.projects ?? [];
         entityReferences.projects.push({
-          id: content.metadata.projectId,
-          name: content.metadata.project,
+          id: metadata.projectId,
+          name: metadata.project,
         });
       }
     }
@@ -2755,8 +3559,8 @@ export class TranscriptDetailViewProvider {
     }
 
     // Format date/time - use structured metadata from server
-    const date = content.metadata.date || transcript.date || 'Unknown date';
-    const time = content.metadata.time || transcript.time || '';
+    const date = metadata.date ?? transcript.date ?? 'Unknown date';
+    const time = metadata.time ?? transcript.time ?? '';
     const dateTime = time ? `${date} ${time}` : date;
 
     // Get createdAt and updatedAt from transcript object (not in content.metadata)
@@ -2764,13 +3568,13 @@ export class TranscriptDetailViewProvider {
     const updatedAt = transcript.updatedAt;
 
     // Get status and tasks from structured metadata
-    const status = content.metadata.status || transcript.status || 'reviewed';
-    const tasks = content.metadata.tasks || transcript.tasks || [];
+    const status = metadata.status ?? transcript.status ?? 'reviewed';
+    const tasks = metadata.tasks ?? transcript.tasks ?? [];
     const openTasks = tasks.filter((t: { status: string }) => t.status === 'open');
 
     // Get project info from structured metadata
-    const projectId = content.metadata.entities?.projects?.[0]?.id || content.metadata.projectId || transcript.entities?.projects?.[0]?.id || '';
-    const projectName = content.metadata.entities?.projects?.[0]?.name || content.metadata.project || transcript.entities?.projects?.[0]?.name || '';
+    const projectId = metadata.entities?.projects?.[0]?.id ?? metadata.projectId ?? transcript.entities?.projects?.[0]?.id ?? '';
+    const projectName = metadata.entities?.projects?.[0]?.name ?? metadata.project ?? transcript.entities?.projects?.[0]?.name ?? '';
     const transcriptPath = transcript.path || transcript.filename;
 
     return `<!DOCTYPE html>

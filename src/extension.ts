@@ -14,9 +14,11 @@ import { PeopleViewProvider } from './peopleView';
 import { TermsViewProvider } from './termsView';
 import { ProjectsViewProvider } from './projectsView';
 import { CompaniesViewProvider } from './companiesView';
-import type { Transcript, TranscriptContent } from './types';
+import { DashboardViewProvider } from './dashboardView';
+import type { Transcript, TranscriptContent, TranscriptStatus } from './types';
 import { log, initLogger } from './logger';
 import { shouldPassContextDirectory, clearServerModeCache } from './serverMode';
+import { UploadService } from './uploadService';
 
 let mcpClient: McpClient | null = null;
 let transcriptsViewProvider: TranscriptsViewProvider | null = null;
@@ -28,6 +30,7 @@ let peopleViewProvider: PeopleViewProvider | null = null;
 let termsViewProvider: TermsViewProvider | null = null;
 let projectsViewProvider: ProjectsViewProvider | null = null;
 let companiesViewProvider: CompaniesViewProvider | null = null;
+let dashboardViewProvider: DashboardViewProvider | null = null;
 
 function getDefaultContextDirectory(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -177,6 +180,10 @@ export async function activate(context: vscode.ExtensionContext) {
           if (params.uri.startsWith('protokoll://transcript/')) {
             console.log('Protokoll: [EXTENSION] This is an individual transcript URI, refreshing if open');
             console.log(`Protokoll: [EXTENSION] Notification URI: ${params.uri}`);
+            // Refresh transcripts list so status changes (e.g. archived) are reflected when filters exclude that status
+            if (transcriptsViewProvider) {
+              await transcriptsViewProvider.refresh();
+            }
             if (transcriptDetailViewProvider) {
               // Refresh the transcript view if it's open
               const currentTranscript = transcriptDetailViewProvider.getCurrentTranscript(params.uri);
@@ -362,6 +369,39 @@ export async function activate(context: vscode.ExtensionContext) {
     // Set transcript detail provider reference for context fallback
     chatViewProvider.setTranscriptDetailProvider(transcriptDetailViewProvider);
   }
+
+  // Dashboard and upload service (shared by dashboard provider and upload command)
+  const uploadService = new UploadService();
+  dashboardViewProvider = new DashboardViewProvider(context.extensionUri);
+  dashboardViewProvider.setUploadService(uploadService);
+  if (mcpClient) {
+    dashboardViewProvider.setClient(mcpClient);
+    log('Protokoll: Dashboard view provider initialized with MCP client');
+
+    // Auto-open dashboard on startup (if not disabled)
+    const autoOpen = vscode.workspace.getConfiguration('protokoll').get<boolean>('dashboard.autoOpen', true);
+    if (autoOpen && serverConnected) {
+      void dashboardViewProvider.show();
+    }
+  } else {
+    log('Protokoll: Dashboard view provider initialized without MCP client');
+  }
+
+  // When a transcript's metadata changes (e.g. status), update the transcripts list.
+  // Uses in-place update when a specific URI and changes are provided, avoiding a
+  // full re-fetch that would reset scroll position on large loaded lists.
+  transcriptDetailViewProvider.setOnTranscriptChanged(async (transcriptUri, updates) => {
+    if (!transcriptsViewProvider) {
+      return;
+    }
+    if (transcriptUri && updates) {
+      const updated = transcriptsViewProvider.updateTranscriptInPlace(transcriptUri, updates);
+      if (updated) {
+        return;
+      }
+    }
+    await transcriptsViewProvider.refresh();
+  });
 
   // Initialize chats view provider
   chatsViewProvider = new ChatsViewProvider();
@@ -708,6 +748,9 @@ export async function activate(context: vscode.ExtensionContext) {
             if (chatViewProvider) {
               chatViewProvider.setClient(mcpClient);
             }
+            if (dashboardViewProvider) {
+              dashboardViewProvider.setClient(mcpClient);
+            }
             vscode.window.showInformationMessage(`Protokoll: Connected to ${input.trim()}`);
           } else {
             vscode.window.showWarningMessage('Protokoll: Server is not responding');
@@ -725,6 +768,9 @@ export async function activate(context: vscode.ExtensionContext) {
             }
             if (chatViewProvider) {
               chatViewProvider.setClient(mcpClient);
+            }
+            if (dashboardViewProvider) {
+              dashboardViewProvider.setClient(mcpClient);
             }
           }
         } catch (error) {
@@ -768,6 +814,16 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
       await transcriptsViewProvider.refresh();
+    }
+  );
+
+  const loadMoreTranscriptsCommand = vscode.commands.registerCommand(
+    'protokoll.loadMoreTranscripts',
+    async () => {
+      if (!transcriptsViewProvider) {
+        return;
+      }
+      await transcriptsViewProvider.loadMore();
     }
   );
 
@@ -937,6 +993,184 @@ export async function activate(context: vscode.ExtensionContext) {
       }
       await companiesViewProvider.loadMore();
     }
+  );
+
+  interface EntityQuickPickItem extends vscode.QuickPickItem {
+    entityId?: string;
+    action: 'existing' | 'create';
+  }
+
+  async function showEntityPicker(opts: {
+    entityType: string;
+    listTool: string;
+    listKey: string;
+    addTool: string;
+    addArgKey: string;
+    addExtraArgs?: Record<string, unknown>;
+    placeholder: string;
+    createLabel: (input: string) => string;
+    itemDescription?: (entity: { name: string; [key: string]: unknown }) => string | undefined;
+    refreshView?: () => Promise<void>;
+  }): Promise<void> {
+    if (!mcpClient) {
+      vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
+      return;
+    }
+
+    const quickPick = vscode.window.createQuickPick<EntityQuickPickItem>();
+    quickPick.placeholder = opts.placeholder;
+    quickPick.matchOnDescription = true;
+
+    let searchTimeout: ReturnType<typeof setTimeout> | undefined;
+
+    const loadItems = async (query: string) => {
+      quickPick.busy = true;
+      try {
+        const args: Record<string, unknown> = { limit: 50, offset: 0 };
+        if (query) { args.search = query; }
+        const response = await mcpClient!.callTool(opts.listTool, args) as { [key: string]: { id: string; name: string; [k: string]: unknown }[] };
+        const entities = (response[opts.listKey] || []) as { id: string; name: string; [k: string]: unknown }[];
+
+        const items: EntityQuickPickItem[] = [];
+
+        if (query.trim()) {
+          items.push({
+            label: `$(add) ${opts.createLabel(query.trim())}`,
+            action: 'create',
+            alwaysShow: true,
+          });
+        }
+
+        for (const entity of entities) {
+          items.push({
+            label: entity.name,
+            description: opts.itemDescription?.(entity) || '',
+            entityId: entity.id,
+            action: 'existing',
+          });
+        }
+
+        if (!query.trim() && items.length === 0) {
+          items.push({
+            label: 'Type to search or create...',
+            action: 'create',
+            description: 'No entities found',
+          });
+        }
+
+        quickPick.items = items;
+      } catch {
+        // Keep current items on error
+      } finally {
+        quickPick.busy = false;
+      }
+    };
+
+    // Initial load
+    await loadItems('');
+
+    quickPick.onDidChangeValue((value) => {
+      if (searchTimeout) { clearTimeout(searchTimeout); }
+      searchTimeout = setTimeout(() => loadItems(value), 200);
+    });
+
+    quickPick.onDidAccept(async () => {
+      const selected = quickPick.selectedItems[0];
+      if (!selected) { return; }
+      quickPick.hide();
+
+      if (selected.action === 'existing' && selected.entityId) {
+        if (transcriptDetailViewProvider) {
+          await transcriptDetailViewProvider.handleOpenEntity(opts.entityType, selected.entityId);
+        }
+      } else if (selected.action === 'create') {
+        const name = quickPick.value.trim();
+        if (!name) { return; }
+        try {
+          const addArgs: Record<string, unknown> = { [opts.addArgKey]: name, ...opts.addExtraArgs };
+          const result = await mcpClient!.callTool(opts.addTool, addArgs) as { success: boolean; entity?: { id: string } };
+          if (result.success && result.entity?.id) {
+            vscode.window.showInformationMessage(`${opts.entityType.charAt(0).toUpperCase() + opts.entityType.slice(1)} "${name}" added`);
+            if (opts.refreshView) { await opts.refreshView(); }
+            if (transcriptDetailViewProvider) {
+              await transcriptDetailViewProvider.handleOpenEntity(opts.entityType, result.entity.id);
+            }
+          }
+        } catch (error) {
+          vscode.window.showErrorMessage(
+            `Failed to add ${opts.entityType}: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      }
+    });
+
+    quickPick.onDidHide(() => {
+      if (searchTimeout) { clearTimeout(searchTimeout); }
+      quickPick.dispose();
+    });
+
+    quickPick.show();
+  }
+
+  const addPersonCommand = vscode.commands.registerCommand(
+    'protokoll.people.add',
+    () => showEntityPicker({
+      entityType: 'person',
+      listTool: 'protokoll_list_people',
+      listKey: 'people',
+      addTool: 'protokoll_add_person',
+      addArgKey: 'name',
+      placeholder: 'Search for an existing person or type a name to create one...',
+      createLabel: (input) => `Create new person "${input}"`,
+      itemDescription: (e) => [e.role, e.company].filter(Boolean).join(' at ') || undefined,
+      refreshView: () => peopleViewProvider?.refresh() ?? Promise.resolve(),
+    })
+  );
+
+  const addTermCommand = vscode.commands.registerCommand(
+    'protokoll.terms.add',
+    () => showEntityPicker({
+      entityType: 'term',
+      listTool: 'protokoll_list_terms',
+      listKey: 'terms',
+      addTool: 'protokoll_add_term',
+      addArgKey: 'term',
+      placeholder: 'Search for an existing term or type to create one...',
+      createLabel: (input) => `Create new term "${input}"`,
+      itemDescription: (e) => [e.expansion, e.domain].filter(Boolean).join(' - ') || undefined,
+      refreshView: () => termsViewProvider?.refresh() ?? Promise.resolve(),
+    })
+  );
+
+  const addProjectCommand = vscode.commands.registerCommand(
+    'protokoll.projects.add',
+    () => showEntityPicker({
+      entityType: 'project',
+      listTool: 'protokoll_list_projects',
+      listKey: 'projects',
+      addTool: 'protokoll_add_project',
+      addArgKey: 'name',
+      addExtraArgs: { useSmartAssist: false },
+      placeholder: 'Search for an existing project or type a name to create one...',
+      createLabel: (input) => `Create new project "${input}"`,
+      itemDescription: (e) => e.contextType ? String(e.contextType) : undefined,
+      refreshView: () => projectsViewProvider?.refresh() ?? Promise.resolve(),
+    })
+  );
+
+  const addCompanyCommand = vscode.commands.registerCommand(
+    'protokoll.companies.add',
+    () => showEntityPicker({
+      entityType: 'company',
+      listTool: 'protokoll_list_companies',
+      listKey: 'companies',
+      addTool: 'protokoll_add_company',
+      addArgKey: 'name',
+      placeholder: 'Search for an existing company or type a name to create one...',
+      createLabel: (input) => `Create new company "${input}"`,
+      itemDescription: (e) => [e.fullName, e.industry].filter(Boolean).join(' - ') || undefined,
+      refreshView: () => companiesViewProvider?.refresh() ?? Promise.resolve(),
+    })
   );
 
   const openEntityCommand = vscode.commands.registerCommand(
@@ -1303,6 +1537,119 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   }
 
+  const changeTranscriptStatusCommand = vscode.commands.registerCommand(
+    'protokoll.changeTranscriptStatus',
+    async (item: TranscriptItem) => {
+      if (!mcpClient) {
+        vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
+        return;
+      }
+
+      if (!item || !item.transcript) {
+        vscode.window.showErrorMessage('No transcript selected.');
+        return;
+      }
+
+      await changeTranscriptsStatus([item], mcpClient, transcriptsViewProvider);
+    }
+  );
+
+  const changeSelectedTranscriptsStatusCommand = vscode.commands.registerCommand(
+    'protokoll.changeSelectedTranscriptsStatus',
+    async () => {
+      if (!mcpClient) {
+        vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
+        return;
+      }
+
+      if (!transcriptsViewProvider) {
+        vscode.window.showErrorMessage('Transcripts view provider not initialized.');
+        return;
+      }
+
+      const selectedItems = transcriptsViewProvider.getSelectedItems();
+      if (selectedItems.length === 0) {
+        vscode.window.showWarningMessage('No transcripts selected. Select one or more transcripts to change status.');
+        return;
+      }
+
+      await changeTranscriptsStatus(selectedItems, mcpClient, transcriptsViewProvider);
+    }
+  );
+
+  // Helper function to change transcript status
+  async function changeTranscriptsStatus(
+    items: TranscriptItem[],
+    client: McpClient,
+    provider: TranscriptsViewProvider | null
+  ): Promise<void> {
+    const statuses = [
+      { id: 'initial', label: 'Initial', icon: '📝' },
+      { id: 'enhanced', label: 'Enhanced', icon: '✨' },
+      { id: 'reviewed', label: 'Reviewed', icon: '👀' },
+      { id: 'in_progress', label: 'In Progress', icon: '🔄' },
+      { id: 'closed', label: 'Closed', icon: '✅' },
+      { id: 'archived', label: 'Archived', icon: '📦' },
+    ];
+
+    const statusItems = statuses.map(s => ({
+      label: `${s.icon} ${s.label}`,
+      description: s.id,
+      id: s.id,
+    }));
+
+    const selected = await vscode.window.showQuickPick(statusItems, {
+      placeHolder: `Select new status for ${items.length} transcript${items.length > 1 ? 's' : ''}`,
+      title: 'Change transcript status',
+    });
+
+    if (!selected) {
+      return; // User cancelled
+    }
+
+    const errors: string[] = [];
+    const succeededUris: string[] = [];
+    for (const item of items) {
+      if (!item.transcript) {
+        continue;
+      }
+      try {
+        const transcriptPath = item.transcript.path || item.transcript.filename;
+        await client.callTool('protokoll_edit_transcript', {
+          transcriptPath: transcriptPath,
+          status: selected.id,
+        });
+        succeededUris.push(item.transcript.uri);
+      } catch (error) {
+        const transcriptName = item.transcript.title || item.transcript.filename;
+        errors.push(`${transcriptName}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    if (errors.length > 0) {
+      vscode.window.showWarningMessage(
+        `Updated status for ${items.length - errors.length} of ${items.length} transcript(s). Errors: ${errors.join('; ')}`
+      );
+    } else {
+      vscode.window.showInformationMessage(
+        `Protokoll: Set ${items.length} transcript${items.length > 1 ? 's' : ''} to "${selected.label}"`
+      );
+    }
+
+    if (provider && succeededUris.length > 0) {
+      const newStatus = selected.id as TranscriptStatus;
+      let allUpdated = true;
+      for (const uri of succeededUris) {
+        if (!provider.updateTranscriptInPlace(uri, { status: newStatus })) {
+          allUpdated = false;
+        }
+      }
+      if (!allUpdated) {
+        await provider.refresh();
+      }
+    }
+  }
+
   const copyTranscriptCommand = vscode.commands.registerCommand(
     'protokoll.copyTranscript',
     async (item: TranscriptItem) => {
@@ -1656,12 +2003,158 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  const openDashboardCommand = vscode.commands.registerCommand(
+    'protokoll.openDashboard',
+    () => {
+      if (dashboardViewProvider) {
+        void dashboardViewProvider.show();
+      } else {
+        vscode.window.showErrorMessage('Protokoll: Dashboard not available.');
+      }
+    }
+  );
+
+  const uploadAudioCommand = vscode.commands.registerCommand(
+    'protokoll.uploadAudio',
+    async () => {
+      if (!mcpClient) {
+        vscode.window.showErrorMessage('Protokoll: MCP client not initialized. Please configure the server URL first.');
+        return;
+      }
+
+      // 1. Open file picker for audio files
+      const fileUris = await vscode.window.showOpenDialog({
+        canSelectFiles: true,
+        canSelectFolders: false,
+        canSelectMany: false,
+        title: 'Select Audio File to Upload',
+        filters: {
+          // eslint-disable-next-line @typescript-eslint/naming-convention -- VS Code filter key is user-facing label
+          'Audio Files': ['mp3', 'm4a', 'wav', 'webm', 'mp4', 'aac', 'ogg', 'flac'],
+        },
+      });
+
+      if (!fileUris || fileUris.length === 0) {
+        return; // User cancelled
+      }
+
+      const filePath = fileUris[0].fsPath;
+
+      // 2. Optional title input
+      const title = await vscode.window.showInputBox({
+        prompt: 'Enter a title for this transcript (optional)',
+        placeHolder: 'e.g., Weekly Team Standup',
+        title: 'Transcript Title',
+      });
+
+      if (title === undefined) {
+        return; // User pressed Escape — cancel the whole flow
+      }
+
+      // 3. Optional project selection (create-or-select pattern)
+      let projectItems: vscode.QuickPickItem[] = [];
+      try {
+        const shouldPass = await shouldPassContextDirectory(mcpClient);
+        const contextDirectory = shouldPass ? getDefaultContextDirectory() : undefined;
+        const projectsResult = await mcpClient.callTool(
+          'protokoll_list_projects',
+          contextDirectory ? { contextDirectory } : {}
+        ) as { projects?: Array<{ id: string; name: string; active?: boolean }> };
+
+        if (projectsResult.projects && projectsResult.projects.length > 0) {
+          const activeProjects = projectsResult.projects.filter((p) => p.active !== false);
+          projectItems = activeProjects.map((p) => ({
+            label: p.name,
+            description: p.id,
+          }));
+        }
+      } catch {
+        // If project fetch fails, just show empty list with create option
+      }
+
+      const skipItem: vscode.QuickPickItem = {
+        label: '$(dash) Skip — no project',
+        description: 'Upload without assigning a project',
+      };
+      const createItem: vscode.QuickPickItem = {
+        label: '$(add) Create new project...',
+        description: 'Type a new project name',
+      };
+
+      const projectPick = await vscode.window.showQuickPick(
+        [skipItem, createItem, ...projectItems],
+        {
+          title: 'Assign to Project (optional)',
+          placeHolder: 'Select a project or skip',
+        }
+      );
+
+      if (projectPick === undefined) {
+        return; // User pressed Escape — cancel
+      }
+
+      let project: string | undefined;
+      if (projectPick === skipItem) {
+        project = undefined;
+      } else if (projectPick === createItem) {
+        project = await vscode.window.showInputBox({
+          prompt: 'Enter new project name',
+          placeHolder: 'e.g., Q1 Customer Interviews',
+        });
+        if (project === undefined) {
+          return; // Cancelled
+        }
+      } else {
+        project = projectPick.label;
+      }
+
+      // 4. Perform upload with progress notification
+      const serverUrl = vscode.workspace.getConfiguration('protokoll').get<string>('serverUrl', 'http://127.0.0.1:3001') || 'http://127.0.0.1:3001';
+
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Uploading audio...',
+          cancellable: false,
+        },
+        async () => {
+          try {
+            const result = await uploadService.uploadAudio({
+              filePath,
+              serverUrl,
+              title: title && title.trim() ? title.trim() : undefined,
+              project: project && project.trim() ? project.trim() : undefined,
+            });
+
+            if (result.success) {
+              if (transcriptsViewProvider) {
+                await transcriptsViewProvider.refresh();
+              }
+              const action = await vscode.window.showInformationMessage(
+                `Audio uploaded successfully! Tracking ID: ${result.uuid?.substring(0, 8)}`,
+                'Open Dashboard'
+              );
+              if (action === 'Open Dashboard') {
+                await vscode.commands.executeCommand('protokoll.openDashboard');
+              }
+            } else {
+              vscode.window.showErrorMessage(`Upload failed: ${result.error}`);
+            }
+          } catch (err) {
+            vscode.window.showErrorMessage(`Upload failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      );
+    }
+  );
+
   context.subscriptions.push(
     showTranscriptsCommand,
     configureServerCommand,
     openTranscriptCommand,
     openTranscriptInNewTabCommand,
     refreshTranscriptsCommand,
+    loadMoreTranscriptsCommand,
     refreshPeopleCommand,
     searchPeopleCommand,
     loadMorePeopleCommand,
@@ -1674,6 +2167,10 @@ export async function activate(context: vscode.ExtensionContext) {
     refreshCompaniesCommand,
     searchCompaniesCommand,
     loadMoreCompaniesCommand,
+    addPersonCommand,
+    addTermCommand,
+    addProjectCommand,
+    addCompanyCommand,
     openEntityCommand,
     filterByProjectCommand,
     filterByStatusCommand,
@@ -1682,6 +2179,8 @@ export async function activate(context: vscode.ExtensionContext) {
     renameTranscriptCommand,
     moveToProjectCommand,
     moveSelectedToProjectCommand,
+    changeTranscriptStatusCommand,
+    changeSelectedTranscriptsStatusCommand,
     copyTranscriptCommand,
     openTranscriptToSideCommand,
     openTranscriptWithCommand,
@@ -1692,6 +2191,8 @@ export async function activate(context: vscode.ExtensionContext) {
     openChatPanelCommand,
     closeChatPanelCommand,
     createNoteCommand,
+    openDashboardCommand,
+    uploadAudioCommand,
     backArrowHandler,
     configWatcher,
     transcriptsTreeView,

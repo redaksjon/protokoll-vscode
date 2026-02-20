@@ -20,6 +20,7 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
   private client: McpClient | null = null;
   private transcripts: Transcript[] = [];
+  private hasMorePages = false;
   private selectedProjectFilter: string | null = null; // Project ID to filter by
   private selectedStatusFilters: Set<string> = new Set(['initial', 'enhanced', 'reviewed', 'in_progress', 'closed']); // Statuses to show (archived excluded by default)
   private sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc' = 'date-desc'; // Default: date descending
@@ -120,8 +121,8 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     this.saveWorkspaceSettings().catch(err => {
       log('Failed to save project filter to workspace state', err);
     });
-    // Refresh the transcript list with the new filter
-    this.refresh().catch(err => {
+    // Changing filters resets pagination — start from the top
+    this.refresh({ resetPagination: true }).catch(err => {
       vscode.window.showErrorMessage(
         `Failed to refresh transcripts: ${err instanceof Error ? err.message : String(err)}`
       );
@@ -138,8 +139,8 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     this.saveWorkspaceSettings().catch(err => {
       log('Failed to save status filters to workspace state', err);
     });
-    // Refresh the transcript list with the new filter
-    this.refresh().catch(err => {
+    // Changing filters resets pagination — start from the top
+    this.refresh({ resetPagination: true }).catch(err => {
       vscode.window.showErrorMessage(
         `Failed to refresh transcripts: ${err instanceof Error ? err.message : String(err)}`
       );
@@ -156,7 +157,7 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     this.saveWorkspaceSettings().catch(err => {
       log('Failed to save sort order to workspace state', err);
     });
-    // Refresh the transcript list with the new sort order
+    // Sort changes don't need pagination reset, but we re-fetch to get server-side sorting
     this.refresh().catch(err => {
       vscode.window.showErrorMessage(
         `Failed to refresh transcripts: ${err instanceof Error ? err.message : String(err)}`
@@ -168,10 +169,15 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     return this.sortOrder;
   }
 
-  async refresh(): Promise<void> {
+  async refresh(options?: { resetPagination?: boolean }): Promise<void> {
+    const preserveLoadedCount = !options?.resetPagination && this.transcripts.length > 0;
+    const limit = preserveLoadedCount ? Math.max(100, this.transcripts.length) : 100;
+    
     log('TranscriptsViewProvider.refresh called', { 
       hasClient: !!this.client, 
-      currentTranscriptsCount: this.transcripts.length 
+      currentTranscriptsCount: this.transcripts.length,
+      preserveLoadedCount,
+      limit
     });
     
     if (!this.client) {
@@ -180,17 +186,17 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     }
 
     try {
-      // The server knows its own output directory from protokoll.yaml configuration.
-      // The client never sends a directory -- it just asks for transcripts.
       log('TranscriptsViewProvider.refresh: Calling listTranscripts', { projectFilter: this.selectedProjectFilter });
       
       const response: TranscriptsListResponse = await this.client.listTranscripts({
-        limit: 100,
+        limit,
+        offset: 0,
         projectId: this.selectedProjectFilter || undefined,
       });
 
       log('TranscriptsViewProvider.refresh: Got response', { 
         transcriptsCount: response.transcripts.length,
+        hasMore: response.pagination?.hasMore,
         sampleTranscript: response.transcripts[0] ? {
           title: response.transcripts[0].title,
           hasEntities: !!response.transcripts[0].entities,
@@ -198,12 +204,72 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
         } : null
       });
       this.transcripts = response.transcripts;
+      this.hasMorePages = response.pagination?.hasMore ?? false;
       this._onDidChangeTreeData.fire();
       log('TranscriptsViewProvider.refresh: Fired tree data change event');
     } catch (error) {
       log('TranscriptsViewProvider.refresh: ERROR', { error: error instanceof Error ? error.message : String(error) });
       vscode.window.showErrorMessage(
         `Failed to load transcripts: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  /**
+   * Update a single transcript's metadata in-place without re-fetching the entire list.
+   * Preserves scroll position and loaded state.
+   */
+  updateTranscriptInPlace(uri: string, updates: Partial<Transcript>): boolean {
+    const index = this.transcripts.findIndex(t => t.uri === uri);
+    if (index === -1) {
+      log('TranscriptsViewProvider.updateTranscriptInPlace: URI not found in loaded transcripts', { uri });
+      return false;
+    }
+
+    this.transcripts[index] = { ...this.transcripts[index], ...updates };
+    log('TranscriptsViewProvider.updateTranscriptInPlace: Updated transcript', { uri, updates });
+    this._onDidChangeTreeData.fire();
+    return true;
+  }
+
+  /**
+   * Find a loaded transcript by URI.
+   */
+  findTranscript(uri: string): Transcript | undefined {
+    return this.transcripts.find(t => t.uri === uri);
+  }
+
+  /**
+   * Load the next page of transcripts (infinite scroll).
+   * Appends to the existing list using the same filters.
+   */
+  async loadMore(): Promise<void> {
+    if (!this.client || !this.hasMorePages) {
+      return;
+    }
+
+    try {
+      const offset = this.transcripts.length;
+      log('TranscriptsViewProvider.loadMore: Fetching next page', { offset, limit: 100 });
+
+      const response: TranscriptsListResponse = await this.client.listTranscripts({
+        limit: 100,
+        offset,
+        projectId: this.selectedProjectFilter || undefined,
+      });
+
+      log('TranscriptsViewProvider.loadMore: Got response', { 
+        transcriptsCount: response.transcripts.length,
+        hasMore: response.pagination?.hasMore 
+      });
+
+      this.transcripts = [...this.transcripts, ...response.transcripts];
+      this.hasMorePages = response.pagination?.hasMore ?? false;
+      this._onDidChangeTreeData.fire();
+    } catch (error) {
+      log('TranscriptsViewProvider.loadMore: ERROR', { error: error instanceof Error ? error.message : String(error) });
+      vscode.window.showErrorMessage(
+        `Failed to load more transcripts: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
@@ -250,17 +316,17 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     }
 
     if (!element) {
-      // Root level - return day groups
+      // Root level - return day groups plus optional "Load more" item
       const dayGroups = this.groupTranscriptsByDay();
-      log('TranscriptsViewProvider.getChildren: Returning root level', { dayCount: Object.keys(dayGroups).length });
-      
-      return Object.keys(dayGroups)
+      log('TranscriptsViewProvider.getChildren: Returning root level', { dayCount: Object.keys(dayGroups).length, hasMorePages: this.hasMorePages });
+
+      const dayItems = Object.keys(dayGroups)
         .sort((a, b) => b.localeCompare(a)) // Sort dates descending (newest first)
         .map(dateKey => {
           const transcripts = dayGroups[dateKey];
           const date = this.getTranscriptDate(transcripts[0]);
           const dayLabel = this.formatDayHeader(date);
-          
+
           return new TranscriptItem(
             dayLabel,
             `day:${dateKey}`,
@@ -274,6 +340,42 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
             dateKey
           );
         });
+
+      // Add "Load more" item when there are more pages
+      const result: TranscriptItem[] = [...dayItems];
+      if (this.hasMorePages) {
+        const loadMoreItem = new TranscriptItem(
+          'Load more transcripts...',
+          'load-more:transcripts',
+          vscode.TreeItemCollapsibleState.None,
+          {
+            command: 'protokoll.loadMoreTranscripts',
+            title: 'Load More Transcripts',
+          },
+          undefined,
+          'load-more'
+        );
+        loadMoreItem.iconPath = new vscode.ThemeIcon('sync');
+        loadMoreItem.tooltip = 'Fetch the next 100 transcripts (respects current filters)';
+        result.push(loadMoreItem);
+      }
+
+      // Add upload action at the bottom of the list
+      const uploadItem = new TranscriptItem(
+        'Upload Audio',
+        'upload:audio',
+        vscode.TreeItemCollapsibleState.None,
+        {
+          command: 'protokoll.uploadAudio',
+          title: 'Upload Audio',
+        },
+        undefined,
+        'upload'
+      );
+      uploadItem.description = 'Upload an audio file for transcription';
+      result.push(uploadItem);
+
+      return result;
     }
 
     if (element.type === 'day') {
@@ -661,7 +763,7 @@ export class TranscriptItem extends vscode.TreeItem {
     public readonly collapsibleState: vscode.TreeItemCollapsibleState,
     public readonly command?: vscode.Command,
     public readonly transcript?: Transcript,
-    public readonly type: 'year' | 'month' | 'transcript' | 'day' = 'transcript',
+    public readonly type: 'year' | 'month' | 'transcript' | 'day' | 'load-more' | 'upload' = 'transcript',
     public readonly year?: string,
     public readonly month?: string,
     public readonly project?: string,
@@ -681,6 +783,13 @@ export class TranscriptItem extends vscode.TreeItem {
       this.contextValue = 'transcriptDay';
       this.iconPath = new vscode.ThemeIcon('calendar');
       this.tooltip = label;
+    } else if (type === 'load-more') {
+      this.contextValue = 'loadMoreTranscripts';
+      // iconPath and tooltip are set by the caller
+    } else if (type === 'upload') {
+      this.contextValue = 'uploadAudio';
+      this.iconPath = new vscode.ThemeIcon('cloud-upload');
+      this.tooltip = 'Upload an audio file for transcription';
     } else {
       this.contextValue = 'transcript';
       

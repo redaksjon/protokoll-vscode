@@ -260,7 +260,7 @@ describe('McpClient', () => {
                 }),
             });
 
-            await client.listTranscripts('/path/to/transcripts', {
+            await client.listTranscripts({
                 limit: 50,
                 offset: 10,
                 startDate: '2026-01-01',
@@ -269,6 +269,28 @@ describe('McpClient', () => {
 
             // Verify the request completed successfully
             expect(client).toBeDefined();
+        });
+
+        it('should include projectId in URI when filtering by project', async () => {
+            const projectId = 'cffd998f-ff32-4d27-9ea7-7976172c44d1';
+            const mockResponse: TranscriptsListResponse = {
+                directory: '/server/default',
+                transcripts: [],
+                pagination: { total: 0, limit: 100, offset: 0, hasMore: false },
+                filters: {},
+            };
+
+            const readResourceSpy = vi.spyOn(client, 'readResource').mockResolvedValue({
+                uri: `protokoll://transcripts?projectId=${projectId}&limit=100`,
+                mimeType: 'application/json',
+                text: JSON.stringify(mockResponse),
+            });
+
+            await client.listTranscripts({ limit: 100, projectId });
+
+            expect(readResourceSpy).toHaveBeenCalledWith(
+                `protokoll://transcripts?limit=100&projectId=${projectId}`
+            );
         });
 
         it('should work without directory parameter (use server default)', async () => {
