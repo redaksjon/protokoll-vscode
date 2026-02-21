@@ -21,6 +21,7 @@ import { UploadService } from './uploadService';
 interface WebviewMessage {
   type: string;
   uuid?: string;
+  projectId?: string | null;
 }
 
 export class DashboardViewProvider {
@@ -271,7 +272,7 @@ export class DashboardViewProvider {
    */
   private async _fetchStats(): Promise<{
     totalCount: number;
-    projects: Array<{ name: string; total: number; statuses: Record<string, number> }>;
+    projects: Array<{ id: string | null; name: string; total: number; statuses: Record<string, number> }>;
   }> {
     if (!this._mcpClient) {
       return { totalCount: 0, projects: [] };
@@ -281,26 +282,44 @@ export class DashboardViewProvider {
       const result = await this._mcpClient.listTranscripts({ limit: 10000 });
       const transcripts = result.transcripts ?? [];
 
-      const projectMap = new Map<string, Record<string, number>>();
+      const projectMap = new Map<string, { id: string | null; statuses: Record<string, number> }>();
       let totalCount = 0;
+
+      const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      // Maps lowercase project name → canonical (first-seen) display name, for case-insensitive grouping
+      const nameCanonical = new Map<string, string>();
 
       for (const t of transcripts) {
         totalCount++;
-        const project =
-          t.entities?.projects?.[0]?.name ?? 'Unassigned';
-        if (!projectMap.has(project)) {
-          projectMap.set(project, {});
+        const projectEntity = t.entities?.projects?.[0];
+        const rawName = projectEntity?.name;
+        // If the stored project name is a UUID it's corrupted data — treat as unassigned
+        const rawProjectName = (rawName && !UUID_RE.test(rawName)) ? rawName : 'Unassigned';
+        // Merge projects that differ only by case (use the first-seen casing as the canonical name)
+        const lowerKey = rawProjectName.toLowerCase();
+        if (!nameCanonical.has(lowerKey)) {
+          nameCanonical.set(lowerKey, rawProjectName);
         }
-        const statusCounts = projectMap.get(project)!;
-        const status = t.status ?? 'unknown';
-        statusCounts[status] = (statusCounts[status] ?? 0) + 1;
+        const projectName = nameCanonical.get(lowerKey)!;
+        const projectId = (projectName !== 'Unassigned' ? projectEntity?.id : null) ?? null;
+        if (!projectMap.has(projectName)) {
+          projectMap.set(projectName, { id: projectId, statuses: {} });
+        }
+        const entry = projectMap.get(projectName)!;
+        // Normalise legacy 'open' status to 'in_progress'
+        const rawStatus: string = t.status ?? 'unknown';
+        const status = rawStatus === 'open' ? 'in_progress' : rawStatus;
+        entry.statuses[status] = (entry.statuses[status] ?? 0) + 1;
       }
 
-      const projects = Array.from(projectMap.entries()).map(([name, statuses]) => ({
-        name,
-        total: Object.values(statuses).reduce((a, b) => a + b, 0),
-        statuses,
-      }));
+      const projects = Array.from(projectMap.entries())
+        .map(([name, { id, statuses }]) => ({
+          id,
+          name,
+          total: Object.values(statuses).reduce((a, b) => a + b, 0),
+          statuses,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
 
       return { totalCount, projects };
     } catch (err) {
@@ -354,6 +373,10 @@ export class DashboardViewProvider {
             }
           }
         }
+        break;
+
+      case 'filter-project':
+        await vscode.commands.executeCommand('protokoll.applyProjectFilter', message.projectId ?? null);
         break;
 
       case 'navigate':
@@ -525,6 +548,14 @@ export class DashboardViewProvider {
     .stats-table td {
       padding: 6px;
       border-bottom: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2));
+    }
+
+    .clickable-row {
+      cursor: pointer;
+    }
+
+    .clickable-row:hover td {
+      background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
     }
 
     .project-name {
@@ -776,7 +807,7 @@ export class DashboardViewProvider {
             \${projects.length === 0
               ? html\`<tr><td colspan="12" class="placeholder">No transcripts yet</td></tr>\`
               : projects.map(p => html\`
-                <tr>
+                <tr class="clickable-row" @click=\${() => vscode.postMessage({ type: 'filter-project', projectId: p.id })}>
                   <td class="project-name">\${p.name}</td>
                   <td class="count-cell">\${p.total}</td>
                   \${ALL_STATUSES.map(s => html\`
