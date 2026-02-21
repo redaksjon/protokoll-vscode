@@ -1248,6 +1248,18 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  const applyProjectFilterCommand = vscode.commands.registerCommand(
+    'protokoll.applyProjectFilter',
+    (projectId: string | null) => {
+      if (!transcriptsViewProvider) {
+        return;
+      }
+      transcriptsViewProvider.setProjectFilter(projectId);
+      // Reveal the transcripts view so the user sees the filtered result
+      void vscode.commands.executeCommand('protokollTranscripts.focus');
+    }
+  );
+
   const filterByStatusCommand = vscode.commands.registerCommand(
     'protokoll.filterByStatus',
     async () => {
@@ -2173,6 +2185,7 @@ export async function activate(context: vscode.ExtensionContext) {
     addCompanyCommand,
     openEntityCommand,
     filterByProjectCommand,
+    applyProjectFilterCommand,
     filterByStatusCommand,
     sortTranscriptsCommand,
     startNewSessionCommand,

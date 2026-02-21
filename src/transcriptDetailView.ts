@@ -1914,18 +1914,21 @@ export class TranscriptDetailViewProvider {
         type: type.value,
         source: 'create-new',
         label: `$(plus) Create new ${type.value}: "${selectedText}"`,
-        description: 'Create and map to new entity'
+        description: 'Create and map to new entity',
+        alwaysShow: true
       });
       
-      // Add existing entities (first 5)
+      // Add existing entities matching the selected text (via name or sounds_like)
       try {
         const listResult = await this._client!.callTool(`protokoll_list_${type.plural}`, {
+          search: selectedText,
           limit: 5
-        }) as { success?: boolean; [key: string]: unknown };
+        }) as { [key: string]: unknown };
         
         const entityKey = type.plural;
-        if (listResult.success && listResult[entityKey]) {
-          for (const entity of listResult[entityKey] as Array<{ id: string; name: string }>) {
+        const entityList = listResult[entityKey] as Array<{ id: string; name: string }> | undefined;
+        if (Array.isArray(entityList)) {
+          for (const entity of entityList) {
             items.push({
               id: entity.id,
               name: entity.name,
@@ -1955,22 +1958,37 @@ export class TranscriptDetailViewProvider {
       if (searchTimeout) {
         clearTimeout(searchTimeout);
       }
-      
+
+      // Rebuild create-new items using typed value (or fall back to selectedText)
+      const createNewName = value.trim() || selectedText;
+      const updatedItems: EntityPickerItem[] = items.map(item => {
+        if (item.source === 'create-new' && item.type) {
+          return {
+            ...item,
+            name: createNewName,
+            label: `$(plus) Create new ${item.type}: "${createNewName}"`,
+            alwaysShow: true
+          };
+        }
+        return item;
+      });
+
       if (value.length > 2) {
         searchTimeout = setTimeout(async () => {
           // Search across all entity types
-          const searchItems: EntityPickerItem[] = [...items.filter(i => i.kind === vscode.QuickPickItemKind.Separator || i.source === 'create-new' || i.source === 'suggestion')];
+          const searchItems: EntityPickerItem[] = [...updatedItems.filter(i => i.kind === vscode.QuickPickItemKind.Separator || i.source === 'create-new' || i.source === 'suggestion')];
           
           for (const type of entityTypes) {
             try {
               const searchResult = await this._client!.callTool(`protokoll_list_${type.plural}`, {
                 search: value,
                 limit: 10
-              }) as { success?: boolean; [key: string]: unknown };
+              }) as { [key: string]: unknown };
               
               const entityKey = type.plural;
-              if (searchResult.success && searchResult[entityKey]) {
-                for (const entity of searchResult[entityKey] as Array<{ id: string; name: string }>) {
+              const entityList = searchResult[entityKey] as Array<{ id: string; name: string }> | undefined;
+              if (Array.isArray(entityList)) {
+                for (const entity of entityList) {
                   // Don't duplicate if already in suggestions
                   if (!searchItems.some(i => i.id === entity.id)) {
                     searchItems.push({
@@ -1991,9 +2009,14 @@ export class TranscriptDetailViewProvider {
           
           picker.items = searchItems;
         }, 300); // Debounce search
+        // Show updated create-new labels immediately while waiting for search results
+        picker.items = updatedItems;
       } else if (value.length === 0) {
         // Reset to original items
         picker.items = items;
+      } else {
+        // 1-2 chars: show updated create-new labels (VS Code filter handles the rest)
+        picker.items = updatedItems;
       }
     });
     
@@ -3568,7 +3591,7 @@ export class TranscriptDetailViewProvider {
     const updatedAt = transcript.updatedAt;
 
     // Get status and tasks from structured metadata
-    const status = metadata.status ?? transcript.status ?? 'reviewed';
+    const status = metadata.status ?? transcript.status ?? 'initial';
     const tasks = metadata.tasks ?? transcript.tasks ?? [];
     const openTasks = tasks.filter((t: { status: string }) => t.status === 'open');
 
@@ -4023,12 +4046,13 @@ export class TranscriptDetailViewProvider {
         .status-badge:hover {
             opacity: 0.9;
         }
-        .status-badge.initial { background-color: #6c757d; color: white; }
-        .status-badge.enhanced { background-color: #17a2b8; color: white; }
-        .status-badge.reviewed { background-color: #007bff; color: white; }
-        .status-badge.in_progress { background-color: #ffc107; color: #333; }
-        .status-badge.closed { background-color: #28a745; color: white; }
-        .status-badge.archived { background-color: #6c757d; color: white; }
+        .status-badge.initial { background-color: #17a2b8; color: white; }
+        .status-badge.enhanced { background-color: #007bff; color: white; }
+        .status-badge.reviewed { background-color: #28a745; color: white; }
+        .status-badge.in_progress { background-color: #fd7e14; color: white; }
+        .status-badge.open { background-color: #fd7e14; color: white; }
+        .status-badge.closed { background-color: #6f42c1; color: white; }
+        .status-badge.archived { background-color: #343a40; color: white; }
         /* Tasks section styles */
         .tasks-section {
             background-color: var(--vscode-editor-inactiveSelectionBackground);
@@ -4719,7 +4743,7 @@ export class TranscriptDetailViewProvider {
                 return;
             }
             
-            const currentText = display.textContent;
+            const currentText = originalTitle;
             
             // Use textarea for multi-line support
             const textarea = document.createElement('textarea');

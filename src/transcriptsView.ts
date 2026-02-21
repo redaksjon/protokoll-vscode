@@ -452,8 +452,7 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     
     // Apply status filters - only show transcripts with selected statuses
     filteredTranscripts = filteredTranscripts.filter(t => {
-      // Default status is 'reviewed' if not set
-      const transcriptStatus = t.status || 'reviewed';
+      const transcriptStatus = t.status || 'initial';
       return this.selectedStatusFilters.has(transcriptStatus);
     });
 
@@ -696,7 +695,7 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
     // Apply status filters - only show transcripts with selected statuses
     const filteredTranscripts = this.transcripts.filter(t => {
-      const transcriptStatus = t.status || 'reviewed';
+      const transcriptStatus = t.status || 'initial';
       return this.selectedStatusFilters.has(transcriptStatus);
     });
 
@@ -793,26 +792,25 @@ export class TranscriptItem extends vscode.TreeItem {
     } else {
       this.contextValue = 'transcript';
       
-      // Get status and use appropriate icon
-      const status = transcript?.status || 'reviewed';
+      // Get status and use appropriate icon (cast to string to handle legacy values like 'open')
+      const status: string = transcript?.status || 'initial';
       
-      // Show color-coded circles based on status (matching detail page colors)
-      // Detail page colors: initial=#6c757d, enhanced=#17a2b8, reviewed=#007bff, 
-      // in_progress=#ffc107, closed=#28a745, archived=#6c757d
+      // Show color-coded circles based on status — mirrors STATUS_COLORS in dashboardView.ts:
+      // initial=gray, enhanced=blue, reviewed=green, in_progress/open=orange, closed=purple, archived=gray
       if (status === 'initial') {
         this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
       } else if (status === 'enhanced') {
-        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.blue')); // Cyan/teal closest to blue
-      } else if (status === 'reviewed') {
         this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.blue'));
-      } else if (status === 'in_progress') {
-        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.yellow'));
-      } else if (status === 'closed') {
+      } else if (status === 'reviewed') {
         this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.green'));
+      } else if (status === 'in_progress' || status === 'open') {
+        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.orange'));
+      } else if (status === 'closed') {
+        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.purple'));
       } else if (status === 'archived') {
         this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
       } else {
-        // Fallback for unknown status
+        // Fallback for unknown/legacy status values
         this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
       }
       
