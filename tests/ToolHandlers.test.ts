@@ -277,12 +277,12 @@ describe('createDefaultHandlers', () => {
     expect(registry.getHandler('status')).toBeTruthy();
   });
 
-  it('should register all 47 tools', () => {
+  it('should register all 51 tools', () => {
     const registry = createDefaultHandlers();
     const tools = registry.getAllTools();
 
-    // We have 47 tools across 10 categories
-    expect(tools.length).toBe(47);
+    // We currently have 51 tools across 10 categories
+    expect(tools.length).toBe(51);
 
     // Verify some key tools are present
     expect(tools).toContain('protokoll_get_version');

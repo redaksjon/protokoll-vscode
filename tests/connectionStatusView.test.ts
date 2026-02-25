@@ -14,7 +14,7 @@ describe('ConnectionStatusViewProvider', () => {
     let mockContext: vscode.ExtensionContext;
 
     beforeEach(() => {
-        mockContext = new vscode.ExtensionContext();
+        mockContext = {} as vscode.ExtensionContext;
         provider = new ConnectionStatusViewProvider(mockContext);
         vi.clearAllMocks();
     });

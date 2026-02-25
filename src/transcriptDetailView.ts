@@ -36,6 +36,12 @@ interface SummaryConfig {
 }
 
 interface GeneratedSummary {
+  id: string;
+  title: string;
+  audience: string;
+  guidance: string;
+  stylePreset: SummaryConfig['stylePreset'];
+  styleLabel: string;
   content: string;
   generatedAt: string;
 }
@@ -56,6 +62,10 @@ interface IdentifyTasksResult {
   totalCandidates?: number;
   message?: string;
 }
+
+const SUMMARY_TOOL_CANDIDATES = [
+  'protokoll_summarize_transcript',
+];
 
 // Global map of temp file paths -> transcript info for save syncing
 const editableTranscriptFiles: Map<string, EditableTranscriptInfo> = new Map();
@@ -159,8 +169,8 @@ export class TranscriptDetailViewProvider {
   private _entityLastFetched: Map<string, Date> = new Map(); // Track when entities were last fetched
   private _transcriptLastFetched: Map<string, Date> = new Map(); // Track when transcripts were last fetched
   private _summaryConfigByTranscript: Map<string, SummaryConfig> = new Map();
-  private _generatedSummaryByTranscript: Map<string, GeneratedSummary> = new Map();
-  private _summaryHistoryByTranscript: Map<string, GeneratedSummary[]> = new Map();
+  private _activeSummaryIdByTranscript: Map<string, string> = new Map();
+  private _resolvedSummaryToolName: string | null = null;
   private _onTranscriptChanged?: (transcriptUri?: string, updates?: Partial<Transcript>) => void | Promise<void>;
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
@@ -487,6 +497,31 @@ export class TranscriptDetailViewProvider {
           case 'loadEnhancementLog':
             await this.handleLoadEnhancementLog(panel, message.transcriptPath);
             break;
+          case 'rejectCorrection': {
+            const correctionEntryId = Number(message.correctionEntryId);
+            if (!Number.isInteger(correctionEntryId) || correctionEntryId < 1) {
+              vscode.window.showErrorMessage('Invalid correction entry id');
+              break;
+            }
+            const activeTranscriptPath = message.transcriptPath || currentTranscript.transcript.path || currentTranscript.transcript.filename;
+            await this.handleRejectCorrection(activeTranscriptPath, correctionEntryId, transcriptUri);
+            break;
+          }
+          case 'requestRejectCorrection': {
+            const correctionEntryId = Number(message.correctionEntryId);
+            if (!Number.isInteger(correctionEntryId) || correctionEntryId < 1) {
+              vscode.window.showErrorMessage('Invalid correction entry id');
+              break;
+            }
+            const activeTranscriptPath = message.transcriptPath || currentTranscript.transcript.path || currentTranscript.transcript.filename;
+            await this.handleRejectCorrectionWithConfirmation(
+              panel,
+              activeTranscriptPath,
+              correctionEntryId,
+              transcriptUri
+            );
+            break;
+          }
           case 'refreshTranscript': {
             await this.refreshTranscript(transcriptUri);
             const refreshPanel = this._panels.get(transcriptUri);
@@ -515,6 +550,9 @@ export class TranscriptDetailViewProvider {
             break;
           case 'generateSummary':
             await this.handleGenerateSummary(message.transcriptPath, transcriptUri);
+            break;
+          case 'deleteSummary':
+            await this.handleDeleteSummary(message.transcriptPath, transcriptUri, message.summaryId);
             break;
         }
       },
@@ -577,7 +615,8 @@ export class TranscriptDetailViewProvider {
       return;
     }
 
-    const defaultTitle = `${transcript.title || transcript.filename} Summary`;
+    const existingConfig = this.getSummaryConfig(transcriptUri) || this.getDefaultSummaryConfig();
+    const defaultTitle = existingConfig.title || 'Summary';
     const titleInput = await vscode.window.showInputBox({
       title: 'Summary Setup',
       prompt: 'Summary title (optional)',
@@ -591,15 +630,10 @@ export class TranscriptDetailViewProvider {
 
     const audienceInput = await vscode.window.showInputBox({
       title: 'Summary Setup',
-      prompt: 'Who is the summary for?',
+      prompt: 'Who is the summary for? (optional)',
       placeHolder: 'e.g., Gerald Corson, Internal team, Project attendees',
+      value: existingConfig.audience,
       ignoreFocusOut: true,
-      validateInput: (value) => {
-        if (!value || !value.trim()) {
-          return 'Audience is required';
-        }
-        return null;
-      },
     });
     if (audienceInput === undefined) {
       return;
@@ -609,6 +643,7 @@ export class TranscriptDetailViewProvider {
       title: 'Summary Setup',
       prompt: 'Guidance note (optional)',
       placeHolder: 'e.g., Exclude internal reflections and sensitive personal notes',
+      value: existingConfig.guidance,
       ignoreFocusOut: true,
     });
     if (noteInput === undefined) {
@@ -641,13 +676,13 @@ export class TranscriptDetailViewProvider {
     }
 
     const summaryConfig: SummaryConfig = {
-      title: (titleInput || '').trim() || defaultTitle,
-      audience: audienceInput.trim(),
+      title: (titleInput || '').trim() || existingConfig.title || defaultTitle,
+      audience: (audienceInput || '').trim() || existingConfig.audience,
       guidance: (noteInput || '').trim(),
       stylePreset: stylePick.value as SummaryConfig['stylePreset'],
       styleLabel: stylePick.label,
     };
-    this._summaryConfigByTranscript.set(transcriptUri, summaryConfig);
+    this.setSummaryConfig(transcriptUri, summaryConfig);
 
     panel.webview.postMessage({
       command: 'summarySetupReady',
@@ -666,46 +701,106 @@ export class TranscriptDetailViewProvider {
       return;
     }
 
-    const summaryConfig = this._summaryConfigByTranscript.get(transcriptUri);
-    if (!summaryConfig) {
-      vscode.window.showWarningMessage('Configure Summary first.');
-      return;
+    const summaryConfig = this.getSummaryConfig(transcriptUri) || this.getDefaultSummaryConfig();
+    this.setSummaryConfig(transcriptUri, summaryConfig);
+
+    const panel = this._panels.get(transcriptUri);
+    if (panel) {
+      this._updatingTranscripts.add(transcriptUri);
+      this.showUpdateIndicator(panel, true);
     }
 
     try {
-      const result = await this._client.callTool('protokoll_summarize_transcript', {
+      const summaryToolName = await this.resolveSummaryToolName();
+      const result = await this._client.callTool(summaryToolName, {
         transcriptPath: this.convertToRelativePath(transcriptPath),
         audience: summaryConfig.audience,
         guidance: summaryConfig.guidance,
         stylePreset: summaryConfig.stylePreset,
         summaryTitle: summaryConfig.title,
-      }) as { summary?: string; content?: string; text?: string } | string;
+      }) as {
+        summary?: string;
+        content?: string;
+        text?: string;
+        summaryId?: string;
+        generatedAt?: string;
+      } | string;
 
       const summaryContent = typeof result === 'string'
         ? result
         : (result.summary || result.content || result.text || '').trim();
 
       if (!summaryContent) {
-        throw new Error('No summary text returned by protokoll_summarize_transcript');
+        throw new Error(`No summary text returned by ${summaryToolName}`);
       }
 
-      const existingSummary = this._generatedSummaryByTranscript.get(transcriptUri);
-      if (existingSummary) {
-        const history = this._summaryHistoryByTranscript.get(transcriptUri) || [];
-        this._summaryHistoryByTranscript.set(transcriptUri, [...history, existingSummary]);
+      if (typeof result !== 'string' && result.summaryId) {
+        this.setActiveSummaryId(transcriptUri, result.summaryId);
       }
-
-      this._generatedSummaryByTranscript.set(transcriptUri, {
-        content: summaryContent,
-        generatedAt: new Date().toISOString(),
-      });
 
       await this.refreshTranscript(transcriptUri);
       vscode.window.showInformationMessage('Summary generated.');
     } catch (error) {
+      if (panel) {
+        panel.webview.postMessage({
+          command: 'summaryGenerationFailed',
+        });
+      }
       vscode.window.showErrorMessage(
         `Failed to generate summary: ${error instanceof Error ? error.message : String(error)}`
       );
+    } finally {
+      if (panel) {
+        this._updatingTranscripts.delete(transcriptUri);
+        this.showUpdateIndicator(panel, false);
+      }
+    }
+  }
+
+  private async handleDeleteSummary(
+    transcriptPath: string,
+    transcriptUri: string,
+    summaryId: string
+  ): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    if (!summaryId) {
+      return;
+    }
+
+    const confirm = await vscode.window.showWarningMessage(
+      'Delete this summary?',
+      { modal: false },
+      'Delete'
+    );
+    if (confirm !== 'Delete') {
+      return;
+    }
+
+    const panel = this._panels.get(transcriptUri);
+    if (panel) {
+      this._updatingTranscripts.add(transcriptUri);
+      this.showUpdateIndicator(panel, true);
+    }
+    try {
+      await this._client.callTool('protokoll_delete_transcript_summary', {
+        transcriptPath: this.convertToRelativePath(transcriptPath),
+        summaryId,
+      });
+      await this.refreshTranscript(transcriptUri);
+      vscode.window.showInformationMessage('Summary deleted.');
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to delete summary: ${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      if (panel) {
+        this._updatingTranscripts.delete(transcriptUri);
+        this.showUpdateIndicator(panel, false);
+      }
     }
   }
 
@@ -738,6 +833,101 @@ export class TranscriptDetailViewProvider {
 
     // Fallback: return just the filename
     return pathParts[pathParts.length - 1] || absolutePath;
+  }
+
+  private canonicalizeTranscriptUri(uri: string): string {
+    if (!uri) {
+      return uri;
+    }
+    return uri.replace(/^protokoll:\/\/transcript\/\.\.\//, 'protokoll://transcript/');
+  }
+
+  private getDefaultSummaryConfig(): SummaryConfig {
+    return {
+      title: 'Summary',
+      audience: 'General audience',
+      guidance: '',
+      stylePreset: 'detailed',
+      styleLabel: 'Detailed summary',
+    };
+  }
+
+  private getSummaryConfig(transcriptUri: string): SummaryConfig | undefined {
+    return this._summaryConfigByTranscript.get(transcriptUri)
+      || this._summaryConfigByTranscript.get(this.canonicalizeTranscriptUri(transcriptUri));
+  }
+
+  private setSummaryConfig(transcriptUri: string, config: SummaryConfig): void {
+    const canonical = this.canonicalizeTranscriptUri(transcriptUri);
+    this._summaryConfigByTranscript.set(transcriptUri, config);
+    this._summaryConfigByTranscript.set(canonical, config);
+  }
+
+  private getActiveSummaryId(transcriptUri: string): string | undefined {
+    return this._activeSummaryIdByTranscript.get(transcriptUri)
+      || this._activeSummaryIdByTranscript.get(this.canonicalizeTranscriptUri(transcriptUri));
+  }
+
+  private async resolveSummaryToolName(): Promise<string> {
+    if (!this._client) {
+      throw new Error('MCP client not initialized');
+    }
+    if (this._resolvedSummaryToolName) {
+      return this._resolvedSummaryToolName;
+    }
+
+    const tools = await this._client.listTools();
+    const availableNames = new Set(tools.map((tool) => tool.name));
+    const resolved = SUMMARY_TOOL_CANDIDATES.find((candidate) => availableNames.has(candidate));
+    if (!resolved) {
+      const summaryLikeTools = tools
+        .map((tool) => tool.name)
+        .filter((name) => name.includes('summary') || name.includes('summarize'));
+      const discoveryHint = summaryLikeTools.length > 0
+        ? `Available summary-like tools: ${summaryLikeTools.join(', ')}`
+        : 'No summary-like tools were published by this MCP server.';
+      throw new Error(
+        `Missing summary tool. Expected one of: ${SUMMARY_TOOL_CANDIDATES.join(', ')}. ${discoveryHint}`
+      );
+    }
+
+    this._resolvedSummaryToolName = resolved;
+    return resolved;
+  }
+
+  private setActiveSummaryId(transcriptUri: string, summaryId: string): void {
+    const canonical = this.canonicalizeTranscriptUri(transcriptUri);
+    this._activeSummaryIdByTranscript.set(transcriptUri, summaryId);
+    this._activeSummaryIdByTranscript.set(canonical, summaryId);
+  }
+
+  private normalizePersistedSummaries(summaries: TranscriptContent['summaries']): GeneratedSummary[] {
+    if (!Array.isArray(summaries)) {
+      return [];
+    }
+    return summaries
+      .map((summary) => {
+        if (!summary || typeof summary !== 'object') {
+          return null;
+        }
+        const id = String(summary.id || '').trim();
+        const content = String(summary.content || '').trim();
+        if (!id || !content) {
+          return null;
+        }
+        return {
+          id,
+          title: String(summary.title || '').trim(),
+          audience: String(summary.audience || '').trim(),
+          guidance: String(summary.guidance || '').trim(),
+          stylePreset: (summary.stylePreset || 'detailed') as SummaryConfig['stylePreset'],
+          styleLabel: String(summary.styleLabel || '').trim() || 'Detailed summary',
+          content,
+          generatedAt: String(summary.generatedAt || '').trim() || new Date().toISOString(),
+        } satisfies GeneratedSummary;
+      })
+      .filter((summary): summary is GeneratedSummary => summary !== null)
+      .sort((a, b) => b.generatedAt.localeCompare(a.generatedAt));
   }
 
   private async handleChangeProject(transcript: Transcript, transcriptUri: string): Promise<void> {
@@ -1711,6 +1901,89 @@ export class TranscriptDetailViewProvider {
         command: 'enhancementLog',
         data: { entries: [], total: 0 },
       });
+    }
+  }
+
+  /**
+   * Reject a previously applied correction and refresh transcript content
+   */
+  private async handleRejectCorrectionWithConfirmation(
+    panel: vscode.WebviewPanel,
+    transcriptPath: string,
+    correctionEntryId: number,
+    transcriptUri: string
+  ): Promise<void> {
+    const confirmed = await vscode.window.showWarningMessage(
+      'Reject this correction and restore the original text?',
+      { modal: true },
+      'Reject'
+    );
+    if (confirmed !== 'Reject') {
+      panel.webview.postMessage({
+        command: 'rejectCorrectionDecision',
+        correctionEntryId,
+        approved: false,
+      });
+      return;
+    }
+
+    panel.webview.postMessage({
+      command: 'rejectCorrectionDecision',
+      correctionEntryId,
+      approved: true,
+    });
+
+    const success = await this.handleRejectCorrection(transcriptPath, correctionEntryId, transcriptUri);
+    if (!success) {
+      panel.webview.postMessage({
+        command: 'rejectCorrectionFailed',
+        correctionEntryId,
+      });
+    }
+  }
+
+  private async handleRejectCorrection(
+    transcriptPath: string,
+    correctionEntryId: number,
+    transcriptUri: string
+  ): Promise<boolean> {
+    if (!this._client) {
+      return false;
+    }
+
+    try {
+      const response = await this._client.callTool('protokoll_reject_correction', {
+        transcriptPath,
+        correctionEntryId,
+      }) as {
+        success?: boolean;
+        alreadyRejected?: boolean;
+        message?: string;
+      } | string;
+
+      if (typeof response === 'string') {
+        throw new Error(response);
+      }
+      if (!response.success) {
+        throw new Error(response.message || 'Failed to reject correction');
+      }
+
+      vscode.window.showInformationMessage(
+        response.message || 'Correction rejected and transcript updated'
+      );
+
+      await this.refreshTranscript(transcriptUri);
+      const refreshPanel = this._panels.get(transcriptUri);
+      if (refreshPanel) {
+        refreshPanel.webview.postMessage({ command: 'refreshComplete' });
+      }
+      return true;
+    } catch (error) {
+      console.error('Protokoll: Failed to reject correction', error);
+      vscode.window.showErrorMessage(
+        `Failed to reject correction: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return false;
     }
   }
 
@@ -4324,12 +4597,11 @@ export class TranscriptDetailViewProvider {
       : (['enhanced', 'reviewed', 'closed', 'archived'].includes(status) && transcriptText.trim().length > 0);
     const showEnhancedTab = !isManualNote || hasManualEnhancedContent;
     const hasOriginalTab = !!content.rawTranscript || isManualNote;
-    const summaryConfig = this._summaryConfigByTranscript.get(transcript.uri);
-    const generatedSummary = this._generatedSummaryByTranscript.get(transcript.uri);
-    const summaryHistoryCount = (this._summaryHistoryByTranscript.get(transcript.uri) || []).length;
-    const hasSummary = !!generatedSummary?.content?.trim();
-    const summaryText = generatedSummary?.content || '';
-    const summaryGeneratedAt = generatedSummary?.generatedAt || '';
+    const summaryConfig = this.getSummaryConfig(transcript.uri) || this.getDefaultSummaryConfig();
+    const summaries = this.normalizePersistedSummaries(content.summaries);
+    const hasSummary = summaries.length > 0;
+    const preferredSummaryId = this.getActiveSummaryId(transcript.uri);
+    const activeSummary = summaries.find(summary => summary.id === preferredSummaryId) || summaries[0];
     const summaryFeatureEnabled = vscode.workspace.getConfiguration('protokoll').get<boolean>('features.summaryEnabled', true);
     const initialTab: 'enhanced' | 'raw' | 'summary' = hasSummary
       ? 'summary'
@@ -4758,6 +5030,38 @@ export class TranscriptDetailViewProvider {
             font-size: 0.85em;
             color: var(--vscode-descriptionForeground);
         }
+        .enhancement-step-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-left: 12px;
+        }
+        .enhancement-reject-btn {
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            border-radius: 3px;
+            font-size: 0.8em;
+            padding: 3px 8px;
+            cursor: pointer;
+        }
+        .enhancement-reject-btn:hover {
+            background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .enhancement-reject-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        .enhancement-status-pill {
+            font-size: 0.75em;
+            font-weight: 600;
+            color: var(--vscode-testing-iconFailed);
+            border: 1px solid var(--vscode-testing-iconFailed);
+            border-radius: 999px;
+            padding: 2px 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
         .enhancement-step-details {
             margin-top: 8px;
             padding-top: 8px;
@@ -5183,6 +5487,106 @@ export class TranscriptDetailViewProvider {
         .button-secondary:hover {
             background-color: var(--vscode-button-secondaryHoverBackground);
         }
+        .summary-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .summary-layout {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-top: 10px;
+        }
+        .summary-list-panel {
+            min-width: 0;
+        }
+        .summary-detail-panel {
+            min-width: 0;
+        }
+        @media (min-width: 1100px) {
+            .summary-layout {
+                flex-direction: row;
+                align-items: flex-start;
+            }
+            .summary-list-panel {
+                width: 320px;
+                flex: 0 0 320px;
+            }
+            .summary-detail-panel {
+                flex: 1 1 auto;
+            }
+        }
+        .summary-item {
+            background-color: var(--vscode-editor-inactiveSelectionBackground);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 4px;
+            padding: 8px 34px 8px 10px;
+            cursor: pointer;
+            text-align: left;
+            width: 100%;
+            box-sizing: border-box;
+            position: relative;
+        }
+        .summary-item:hover {
+            border-color: var(--vscode-focusBorder);
+        }
+        .summary-item.active {
+            border-color: var(--vscode-textLink-foreground);
+            background-color: color-mix(in srgb, var(--vscode-textLink-foreground) 12%, var(--vscode-editor-inactiveSelectionBackground));
+        }
+        .summary-item-title {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        .summary-item-meta {
+            font-size: 0.85em;
+            color: var(--vscode-descriptionForeground);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .summary-item-guidance {
+            font-size: 0.85em;
+            color: var(--vscode-descriptionForeground);
+            margin-top: 6px;
+        }
+        .summary-item-delete {
+            position: absolute;
+            top: 6px;
+            right: 6px;
+            border: none;
+            background: transparent;
+            color: var(--vscode-descriptionForeground);
+            cursor: pointer;
+            font-size: 1.05em;
+            line-height: 1;
+            border-radius: 3px;
+            padding: 2px 5px;
+            opacity: 0.7;
+        }
+        .summary-item-delete:hover {
+            opacity: 1;
+            color: var(--vscode-errorForeground);
+            background-color: var(--vscode-inputValidation-errorBackground);
+        }
+        .summary-detail {
+            background-color: var(--vscode-editor-inactiveSelectionBackground);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 4px;
+            padding: 12px;
+        }
+        .summary-detail.hidden {
+            display: none;
+        }
+        .summary-detail-meta {
+            font-size: 0.85em;
+            color: var(--vscode-descriptionForeground);
+            margin-bottom: 10px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
         .error {
             color: var(--vscode-errorForeground);
             padding: 16px;
@@ -5412,10 +5816,9 @@ export class TranscriptDetailViewProvider {
     </div>
     <div class="transcript-content-wrapper">
         <div class="content-tabs">
-            ${showEnhancedTab ? `<button class="content-tab ${initialTab === 'enhanced' ? 'active' : ''}" id="enhanced-tab" onclick="switchTab('enhanced')">Enhanced</button>` : ''}
             <button class="content-tab ${hasOriginalTab ? (initialTab === 'raw' ? 'active' : '') : 'disabled'}" id="raw-tab" onclick="switchTab('raw')" ${hasOriginalTab ? '' : 'disabled'}>Original</button>
-            ${summaryFeatureEnabled ? `<button class="content-tab ${initialTab === 'summary' ? 'active' : ''}" id="summary-tab" onclick="switchTab('summary')">Summary</button>` : ''}
-            <button class="content-tab" id="enhancement-tab" onclick="switchTab('enhancement')">Enhancement</button>
+            ${showEnhancedTab ? `<button class="content-tab ${initialTab === 'enhanced' ? 'active' : ''}" id="enhanced-tab" onclick="switchTab('enhanced')">Enhanced</button>` : ''}
+            ${summaryFeatureEnabled ? `<button class="content-tab ${initialTab === 'summary' ? 'active' : ''}" id="summary-tab" onclick="switchTab('summary')">Summary (${summaries.length})</button>` : ''}
         </div>
         ${showEnhancedTab ? `
         <div class="tab-content ${initialTab === 'enhanced' ? 'active' : ''}" id="enhanced-content">
@@ -5427,6 +5830,12 @@ export class TranscriptDetailViewProvider {
                 ${this.markdownToHtml(transcriptText)}
             </div>
             <button class="create-entity-button" id="create-entity-btn" onclick="createEntityFromSelection()" title="Correct this text by creating new entity or mapping to existing">Correct Text</button>
+            <div style="margin-top: 18px;">
+                <div class="last-fetched">Enhancement history</div>
+                <div id="enhancement-log-container">
+                    <div class="loading">Loading enhancement log...</div>
+                </div>
+            </div>
         </div>
         ` : ''}
         ${hasOriginalTab ? `
@@ -5461,16 +5870,45 @@ export class TranscriptDetailViewProvider {
             ${hasSummary ? `
             <div style="display: flex; gap: 8px; margin-bottom: 12px;">
                 <button class="button button-secondary" id="summary-configure-btn" onclick="startSummarySetup()">Reconfigure</button>
-                <button class="button" id="summary-regenerate-btn" onclick="generateSummary()">Regenerate</button>
+                <button class="button" id="summary-regenerate-btn" onclick="generateSummary()">Generate New Summary</button>
             </div>
-            ${summaryGeneratedAt ? `<div class="last-fetched">Generated: ${this.escapeHtml(this.formatDate(summaryGeneratedAt))}</div>` : ''}
-            ${summaryHistoryCount > 0 ? `<div class="last-fetched">Previous summary versions kept: ${summaryHistoryCount}</div>` : ''}
-            <div class="summary-content-text">${this.markdownToHtml(summaryText)}</div>
+            <div class="last-fetched">Saved summaries: ${summaries.length}</div>
+            <div class="summary-layout">
+                <div class="summary-list-panel">
+                    <div class="summary-list" id="summary-list">
+                        ${summaries.map((summary) => `
+                            <div class="summary-item ${activeSummary && summary.id === activeSummary.id ? 'active' : ''}" data-summary-id="${this.escapeHtml(summary.id)}" onclick="selectSummary('${this.escapeHtml(summary.id)}')">
+                                <button type="button" class="summary-item-delete" title="Delete summary" onclick="deleteSummary('${this.escapeHtml(summary.id)}', event)">×</button>
+                                <div class="summary-item-title">${this.escapeHtml(summary.title || 'Untitled summary')}</div>
+                                <div class="summary-item-meta">
+                                    <span>Audience: ${this.escapeHtml(summary.audience || '(none)')}</span>
+                                    <span>Style: ${this.escapeHtml(summary.styleLabel || summary.stylePreset || 'detailed')}</span>
+                                    <span>Generated: ${this.escapeHtml(this.formatDate(summary.generatedAt))}</span>
+                                </div>
+                                <div class="summary-item-guidance">Guidance: ${this.escapeHtml(summary.guidance || '(none)')}</div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+                <div class="summary-detail-panel">
+                    ${summaries.map((summary) => `
+                        <div class="summary-detail ${activeSummary && summary.id === activeSummary.id ? '' : 'hidden'}" data-summary-detail-id="${this.escapeHtml(summary.id)}">
+                            <div class="summary-detail-meta">
+                                <span><strong>Title:</strong> ${this.escapeHtml(summary.title || 'Untitled summary')}</span>
+                                <span><strong>Audience:</strong> ${this.escapeHtml(summary.audience || '(none)')}</span>
+                                <span><strong>Generated:</strong> ${this.escapeHtml(this.formatDate(summary.generatedAt))}</span>
+                                <span><strong>Guidance:</strong> ${this.escapeHtml(summary.guidance || '(none)')}</span>
+                            </div>
+                            <div class="summary-content-text">${this.markdownToHtml(summary.content || '')}</div>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>
             ` : `
             <div class="summary-empty-state" id="summary-empty-state">
                 <h3>No summary yet</h3>
                 <p id="summary-setup-description">Generate a summary to create a short, audience-aware overview of this note.</p>
-                <div class="summary-setup-preview" id="summary-setup-preview" style="${summaryConfig ? '' : 'display: none;'}">
+                <div class="summary-setup-preview" id="summary-setup-preview">
                     <div class="summary-setup-row"><span class="summary-setup-label">Title:</span><span id="summary-setup-title">${this.escapeHtml(summaryConfig?.title || '')}</span></div>
                     <div class="summary-setup-row"><span class="summary-setup-label">Audience:</span><span id="summary-setup-audience">${this.escapeHtml(summaryConfig?.audience || '')}</span></div>
                     <div class="summary-setup-row"><span class="summary-setup-label">Style:</span><span id="summary-setup-style">${this.escapeHtml(summaryConfig?.styleLabel || '')}</span></div>
@@ -5478,16 +5916,11 @@ export class TranscriptDetailViewProvider {
                 </div>
                 <div style="display: flex; gap: 8px; margin-top: 8px;">
                     <button class="button button-secondary" id="summary-configure-btn" onclick="startSummarySetup()">Configure Summary</button>
-                    <button class="button" id="summary-generate-btn" onclick="generateSummary()" ${summaryConfig ? '' : 'disabled'}>Generate Summary</button>
+                    <button class="button" id="summary-generate-btn" onclick="generateSummary()">Generate Summary</button>
                 </div>
             </div>
             `}
         </div>` : ''}
-        <div class="tab-content" id="enhancement-content">
-            <div id="enhancement-log-container">
-                <div class="loading">Loading enhancement log...</div>
-            </div>
-        </div>
     </div>
     ${this.renderEntityReferences(entityReferences)}
     <script>
@@ -5512,6 +5945,10 @@ export class TranscriptDetailViewProvider {
         let isEditingEntityReferences = false;
         let isSavingEntityReferences = false;
         let entityReferencesState = normalizeEntityReferences(initialEntityReferences);
+        const persistedViewState = vscode.getState() || {};
+        const persistedTabName = typeof persistedViewState.activeTabName === 'string'
+            ? persistedViewState.activeTabName
+            : '';
         let activeTabName = ${JSON.stringify(initialTab)};
         let originalDraft = originalEditorInitialText;
         let lastSavedOriginal = originalEditorInitialText;
@@ -5812,6 +6249,10 @@ export class TranscriptDetailViewProvider {
 
         function switchTab(tabName) {
             if (tabName === activeTabName) {
+                vscode.setState({ activeTabName: tabName });
+                if (tabName === 'enhanced') {
+                    ensureEnhancementLogLoaded();
+                }
                 return;
             }
 
@@ -5837,12 +6278,47 @@ export class TranscriptDetailViewProvider {
                 activeContent.classList.add('active');
             }
             activeTabName = tabName;
+            vscode.setState({ activeTabName: tabName });
             
             // Lazy load enhancement log when tab is first opened
-            if (tabName === 'enhancement' && !enhancementLogLoaded) {
-                loadEnhancementLog();
-                enhancementLogLoaded = true;
+            if (tabName === 'enhanced') {
+                ensureEnhancementLogLoaded();
             }
+        }
+
+        function ensureEnhancementLogLoaded() {
+            if (!showEnhancedTab || enhancementLogLoaded) {
+                return;
+            }
+            const enhancementContainer = document.getElementById('enhancement-log-container');
+            if (!enhancementContainer) {
+                return;
+            }
+            loadEnhancementLog();
+            enhancementLogLoaded = true;
+        }
+
+        function isTabAvailable(tabName) {
+            const tab = document.getElementById(tabName + '-tab');
+            return !!(tab && !tab.disabled);
+        }
+
+        function restoreActiveTabPreference() {
+            if (persistedTabName && isTabAvailable(persistedTabName)) {
+                switchTab(persistedTabName);
+                if (persistedTabName === 'enhanced') {
+                    ensureEnhancementLogLoaded();
+                }
+                return;
+            }
+            if (isManualNote && isTabAvailable('raw') && activeTabName !== 'raw') {
+                switchTab('raw');
+                return;
+            }
+            if (activeTabName === 'enhanced') {
+                ensureEnhancementLogLoaded();
+            }
+            vscode.setState({ activeTabName });
         }
 
         function loadEnhancementLog() {
@@ -5892,6 +6368,13 @@ export class TranscriptDetailViewProvider {
                 container.innerHTML = '<div class="empty-state">No enhancement data available for this transcript</div>';
                 return;
             }
+
+            const rejectedCorrectionEntryIds = new Set(
+                data.entries
+                    .filter(entry => entry.action === 'correction_rejected')
+                    .map(entry => Number(entry.details?.correctionEntryId))
+                    .filter(id => Number.isInteger(id) && id > 0)
+            );
             
             // Group entries by phase
             const byPhase = {
@@ -5926,15 +6409,27 @@ export class TranscriptDetailViewProvider {
                 entries.forEach(entry => {
                     const timestamp = new Date(entry.timestamp).toLocaleTimeString();
                     const detailsJson = entry.details ? JSON.stringify(entry.details, null, 2) : null;
+                    const isCorrectionApplied = entry.action === 'correction_applied';
+                    const correctionEntryId = Number(entry.id);
+                    const correctionIsRejected = isCorrectionApplied && rejectedCorrectionEntryIds.has(correctionEntryId);
+                    const stepId = encodeURIComponent(String(entry.id));
+                    const correctionControls = isCorrectionApplied
+                        ? (correctionIsRejected
+                            ? '<span class="enhancement-status-pill">Rejected</span>'
+                            : '<button type="button" class="enhancement-reject-btn" data-correction-entry-id="' + escapeHtml(String(entry.id)) + '" data-default-label="Reject Correction">Reject Correction</button>')
+                        : '';
                     
                     html += \`
                         <div class="enhancement-step">
-                            <div class="enhancement-step-header" onclick="toggleStepDetails(\${entry.id})">
+                            <div class="enhancement-step-header" data-step-id="\${stepId}">
                                 <span class="enhancement-step-action">\${escapeHtml(entry.action)}</span>
-                                <span class="enhancement-step-timestamp">\${timestamp}</span>
+                                <div class="enhancement-step-controls">
+                                    \${correctionControls}
+                                    <span class="enhancement-step-timestamp">\${timestamp}</span>
+                                </div>
                             </div>
                             \${detailsJson ? \`
-                            <div class="enhancement-step-details" id="step-details-\${entry.id}">
+                            <div class="enhancement-step-details" id="step-details-\${stepId}">
                                 <pre>\${escapeHtml(detailsJson)}</pre>
                             </div>
                             \` : ''}
@@ -5947,6 +6442,7 @@ export class TranscriptDetailViewProvider {
             
             html += '</div>';
             container.innerHTML = html;
+            bindEnhancementLogInteractions(container);
         }
         
         function toggleStepDetails(stepId) {
@@ -5954,6 +6450,74 @@ export class TranscriptDetailViewProvider {
             if (details) {
                 details.classList.toggle('expanded');
             }
+        }
+
+        function toggleStepDetailsFromHeader(headerElement) {
+            if (!headerElement) {
+                return;
+            }
+            const stepId = headerElement.getAttribute('data-step-id');
+            if (!stepId) {
+                return;
+            }
+            toggleStepDetails(stepId);
+        }
+
+        function setRejectCorrectionButtonState(correctionEntryId, nextLabel, disabled) {
+            const safeId = Number(correctionEntryId);
+            if (!Number.isInteger(safeId) || safeId < 1) {
+                return;
+            }
+            const selector = '.enhancement-reject-btn[data-correction-entry-id="' + String(safeId) + '"]';
+            const button = document.querySelector(selector);
+            if (!button) {
+                return;
+            }
+            const fallbackLabel = button.getAttribute('data-default-label') || 'Reject Correction';
+            button.textContent = nextLabel || fallbackLabel;
+            button.disabled = !!disabled;
+        }
+
+        function rejectCorrection(triggerElement, clickEvent) {
+            if (clickEvent) {
+                clickEvent.preventDefault();
+                clickEvent.stopPropagation();
+            }
+            const rawCorrectionEntryId = triggerElement && triggerElement.getAttribute
+                ? triggerElement.getAttribute('data-correction-entry-id')
+                : '';
+            const correctionEntryId = Number(rawCorrectionEntryId);
+            if (!Number.isInteger(correctionEntryId) || correctionEntryId < 1) {
+                console.error('Invalid correction entry id', rawCorrectionEntryId);
+                return false;
+            }
+            setRejectCorrectionButtonState(correctionEntryId, 'Confirm in VS Code...', true);
+
+            vscode.postMessage({
+                command: 'requestRejectCorrection',
+                transcriptPath: transcriptPath,
+                correctionEntryId: correctionEntryId
+            });
+            return false;
+        }
+
+        function bindEnhancementLogInteractions(container) {
+            if (!container) {
+                return;
+            }
+            const headers = container.querySelectorAll('.enhancement-step-header');
+            headers.forEach(header => {
+                header.addEventListener('click', () => {
+                    toggleStepDetailsFromHeader(header);
+                });
+            });
+
+            const rejectButtons = container.querySelectorAll('.enhancement-reject-btn');
+            rejectButtons.forEach(button => {
+                button.addEventListener('click', (event) => {
+                    rejectCorrection(button, event);
+                });
+            });
         }
         
         function escapeHtml(text) {
@@ -5973,6 +6537,16 @@ export class TranscriptDetailViewProvider {
                 case 'summarySetupReady':
                     applySummarySetup(message.summaryConfig || {});
                     switchTab('summary');
+                    break;
+                case 'rejectCorrectionDecision':
+                    if (message.approved) {
+                        setRejectCorrectionButtonState(message.correctionEntryId, 'Rejecting...', true);
+                    } else {
+                        setRejectCorrectionButtonState(message.correctionEntryId, '', false);
+                    }
+                    break;
+                case 'rejectCorrectionFailed':
+                    setRejectCorrectionButtonState(message.correctionEntryId, '', false);
                     break;
             }
         });
@@ -6040,10 +6614,56 @@ export class TranscriptDetailViewProvider {
         }
 
         function generateSummary() {
+            const generateBtn = document.getElementById('summary-generate-btn') || document.getElementById('summary-regenerate-btn');
+            if (generateBtn) {
+                generateBtn.disabled = true;
+                generateBtn.dataset.originalText = generateBtn.dataset.originalText || generateBtn.textContent;
+                generateBtn.textContent = 'Generating...';
+            }
             vscode.postMessage({
                 command: 'generateSummary',
                 transcriptPath: transcriptPath,
                 transcriptUri: transcriptUri
+            });
+        }
+
+        function deleteSummary(summaryId, event) {
+            if (event) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+            if (!summaryId) {
+                return;
+            }
+            vscode.postMessage({
+                command: 'deleteSummary',
+                transcriptPath: transcriptPath,
+                transcriptUri: transcriptUri,
+                summaryId: summaryId
+            });
+        }
+
+        function selectSummary(summaryId) {
+            if (!summaryId) {
+                return;
+            }
+
+            const items = document.querySelectorAll('.summary-item');
+            items.forEach(item => {
+                if (item.dataset.summaryId === summaryId) {
+                    item.classList.add('active');
+                } else {
+                    item.classList.remove('active');
+                }
+            });
+
+            const details = document.querySelectorAll('.summary-detail');
+            details.forEach(detail => {
+                if (detail.dataset.summaryDetailId === summaryId) {
+                    detail.classList.remove('hidden');
+                } else {
+                    detail.classList.add('hidden');
+                }
             });
         }
 
@@ -6325,6 +6945,12 @@ export class TranscriptDetailViewProvider {
                         indicator.classList.remove('show');
                     }
                 }
+            } else if (message.command === 'summaryGenerationFailed') {
+                const generateBtn = document.getElementById('summary-generate-btn') || document.getElementById('summary-regenerate-btn');
+                if (generateBtn) {
+                    generateBtn.disabled = false;
+                    generateBtn.textContent = generateBtn.dataset.originalText || 'Generate Summary';
+                }
             } else if (message.command === 'saveFailed') {
                 const saveBtn = document.getElementById('save-original-btn');
                 if (saveBtn) {
@@ -6387,8 +7013,8 @@ export class TranscriptDetailViewProvider {
         document.addEventListener('DOMContentLoaded', () => {
             setupRefreshButton();
             setupOriginalEditor();
-            if (isManualNote) {
-                switchTab('raw');
+            restoreActiveTabPreference();
+            if (isManualNote && activeTabName === 'raw') {
                 const editor = document.getElementById('original-editor-input');
                 if (editor) {
                     setTimeout(() => editor.focus(), 0);

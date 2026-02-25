@@ -115,6 +115,16 @@ export interface TranscriptContent {
     duration?: number;
     transcribedAt?: string;
   };
+  summaries?: Array<{
+    id: string;
+    title: string;
+    audience: string;
+    guidance: string;
+    stylePreset: 'quick_bullets' | 'detailed' | 'attendee_facing' | string;
+    styleLabel?: string;
+    content: string;
+    generatedAt: string;
+  }>;
 }
 
 export interface JsonRpcRequest {

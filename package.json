@@ -530,6 +530,7 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
+    "typecheck:tests": "tsc --noEmit -p tsconfig.tests.json",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
     "lint:fix": "eslint src --ext ts --fix",
@@ -539,7 +540,7 @@
     "test:watch": "NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' vitest watch",
     "build": "npm run lint && npm run compile",
     "clean": "rm -rf out",
-    "precommit": "npm run lint && npm run build && npm run test:fast",
+    "precommit": "npm run lint && npm run build && npm run typecheck:tests && npm run test:fast",
     "prepublishOnly": "npm run clean && npm run build",
     "package": "vsce package",
     "publish": "npm run build && npm run package",

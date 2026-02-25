@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import * as vscode from 'vscode';
 import { TranscriptDetailViewProvider } from '../src/transcriptDetailView';
 import { McpClient } from '../src/mcpClient';
-import type { Transcript, TranscriptContent } from '../src/types';
+import type { Transcript, TranscriptContent, McpResourceResponse } from '../src/types';
 
 describe('TranscriptDetailViewProvider', () => {
     let provider: TranscriptDetailViewProvider;
@@ -121,6 +121,31 @@ Content here.`;
             expect(html).toContain('id="summary-content"');
             expect(html).toContain('id="summary-generate-btn"');
             expect(html).toContain('Identify Tasks');
+        });
+
+        it('should use sandbox-safe reject correction flow in webview script', () => {
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                filename: 'test.md',
+                date: '2026-01-31',
+                title: 'Test Transcript',
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                title: 'Test Transcript',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test Transcript\n\nContent here.',
+            };
+
+            const html = provider.getWebviewContent(transcript, content);
+            expect(html).toContain("command: 'requestRejectCorrection'");
+            expect(html).not.toContain("window.confirm('Reject this correction and restore the original text?')");
         });
 
         it('should handle transcript without title', () => {
@@ -399,7 +424,7 @@ Content here.`;
         });
 
         it('should handle refresh when client is not set', async () => {
-            provider.setClient(null);
+            provider.setClient(null as any);
             
             await expect(provider.refreshTranscript('protokoll://transcript/test.md')).resolves.not.toThrow();
         });
@@ -583,8 +608,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
             };
 
             vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
@@ -616,8 +646,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
             };
 
             vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
@@ -649,8 +684,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
             };
 
             vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
@@ -768,7 +808,7 @@ Content here.`;
                 metadata: {
                     date: '2026-01-31',
                     tags: [],
-                    tasks: [{ id: 'task-1', description: 'Send proposal', status: 'open' }],
+                    tasks: [{ id: 'task-1', description: 'Send proposal', status: 'open', created: '2026-01-31T00:00:00.000Z' }],
                 },
                 content: '# Test',
             };
@@ -827,11 +867,16 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
             };
 
-            const entityContent: TranscriptContent = {
+            const entityContent: McpResourceResponse = {
                 uri: 'protokoll://entity/person/john-doe',
                 mimeType: 'text/markdown',
                 text: 'name: John Doe\nid: john-doe',
@@ -853,6 +898,267 @@ Content here.`;
             expect(mockClient.readResource).toHaveBeenCalled();
         });
 
+        it('should handle rejectCorrection message', async () => {
+            provider.setClient(mockClient);
+
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                filename: 'test.md',
+                date: '2026-01-31',
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
+            };
+
+            vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
+            const callToolSpy = vi.spyOn(mockClient, 'callTool').mockResolvedValue({
+                success: true,
+                message: 'Correction rejected',
+            });
+            const refreshSpy = vi.spyOn(provider, 'refreshTranscript');
+
+            await provider.showTranscript('protokoll://transcript/test.md', transcript);
+
+            if (messageHandler) {
+                await messageHandler({
+                    command: 'rejectCorrection',
+                    transcriptPath: '/path/to/test.md',
+                    correctionEntryId: 42,
+                });
+            }
+
+            expect(callToolSpy).toHaveBeenCalledWith(
+                'protokoll_reject_correction',
+                expect.objectContaining({
+                    transcriptPath: '/path/to/test.md',
+                    correctionEntryId: 42,
+                })
+            );
+            expect(refreshSpy).toHaveBeenCalledWith('protokoll://transcript/test.md');
+        });
+
+        it('should resolve a registered summary tool before generateSummary', async () => {
+            provider.setClient(mockClient);
+
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                filename: 'test.md',
+                date: '2026-01-31',
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
+            };
+
+            vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
+            const listToolsSpy = vi.spyOn(mockClient, 'listTools').mockResolvedValue([
+                {
+                    name: 'protokoll_summarize_transcript',
+                    description: 'Summarize transcript',
+                    inputSchema: { type: 'object', properties: {} },
+                },
+            ]);
+            const callToolSpy = vi.spyOn(mockClient, 'callTool').mockImplementation(async (toolName: string) => {
+                if (toolName === 'protokoll_summarize_transcript') {
+                    return {
+                        summary: '# Summary',
+                        summaryId: 'summary-1',
+                    };
+                }
+                return {};
+            });
+
+            await provider.showTranscript('protokoll://transcript/test.md', transcript);
+
+            if (messageHandler) {
+                await messageHandler({
+                    command: 'generateSummary',
+                    transcriptPath: '/path/to/test.md',
+                });
+            }
+
+            expect(listToolsSpy).toHaveBeenCalled();
+            expect(callToolSpy).toHaveBeenCalledWith(
+                'protokoll_summarize_transcript',
+                expect.objectContaining({
+                    transcriptPath: 'test.md',
+                })
+            );
+        });
+
+        it('should fail generateSummary when no summary tool is published', async () => {
+            provider.setClient(mockClient);
+
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                filename: 'test.md',
+                date: '2026-01-31',
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
+            };
+
+            vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
+            vi.spyOn(mockClient, 'listTools').mockResolvedValue([
+                {
+                    name: 'protokoll_read_transcript',
+                    description: 'Read transcript',
+                    inputSchema: { type: 'object', properties: {} },
+                },
+            ]);
+            const callToolSpy = vi.spyOn(mockClient, 'callTool').mockResolvedValue({});
+            const showErrorSpy = vi.spyOn(vscode.window, 'showErrorMessage');
+
+            await provider.showTranscript('protokoll://transcript/test.md', transcript);
+
+            if (messageHandler) {
+                await messageHandler({
+                    command: 'generateSummary',
+                    transcriptPath: '/path/to/test.md',
+                });
+            }
+
+            expect(callToolSpy).not.toHaveBeenCalledWith(
+                'protokoll_summarize_transcript',
+                expect.anything()
+            );
+            expect(mockPanel.webview.postMessage).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    command: 'summaryGenerationFailed',
+                })
+            );
+            expect(showErrorSpy).toHaveBeenCalled();
+        });
+
+        it('should confirm rejectCorrection through VS Code warning flow', async () => {
+            provider.setClient(mockClient);
+
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                filename: 'test.md',
+                date: '2026-01-31',
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
+            };
+
+            vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
+            const callToolSpy = vi.spyOn(mockClient, 'callTool').mockResolvedValue({
+                success: true,
+                message: 'Correction rejected',
+            });
+            const warningSpy = vi.spyOn(vscode.window, 'showWarningMessage').mockResolvedValue('Reject' as any);
+
+            await provider.showTranscript('protokoll://transcript/test.md', transcript);
+
+            if (messageHandler) {
+                await messageHandler({
+                    command: 'requestRejectCorrection',
+                    transcriptPath: '/path/to/test.md',
+                    correctionEntryId: 42,
+                });
+            }
+
+            expect(warningSpy).toHaveBeenCalledWith(
+                'Reject this correction and restore the original text?',
+                { modal: true },
+                'Reject'
+            );
+            expect(callToolSpy).toHaveBeenCalledWith(
+                'protokoll_reject_correction',
+                expect.objectContaining({
+                    transcriptPath: '/path/to/test.md',
+                    correctionEntryId: 42,
+                })
+            );
+        });
+
+        it('should cancel rejectCorrection when VS Code confirmation is dismissed', async () => {
+            provider.setClient(mockClient);
+
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                filename: 'test.md',
+                date: '2026-01-31',
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
+            };
+
+            vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
+            const callToolSpy = vi.spyOn(mockClient, 'callTool').mockResolvedValue({
+                success: true,
+                message: 'Correction rejected',
+            });
+            vi.spyOn(vscode.window, 'showWarningMessage').mockResolvedValue(undefined);
+
+            await provider.showTranscript('protokoll://transcript/test.md', transcript);
+
+            if (messageHandler) {
+                await messageHandler({
+                    command: 'requestRejectCorrection',
+                    transcriptPath: '/path/to/test.md',
+                    correctionEntryId: 42,
+                });
+            }
+
+            expect(callToolSpy).not.toHaveBeenCalledWith(
+                'protokoll_reject_correction',
+                expect.anything()
+            );
+            expect(mockPanel.webview.postMessage).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    command: 'rejectCorrectionDecision',
+                    correctionEntryId: 42,
+                    approved: false,
+                })
+            );
+        });
+
         it('should handle errors in message handlers', async () => {
             provider.setClient(mockClient);
             
@@ -865,8 +1171,13 @@ Content here.`;
 
             const content: TranscriptContent = {
                 uri: 'protokoll://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: '# Test',
             };
 
             vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
