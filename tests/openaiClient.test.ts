@@ -125,8 +125,8 @@ describe('OpenAIClient', () => {
       const tools = await client.discoverTools();
 
       expect(tools).toHaveLength(2);
-      expect(tools[0].function.name).toBe('tool1');
-      expect(tools[1].function.name).toBe('tool2');
+      expect((tools[0] as any).function?.name).toBe('tool1');
+      expect((tools[1] as any).function?.name).toBe('tool2');
     });
   });
 
@@ -152,7 +152,7 @@ describe('OpenAIClient', () => {
       const tools = client.getTools();
 
       expect(tools).toHaveLength(1);
-      expect(tools[0].function.name).toBe('test_tool');
+      expect((tools[0] as any).function?.name).toBe('test_tool');
     });
   });
 

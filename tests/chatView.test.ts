@@ -16,7 +16,7 @@ describe('ChatViewProvider', () => {
   let provider: ChatViewProvider;
   let mockExtensionUri: vscode.Uri;
   let mockClient: McpClient;
-  let mockOpenAIClient: OpenAIClient;
+  let mockOpenAIClient: any;
 
   beforeEach(() => {
     mockExtensionUri = vscode.Uri.file('/test/extension');

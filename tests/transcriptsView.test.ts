@@ -9,13 +9,49 @@ import { McpClient } from '../src/mcpClient';
 import type { Transcript, TranscriptsListResponse } from '../src/types';
 import { mockHttpRequest } from './helpers/httpMock';
 
+function createMockExtensionContext(): vscode.ExtensionContext {
+    const workspaceStateData = new Map<string, unknown>();
+    const globalStateData = new Map<string, unknown>();
+
+    return {
+        workspaceState: {
+            get: <T>(key: string, defaultValue?: T): T | undefined => {
+                if (workspaceStateData.has(key)) {
+                    return workspaceStateData.get(key) as T;
+                }
+                return defaultValue;
+            },
+            update: (key: string, value: unknown) => {
+                workspaceStateData.set(key, value);
+                return Promise.resolve();
+            },
+            keys: (): readonly string[] => Array.from(workspaceStateData.keys()),
+        },
+        globalState: {
+            get: <T>(key: string, defaultValue?: T): T | undefined => {
+                if (globalStateData.has(key)) {
+                    return globalStateData.get(key) as T;
+                }
+                return defaultValue;
+            },
+            update: (key: string, value: unknown) => {
+                globalStateData.set(key, value);
+                return Promise.resolve();
+            },
+            setKeysForSync: () => {},
+            keys: (): readonly string[] => Array.from(globalStateData.keys()),
+        },
+        subscriptions: [],
+    } as unknown as vscode.ExtensionContext;
+}
+
 describe('TranscriptsViewProvider', () => {
     let provider: TranscriptsViewProvider;
     let mockContext: vscode.ExtensionContext;
     let mockClient: McpClient;
 
     beforeEach(() => {
-        mockContext = new vscode.ExtensionContext();
+        mockContext = createMockExtensionContext();
         provider = new TranscriptsViewProvider(mockContext);
         mockClient = new McpClient('http://localhost:3001');
         vi.clearAllMocks();
@@ -249,7 +285,7 @@ describe('TranscriptsViewProvider', () => {
                 }),
             });
 
-            await provider.refresh('/test/dir');
+            await provider.refresh();
             // Should complete without error
             expect(provider).toBeDefined();
         });
@@ -266,7 +302,7 @@ describe('TranscriptsViewProvider', () => {
             const showErrorMessage = vi.fn();
             (vscode.window.showErrorMessage as any) = showErrorMessage;
 
-            await provider.refresh('/test/dir');
+            await provider.refresh();
             
             expect(showErrorMessage).toHaveBeenCalled();
         });
@@ -358,7 +394,7 @@ describe('TranscriptsViewProvider', () => {
                 }),
             });
 
-            await provider.refresh('/test');
+            await provider.refresh();
             const children = await provider.getChildren();
             
             expect(children.length).toBeGreaterThan(0);
@@ -408,7 +444,7 @@ describe('TranscriptsViewProvider', () => {
                 }),
             });
 
-            await provider.refresh('/test');
+            await provider.refresh();
             const dayItems = await provider.getChildren();
             const dayItem = dayItems.find(item => item.uri === 'day:2026-01-31');
             
@@ -523,7 +559,7 @@ describe('TranscriptsViewProvider', () => {
                 }),
             });
 
-            await provider.refresh('/test');
+            await provider.refresh();
             const yearItems = await provider.getChildren();
             const yearItem = yearItems.find(item => item.uri === 'year:2026');
             
@@ -616,5 +652,51 @@ describe('TranscriptItem', () => {
         );
 
         expect(item.iconPath).toBeDefined();
+    });
+
+    it('should show note icon for manual note items', () => {
+        const transcript: Transcript = {
+            uri: 'protokoll://transcript/note.md',
+            path: '/path/to/note.md',
+            filename: 'note.md',
+            date: '2026-01-31',
+            contentType: 'manual_note',
+            status: 'initial',
+        };
+
+        const item = new TranscriptItem(
+            'Manual Note',
+            'protokoll://transcript/note.md',
+            vscode.TreeItemCollapsibleState.None,
+            undefined,
+            transcript,
+            'transcript'
+        );
+
+        expect(item.iconPath).toBeInstanceOf(vscode.ThemeIcon);
+        expect((item.iconPath as vscode.ThemeIcon).id).toBe('note');
+    });
+
+    it('should keep status circle icon for audio transcripts', () => {
+        const transcript: Transcript = {
+            uri: 'protokoll://transcript/audio.md',
+            path: '/path/to/audio.md',
+            filename: 'audio.md',
+            date: '2026-01-31',
+            contentType: 'audio_transcript',
+            status: 'enhanced',
+        };
+
+        const item = new TranscriptItem(
+            'Audio Transcript',
+            'protokoll://transcript/audio.md',
+            vscode.TreeItemCollapsibleState.None,
+            undefined,
+            transcript,
+            'transcript'
+        );
+
+        expect(item.iconPath).toBeInstanceOf(vscode.ThemeIcon);
+        expect((item.iconPath as vscode.ThemeIcon).id).toBe('circle-filled');
     });
 });

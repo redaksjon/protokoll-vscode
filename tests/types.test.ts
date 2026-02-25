@@ -100,13 +100,17 @@ describe('types', () => {
         it('should have required fields', () => {
             const content: TranscriptContent = {
                 uri: 'redaksjon://transcript/test.md',
-                mimeType: 'text/markdown',
-                text: '# Test Transcript\n\nContent here.',
+                path: 'test.md',
+                title: 'Test Transcript',
+                metadata: {
+                    tags: [],
+                },
+                content: '# Test Transcript\n\nContent here.',
             };
             
             expect(content.uri).toBe('redaksjon://transcript/test.md');
-            expect(content.mimeType).toBe('text/markdown');
-            expect(content.text).toContain('Test Transcript');
+            expect(content.title).toBe('Test Transcript');
+            expect(content.content).toContain('Test Transcript');
         });
     });
 

@@ -79,7 +79,7 @@ describe('logger', () => {
       log('test message');
       
       expect(mockOutputChannel.appendLine).toHaveBeenCalled();
-      const loggedMessage = mockOutputChannel.appendLine.mock.calls[0][0];
+      const loggedMessage = (mockOutputChannel.appendLine as any).mock.calls[0][0];
       expect(loggedMessage).toContain('test message');
     });
 

@@ -2,7 +2,7 @@
   "name": "protokoll-vscode",
   "displayName": "Protokoll",
   "description": "VS Code extension for viewing Protokoll transcripts and entities via HTTP MCP server",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/redaksjon/protokoll-vscode.git"
@@ -71,7 +71,7 @@
       },
       {
         "command": "protokoll.startNewSession",
-        "title": "New Transcript",
+        "title": "New Item",
         "icon": "$(add)",
         "category": "Protokoll"
       },
@@ -98,6 +98,11 @@
       {
         "command": "protokoll.changeSelectedTranscriptsStatus",
         "title": "Change Selected Status",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.identifyTasksInTranscript",
+        "title": "Identify Tasks in Transcript",
         "category": "Protokoll"
       },
       {
@@ -450,6 +455,16 @@
           "command": "protokoll.changeSelectedTranscriptsStatus",
           "when": "view == protokollTranscripts",
           "group": "z_commands"
+        },
+        {
+          "command": "protokoll.identifyTasksInTranscript",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "z_commands"
+        },
+        {
+          "command": "protokoll.identifyTasksInTranscript",
+          "when": "view == protokollTranscripts",
+          "group": "z_commands"
         }
       ]
     },
@@ -493,6 +508,21 @@
           "type": "boolean",
           "default": true,
           "description": "Automatically open the Protokoll Dashboard when the extension activates."
+        },
+        "protokoll.features.summaryEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the experimental Summary tab in transcript detail views."
+        },
+        "protokoll.tasks.identify.approveAllDefault": {
+          "type": "boolean",
+          "default": false,
+          "description": "Phase-2 hook: when enabled, default task identification selections to approved in review flows."
+        },
+        "protokoll.tasks.identify.autoCreate": {
+          "type": "boolean",
+          "default": false,
+          "description": "Phase-2 hook: when enabled, automatically create identified tasks after generation (currently not used by MVP flow)."
         }
       }
     }
@@ -500,6 +530,7 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
+    "typecheck:tests": "tsc --noEmit -p tsconfig.tests.json",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
     "lint:fix": "eslint src --ext ts --fix",
@@ -509,7 +540,7 @@
     "test:watch": "NODE_OPTIONS='--max-old-space-size=4096 --expose-gc' vitest watch",
     "build": "npm run lint && npm run compile",
     "clean": "rm -rf out",
-    "precommit": "npm run lint && npm run build && npm run test:fast",
+    "precommit": "npm run lint && npm run build && npm run typecheck:tests && npm run test:fast",
     "prepublishOnly": "npm run clean && npm run build",
     "package": "vsce package",
     "publish": "npm run build && npm run package",

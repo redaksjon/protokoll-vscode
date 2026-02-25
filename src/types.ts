@@ -28,6 +28,8 @@ export interface Task {
   completed?: string;
 }
 
+export type TranscriptContentType = 'audio_transcript' | 'manual_note';
+
 export interface Transcript {
   uri: string;
   path: string;
@@ -38,6 +40,7 @@ export interface Transcript {
   hasRawTranscript?: boolean;
   createdAt?: string; // Date when transcript was added to the system
   updatedAt?: string; // Date when transcript content was last updated
+  contentType?: TranscriptContentType;
   // Lifecycle fields
   status?: TranscriptStatus;
   openTasksCount?: number;
@@ -112,6 +115,16 @@ export interface TranscriptContent {
     duration?: number;
     transcribedAt?: string;
   };
+  summaries?: Array<{
+    id: string;
+    title: string;
+    audience: string;
+    guidance: string;
+    stylePreset: 'quick_bullets' | 'detailed' | 'attendee_facing' | string;
+    styleLabel?: string;
+    content: string;
+    generatedAt: string;
+  }>;
 }
 
 export interface JsonRpcRequest {

@@ -4,7 +4,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { McpClient } from '../src/mcpClient';
-import type { JsonRpcResponse, TranscriptsListResponse, TranscriptContent, McpResourcesListResponse } from '../src/types';
+import type { JsonRpcResponse, TranscriptsListResponse, TranscriptContent, McpResourcesListResponse, McpResourceResponse } from '../src/types';
 import { mockHttpRequest, resetHttpMocks } from './helpers/httpMock';
 
 describe('McpClient', () => {
@@ -158,7 +158,7 @@ describe('McpClient', () => {
 
     describe('readResource', () => {
         it('should read resource successfully', async () => {
-            const mockContent: TranscriptContent = {
+            const mockContent: McpResourceResponse = {
                 uri: 'protokoll://transcript/test.md',
                 mimeType: 'text/markdown',
                 text: '# Test Transcript\n\nContent here.',
@@ -232,7 +232,7 @@ describe('McpClient', () => {
                 }),
             });
 
-            const result = await client.listTranscripts('/path/to/transcripts');
+            const result = await client.listTranscripts();
             expect(result.transcripts).toHaveLength(1);
             expect(result.directory).toBe('/path/to/transcripts');
         });
