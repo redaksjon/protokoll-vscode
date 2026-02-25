@@ -71,7 +71,7 @@
       },
       {
         "command": "protokoll.startNewSession",
-        "title": "New Transcript",
+        "title": "New Item",
         "icon": "$(add)",
         "category": "Protokoll"
       },
@@ -98,6 +98,11 @@
       {
         "command": "protokoll.changeSelectedTranscriptsStatus",
         "title": "Change Selected Status",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.identifyTasksInTranscript",
+        "title": "Identify Tasks in Transcript",
         "category": "Protokoll"
       },
       {
@@ -450,6 +455,16 @@
           "command": "protokoll.changeSelectedTranscriptsStatus",
           "when": "view == protokollTranscripts",
           "group": "z_commands"
+        },
+        {
+          "command": "protokoll.identifyTasksInTranscript",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "z_commands"
+        },
+        {
+          "command": "protokoll.identifyTasksInTranscript",
+          "when": "view == protokollTranscripts",
+          "group": "z_commands"
         }
       ]
     },
@@ -493,6 +508,21 @@
           "type": "boolean",
           "default": true,
           "description": "Automatically open the Protokoll Dashboard when the extension activates."
+        },
+        "protokoll.features.summaryEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the experimental Summary tab in transcript detail views."
+        },
+        "protokoll.tasks.identify.approveAllDefault": {
+          "type": "boolean",
+          "default": false,
+          "description": "Phase-2 hook: when enabled, default task identification selections to approved in review flows."
+        },
+        "protokoll.tasks.identify.autoCreate": {
+          "type": "boolean",
+          "default": false,
+          "description": "Phase-2 hook: when enabled, automatically create identified tasks after generation (currently not used by MVP flow)."
         }
       }
     }

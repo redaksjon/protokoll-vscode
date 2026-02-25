@@ -117,6 +117,10 @@ Content here.`;
             expect(html).toContain('Test Transcript');
             expect(html).toContain('Content here');
             expect(html).toContain('<!DOCTYPE html>');
+            expect(html).toContain('id="summary-tab"');
+            expect(html).toContain('id="summary-content"');
+            expect(html).toContain('id="summary-generate-btn"');
+            expect(html).toContain('Identify Tasks');
         });
 
         it('should handle transcript without title', () => {
@@ -172,6 +176,152 @@ Content here.`;
             const html = provider.getWebviewContent(transcript, content);
             expect(html).toContain('John Doe');
             expect(html).toContain('Test Project');
+        });
+
+        it('should render manual note original editor and hide enhanced tab before enhancement', () => {
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/manual-note.md',
+                path: '/path/to/manual-note.md',
+                filename: 'manual-note.md',
+                date: '2026-01-31',
+                title: 'Manual Note',
+                contentType: 'manual_note',
+                status: 'initial',
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/manual-note.md',
+                path: '/path/to/manual-note.md',
+                title: 'Manual Note',
+                metadata: {
+                    date: '2026-01-31',
+                    status: 'initial',
+                    tags: [],
+                },
+                content: 'This is a manually entered note.',
+            };
+
+            const html = provider.getWebviewContent(transcript, content);
+
+            expect(html).toContain('id="original-editor-input"');
+            expect(html).toContain('id="save-original-btn"');
+            expect(html).toContain('id="enhance-original-btn"');
+            expect(html).toContain('id="summary-tab"');
+            expect(html).not.toContain('id="enhanced-tab"');
+        });
+
+        it('should show enhanced tab for manual note after enhancement status', () => {
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/manual-note-enhanced.md',
+                path: '/path/to/manual-note-enhanced.md',
+                filename: 'manual-note-enhanced.md',
+                date: '2026-01-31',
+                title: 'Manual Note Enhanced',
+                contentType: 'manual_note',
+                status: 'enhanced',
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/manual-note-enhanced.md',
+                path: '/path/to/manual-note-enhanced.md',
+                title: 'Manual Note Enhanced',
+                metadata: {
+                    date: '2026-01-31',
+                    status: 'enhanced',
+                    tags: [],
+                },
+                content: 'Enhanced manual note output.',
+            };
+
+            const html = provider.getWebviewContent(transcript, content);
+            expect(html).toContain('id="enhanced-tab"');
+        });
+
+        it('should render enhance action in original tab for audio transcripts', () => {
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/audio.md',
+                path: '/path/to/audio.md',
+                filename: 'audio.md',
+                date: '2026-01-31',
+                title: 'Audio Transcript',
+                contentType: 'audio_transcript',
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/audio.md',
+                path: '/path/to/audio.md',
+                title: 'Audio Transcript',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                },
+                content: 'Enhanced transcript content.',
+                rawTranscript: {
+                    text: 'Raw transcript text',
+                },
+            };
+
+            const html = provider.getWebviewContent(transcript, content);
+            expect(html).toContain('id="raw-tab"');
+            expect(html).toContain('id="enhance-original-btn"');
+        });
+
+        it('should not inject metadata.project into entity references', () => {
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                filename: 'test.md',
+                date: '2026-01-31',
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    projectId: 'grunnverk',
+                    project: 'Grunnverk',
+                    tags: [],
+                    entities: {
+                        projects: [],
+                    },
+                },
+                content: 'Content',
+            };
+
+            const html = provider.getWebviewContent(transcript, content);
+            expect(html).not.toContain("openEntity('project', 'grunnverk')");
+        });
+
+        it('should prefer metadata.entities over transcript.entities fallback', () => {
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                filename: 'test.md',
+                date: '2026-01-31',
+                entities: {
+                    projects: [{ id: 'old-project', name: 'Old Project' }],
+                },
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                    entities: {
+                        projects: [{ id: 'new-project', name: 'New Project' }],
+                    },
+                },
+                content: 'Content',
+            };
+
+            const html = provider.getWebviewContent(transcript, content);
+            expect(html).toContain("openEntity('project', 'new-project')");
+            expect(html).not.toContain("openEntity('project', 'old-project')");
         });
     });
 
@@ -484,6 +634,185 @@ Content here.`;
             }
 
             expect(mockClient.callTool).toHaveBeenCalled();
+        });
+
+        it('should handle identifyTasks message and create selected tasks', async () => {
+            provider.setClient(mockClient);
+
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                filename: 'test.md',
+                date: '2026-01-31',
+                title: 'Test',
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/test.md',
+                mimeType: 'text/markdown',
+                text: '# Test',
+            };
+
+            vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
+            vi.spyOn(mockClient, 'callTool')
+                .mockResolvedValueOnce({
+                    candidates: [
+                        {
+                            id: 'candidate-1',
+                            taskText: 'Send proposal',
+                            confidenceBucket: 'high',
+                            rationale: 'explicit action language',
+                            suggestedTags: ['followup'],
+                        },
+                    ],
+                } as any)
+                .mockResolvedValue({ success: true } as any);
+
+            (vscode.window.showQuickPick as any)
+                .mockResolvedValueOnce([
+                    {
+                        label: 'Send proposal',
+                        description: 'Confidence: HIGH • explicit action language',
+                        candidate: {
+                            id: 'candidate-1',
+                            taskText: 'Send proposal',
+                            confidenceBucket: 'high',
+                            rationale: 'explicit action language',
+                            suggestedTags: ['followup'],
+                        },
+                    },
+                ])
+                .mockResolvedValueOnce([]);
+
+            await provider.showTranscript('protokoll://transcript/test.md', transcript);
+
+            if (messageHandler) {
+                await messageHandler({
+                    command: 'identifyTasks',
+                    transcriptPath: '/path/to/test.md',
+                });
+            }
+
+            expect(mockClient.callTool).toHaveBeenCalledWith(
+                'protokoll_identify_tasks_from_transcript',
+                expect.objectContaining({ transcriptPath: expect.any(String) })
+            );
+            expect(mockClient.callTool).toHaveBeenCalledWith(
+                'protokoll_create_task',
+                expect.objectContaining({ description: 'Send proposal' })
+            );
+        });
+
+        it('should handle identifyTasks message with no candidates', async () => {
+            provider.setClient(mockClient);
+
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                filename: 'test.md',
+                date: '2026-01-31',
+                title: 'Test',
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                    tasks: [],
+                },
+                content: '# Test',
+            };
+
+            const callToolSpy = vi.spyOn(mockClient, 'callTool').mockResolvedValue({
+                candidates: [],
+                message: 'No task candidates found.',
+            } as any);
+            vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
+            const infoSpy = vi.spyOn(vscode.window, 'showInformationMessage');
+
+            await provider.showTranscript('protokoll://transcript/test.md', transcript);
+
+            if (messageHandler) {
+                await messageHandler({
+                    command: 'identifyTasks',
+                    transcriptPath: '/path/to/test.md',
+                });
+            }
+
+            expect(callToolSpy).toHaveBeenCalledWith(
+                'protokoll_identify_tasks_from_transcript',
+                expect.objectContaining({ transcriptPath: expect.any(String) })
+            );
+            expect(callToolSpy).not.toHaveBeenCalledWith('protokoll_create_task', expect.anything());
+            expect(infoSpy).toHaveBeenCalledWith('No task candidates found.');
+        });
+
+        it('should block duplicate identifyTasks candidates from creation', async () => {
+            provider.setClient(mockClient);
+
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                filename: 'test.md',
+                date: '2026-01-31',
+                title: 'Test',
+            };
+
+            const content: TranscriptContent = {
+                uri: 'protokoll://transcript/test.md',
+                path: '/path/to/test.md',
+                title: 'test.md',
+                metadata: {
+                    date: '2026-01-31',
+                    tags: [],
+                    tasks: [{ id: 'task-1', description: 'Send proposal', status: 'open' }],
+                },
+                content: '# Test',
+            };
+
+            const callToolSpy = vi.spyOn(mockClient, 'callTool')
+                .mockResolvedValueOnce({
+                    candidates: [
+                        {
+                            id: 'candidate-dup',
+                            taskText: 'Send proposal',
+                            confidenceBucket: 'high',
+                            rationale: 'explicit action',
+                            suggestedTags: [],
+                        },
+                    ],
+                } as any)
+                .mockResolvedValue({ success: true } as any);
+            vi.spyOn(mockClient, 'readTranscript').mockResolvedValue(content);
+            (vscode.window.showQuickPick as any).mockResolvedValueOnce([
+                {
+                    label: 'Send proposal',
+                    description: 'Confidence: HIGH • explicit action',
+                    candidate: {
+                        id: 'candidate-dup',
+                        taskText: 'Send proposal',
+                        confidenceBucket: 'high',
+                        rationale: 'explicit action',
+                        suggestedTags: [],
+                    },
+                },
+            ]);
+            const infoSpy = vi.spyOn(vscode.window, 'showInformationMessage');
+
+            await provider.showTranscript('protokoll://transcript/test.md', transcript);
+
+            if (messageHandler) {
+                await messageHandler({
+                    command: 'identifyTasks',
+                    transcriptPath: '/path/to/test.md',
+                });
+            }
+
+            expect(callToolSpy).not.toHaveBeenCalledWith('protokoll_create_task', expect.anything());
+            expect(infoSpy).toHaveBeenCalledWith('Protokoll: Created 0 tasks from identified candidates (1 duplicate blocked).');
         });
 
         it('should handle openEntity message', async () => {
@@ -855,74 +1184,31 @@ Actual content.`;
     });
 
     describe('renderEntityReferences', () => {
-        it('should render projects', () => {
-            const entities = {
-                projects: [
-                    { id: 'project-1', name: 'Project One' },
-                    { id: 'project-2', name: 'Project Two' },
-                ],
-            };
-
-            const html = (provider as any).renderEntityReferences(entities);
-            expect(html).toContain('Project One');
-            expect(html).toContain('project-1');
-            expect(html).toContain('Entity References');
-        });
-
-        it('should render people', () => {
-            const entities = {
-                people: [
-                    { id: 'person-1', name: 'John Doe' },
-                ],
-            };
-
-            const html = (provider as any).renderEntityReferences(entities);
-            expect(html).toContain('John Doe');
-            expect(html).toContain('People');
-        });
-
-        it('should render terms', () => {
-            const entities = {
-                terms: [
-                    { id: 'term-1', name: 'Important Term' },
-                ],
-            };
-
-            const html = (provider as any).renderEntityReferences(entities);
-            expect(html).toContain('Important Term');
-            expect(html).toContain('Terms');
-        });
-
-        it('should render companies', () => {
-            const entities = {
-                companies: [
-                    { id: 'company-1', name: 'Acme Corp' },
-                ],
-            };
-
-            const html = (provider as any).renderEntityReferences(entities);
-            expect(html).toContain('Acme Corp');
-            expect(html).toContain('Companies');
-        });
-
-        it('should return empty string when no entities', () => {
+        it('should render entity references editor shell', () => {
             const html = (provider as any).renderEntityReferences({});
-            expect(html).toBe('');
+            expect(html).toContain('Entity References');
+            expect(html).toContain('entity-references-content');
         });
 
-        it('should render all entity types', () => {
-            const entities = {
-                projects: [{ id: 'p1', name: 'Project' }],
-                people: [{ id: 'pe1', name: 'Person' }],
-                terms: [{ id: 't1', name: 'Term' }],
-                companies: [{ id: 'c1', name: 'Company' }],
-            };
+        it('should render edit and save controls', () => {
+            const html = (provider as any).renderEntityReferences({});
+            expect(html).toContain('entity-references-edit-btn');
+            expect(html).toContain('entity-references-save-btn');
+            expect(html).toContain('startEditEntityReferences()');
+            expect(html).toContain('saveEntityReferences()');
+        });
 
-            const html = (provider as any).renderEntityReferences(entities);
-            expect(html).toContain('Project');
-            expect(html).toContain('Person');
-            expect(html).toContain('Term');
-            expect(html).toContain('Company');
+        it('should include status container for save feedback', () => {
+            const html = (provider as any).renderEntityReferences({});
+            expect(html).toContain('entity-references-status');
+        });
+
+        it('should render existing entities in non-edit mode', () => {
+            const html = (provider as any).renderEntityReferences({
+                projects: [{ id: 'project-1', name: 'Project One' }],
+            });
+            expect(html).toContain('Project One');
+            expect(html).toContain('openEntity');
         });
     });
 

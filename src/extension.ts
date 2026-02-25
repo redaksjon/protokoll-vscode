@@ -15,7 +15,7 @@ import { TermsViewProvider } from './termsView';
 import { ProjectsViewProvider } from './projectsView';
 import { CompaniesViewProvider } from './companiesView';
 import { DashboardViewProvider } from './dashboardView';
-import type { Transcript, TranscriptContent, TranscriptStatus } from './types';
+import type { Transcript, TranscriptContent, TranscriptStatus, TranscriptContentType } from './types';
 import { log, initLogger } from './logger';
 import { shouldPassContextDirectory, clearServerModeCache } from './serverMode';
 import { UploadService } from './uploadService';
@@ -1365,7 +1365,33 @@ export async function activate(context: vscode.ExtensionContext) {
   const startNewSessionCommand = vscode.commands.registerCommand(
     'protokoll.startNewSession',
     async () => {
-      // Redirect to createNote command - "Start New Session" should create a new transcript
+      const createChoices: Array<vscode.QuickPickItem & { contentType: TranscriptContentType }> = [
+        {
+          label: '$(cloud-upload) Upload audio transcript',
+          description: 'Use the existing audio upload/transcription flow',
+          contentType: 'audio_transcript',
+        },
+        {
+          label: '$(file-text) Create manual note',
+          description: 'Create a note and start with editable original text',
+          contentType: 'manual_note',
+        },
+      ];
+
+      const selected = await vscode.window.showQuickPick(createChoices, {
+        title: 'Create New Item',
+        placeHolder: 'Choose what kind of item to create',
+      });
+
+      if (!selected) {
+        return;
+      }
+
+      if (selected.contentType === 'audio_transcript') {
+        await vscode.commands.executeCommand('protokoll.uploadAudio');
+        return;
+      }
+
       await vscode.commands.executeCommand('protokoll.createNote');
     }
   );
@@ -1586,6 +1612,158 @@ export async function activate(context: vscode.ExtensionContext) {
       }
 
       await changeTranscriptsStatus(selectedItems, mcpClient, transcriptsViewProvider);
+    }
+  );
+
+  interface IdentifyTaskCandidate {
+    id: string;
+    taskText: string;
+    confidenceBucket: 'high' | 'medium' | 'low';
+    rationale: string;
+    suggestedTags?: string[];
+  }
+
+  const identifyTasksInTranscriptCommand = vscode.commands.registerCommand(
+    'protokoll.identifyTasksInTranscript',
+    async (item?: TranscriptItem) => {
+      if (!mcpClient) {
+        vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
+        return;
+      }
+      if (!transcriptsViewProvider) {
+        vscode.window.showErrorMessage('Transcripts view provider not initialized.');
+        return;
+      }
+
+      const targetItems = item?.transcript
+        ? [item]
+        : transcriptsViewProvider.getSelectedItems();
+      if (targetItems.length === 0) {
+        vscode.window.showWarningMessage('No transcripts selected. Select one or more transcripts first.');
+        return;
+      }
+
+      const normalize = (text: string): string[] => text
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .filter(token => token.length > 2);
+      const similarity = (a: string, b: string): number => {
+        const aTokens = new Set(normalize(a));
+        const bTokens = new Set(normalize(b));
+        if (aTokens.size === 0 || bTokens.size === 0) {
+          return 0;
+        }
+        const overlap = Array.from(aTokens).filter(token => bTokens.has(token)).length;
+        return overlap / Math.max(aTokens.size, bTokens.size);
+      };
+
+      let totalCreated = 0;
+      let totalBlocked = 0;
+      let processed = 0;
+
+      for (const target of targetItems) {
+        const transcript = target.transcript;
+        if (!transcript) {
+          continue;
+        }
+        processed += 1;
+
+        const transcriptPath = transcript.path || transcript.filename;
+        const identifyResult = await mcpClient.callTool('protokoll_identify_tasks_from_transcript', {
+          transcriptPath,
+          maxCandidates: 25,
+          includeTagSuggestions: true,
+        }) as { candidates?: IdentifyTaskCandidate[] };
+
+        const candidates = identifyResult.candidates || [];
+        if (candidates.length === 0) {
+          continue;
+        }
+        log('IdentifyTasks: candidates found', {
+          transcriptUri: transcript.uri,
+          candidateCount: candidates.length,
+        });
+
+        const selected = await vscode.window.showQuickPick(
+          candidates.map(candidate => ({
+            label: candidate.taskText,
+            description: `${(transcript.title || transcript.filename)} • ${candidate.confidenceBucket.toUpperCase()} • ${candidate.rationale}`,
+            candidate,
+            picked: false,
+          })),
+          {
+            canPickMany: true,
+            title: `Identify Tasks: ${transcript.title || transcript.filename}`,
+            placeHolder: 'Select which identified tasks to create',
+            ignoreFocusOut: true,
+          }
+        );
+
+        if (!selected || selected.length === 0) {
+          continue;
+        }
+
+        const latest = await mcpClient.readTranscript(transcript.uri);
+        const existingDescriptions = (latest.metadata?.tasks || []).map(task => task.description);
+        const createdInThisRun: string[] = [];
+
+        for (const selectedItem of selected) {
+          const taskText = selectedItem.candidate.taskText;
+          const isDuplicate = [...existingDescriptions, ...createdInThisRun].some(existing => {
+            return similarity(taskText, existing) >= 0.75;
+          });
+
+          if (isDuplicate) {
+            totalBlocked += 1;
+            continue;
+          }
+
+          await mcpClient.callTool('protokoll_create_task', {
+            transcriptPath,
+            description: taskText,
+          });
+          totalCreated += 1;
+          createdInThisRun.push(taskText);
+        }
+
+        const suggestedTags = Array.from(new Set(
+          selected.flatMap(candidate => candidate.candidate.suggestedTags || [])
+        ));
+        if (suggestedTags.length > 0) {
+          const selectedTags = await vscode.window.showQuickPick(
+            suggestedTags.map(tag => ({ label: tag })),
+            {
+              canPickMany: true,
+              title: `Apply Suggested Tags: ${transcript.title || transcript.filename}`,
+              placeHolder: 'Optional: select tags to add',
+              ignoreFocusOut: true,
+            }
+          );
+          if (selectedTags && selectedTags.length > 0) {
+            await mcpClient.callTool('protokoll_edit_transcript', {
+              transcriptPath,
+              tagsToAdd: selectedTags.map(tag => tag.label),
+            });
+          }
+        }
+      }
+
+      if (processed > 0) {
+        vscode.window.showInformationMessage(
+          `Protokoll: Created ${totalCreated} task${totalCreated === 1 ? '' : 's'}` +
+          `${totalBlocked > 0 ? ` (${totalBlocked} duplicate${totalBlocked === 1 ? '' : 's'} blocked)` : ''}.`
+        );
+        log('IdentifyTasks: run summary', {
+          processedTranscripts: processed,
+          totalCreated,
+          totalBlocked,
+        });
+      }
+
+      if (transcriptsViewProvider) {
+        await transcriptsViewProvider.refresh();
+      }
     }
   );
 
@@ -1919,6 +2097,7 @@ export async function activate(context: vscode.ExtensionContext) {
               filename: result.filename || result.filePath.split('/').pop() || '',
               title: title.trim(),
               date: new Date().toISOString(),
+              contentType: 'manual_note',
             };
             
             await transcriptDetailViewProvider.showTranscript(newTranscript.uri, newTranscript);
@@ -2194,6 +2373,7 @@ export async function activate(context: vscode.ExtensionContext) {
     moveSelectedToProjectCommand,
     changeTranscriptStatusCommand,
     changeSelectedTranscriptsStatusCommand,
+    identifyTasksInTranscriptCommand,
     copyTranscriptCommand,
     openTranscriptToSideCommand,
     openTranscriptWithCommand,

@@ -27,6 +27,36 @@ export interface EditableTranscriptInfo {
   originalBody: string;
 }
 
+interface SummaryConfig {
+  title: string;
+  audience: string;
+  guidance: string;
+  stylePreset: 'quick_bullets' | 'detailed' | 'attendee_facing';
+  styleLabel: string;
+}
+
+interface GeneratedSummary {
+  content: string;
+  generatedAt: string;
+}
+
+interface TaskCandidate {
+  id: string;
+  taskText: string;
+  confidenceBucket: 'high' | 'medium' | 'low';
+  rationale: string;
+  suggestedDueDate?: string | null;
+  suggestedProject?: { id?: string | null; name?: string | null };
+  suggestedEntities?: Array<{ id: string; name: string; type: 'person' | 'project' | 'term' | 'company' }>;
+  suggestedTags?: string[];
+}
+
+interface IdentifyTasksResult {
+  candidates?: TaskCandidate[];
+  totalCandidates?: number;
+  message?: string;
+}
+
 // Global map of temp file paths -> transcript info for save syncing
 const editableTranscriptFiles: Map<string, EditableTranscriptInfo> = new Map();
 
@@ -128,6 +158,9 @@ export class TranscriptDetailViewProvider {
   private _updatingTranscripts: Set<string> = new Set(); // Track transcripts being updated
   private _entityLastFetched: Map<string, Date> = new Map(); // Track when entities were last fetched
   private _transcriptLastFetched: Map<string, Date> = new Map(); // Track when transcripts were last fetched
+  private _summaryConfigByTranscript: Map<string, SummaryConfig> = new Map();
+  private _generatedSummaryByTranscript: Map<string, GeneratedSummary> = new Map();
+  private _summaryHistoryByTranscript: Map<string, GeneratedSummary[]> = new Map();
   private _onTranscriptChanged?: (transcriptUri?: string, updates?: Partial<Transcript>) => void | Promise<void>;
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
@@ -407,8 +440,31 @@ export class TranscriptDetailViewProvider {
           case 'editTranscript':
             await this.handleEditTranscript(currentTranscript.transcript, message.transcriptPath, message.newContent, transcriptUri);
             break;
+          case 'saveOriginalContent':
+            await this.handleEditTranscript(currentTranscript.transcript, message.transcriptPath, message.newContent, transcriptUri);
+            break;
+          case 'enhanceFromOriginal':
+            await this.handleEnhanceFromOriginal(
+              currentTranscript.transcript,
+              message.transcriptPath,
+              message.originalText,
+              message.overwriteConfirmed,
+              transcriptUri
+            );
+            break;
           case 'openEntity':
             await this.handleOpenEntity(message.entityType, message.entityId);
+            break;
+          case 'pickEntityReference':
+            await this.handlePickEntityReference(panel, currentTranscript.transcript, message.entityType);
+            break;
+          case 'saveEntityReferences':
+            await this.handleSaveEntityReferences(
+              panel,
+              currentTranscript.transcript,
+              transcriptUri,
+              message.entities
+            );
             break;
           case 'showUpdateIndicator':
             // This is handled by the webview itself, but we can acknowledge it
@@ -445,11 +501,20 @@ export class TranscriptDetailViewProvider {
           case 'addTask':
             await this.handleAddTask(currentTranscript.transcript, message.transcriptPath, transcriptUri);
             break;
+          case 'identifyTasks':
+            await this.handleIdentifyTasks(currentTranscript.transcript, message.transcriptPath, transcriptUri);
+            break;
           case 'completeTask':
             await this.handleCompleteTask(currentTranscript.transcript, message.transcriptPath, message.taskId, transcriptUri);
             break;
           case 'deleteTask':
             await this.handleDeleteTask(currentTranscript.transcript, message.transcriptPath, message.taskId, transcriptUri);
+            break;
+          case 'startSummarySetup':
+            await this.handleStartSummarySetup(currentTranscript.transcript, transcriptUri);
+            break;
+          case 'generateSummary':
+            await this.handleGenerateSummary(message.transcriptPath, transcriptUri);
             break;
         }
       },
@@ -502,6 +567,144 @@ export class TranscriptDetailViewProvider {
       console.error(`Protokoll: Error loading transcript ${transcriptUri}:`, error);
       panel.webview.html = this.getErrorContent(
         error instanceof Error ? error.message : String(error)
+      );
+    }
+  }
+
+  private async handleStartSummarySetup(transcript: Transcript, transcriptUri: string): Promise<void> {
+    const panel = this._panels.get(transcriptUri);
+    if (!panel) {
+      return;
+    }
+
+    const defaultTitle = `${transcript.title || transcript.filename} Summary`;
+    const titleInput = await vscode.window.showInputBox({
+      title: 'Summary Setup',
+      prompt: 'Summary title (optional)',
+      placeHolder: defaultTitle,
+      value: defaultTitle,
+      ignoreFocusOut: true,
+    });
+    if (titleInput === undefined) {
+      return;
+    }
+
+    const audienceInput = await vscode.window.showInputBox({
+      title: 'Summary Setup',
+      prompt: 'Who is the summary for?',
+      placeHolder: 'e.g., Gerald Corson, Internal team, Project attendees',
+      ignoreFocusOut: true,
+      validateInput: (value) => {
+        if (!value || !value.trim()) {
+          return 'Audience is required';
+        }
+        return null;
+      },
+    });
+    if (audienceInput === undefined) {
+      return;
+    }
+
+    const noteInput = await vscode.window.showInputBox({
+      title: 'Summary Setup',
+      prompt: 'Guidance note (optional)',
+      placeHolder: 'e.g., Exclude internal reflections and sensitive personal notes',
+      ignoreFocusOut: true,
+    });
+    if (noteInput === undefined) {
+      return;
+    }
+
+    const stylePick = await vscode.window.showQuickPick([
+      {
+        label: 'Quick paragraph + bullet points',
+        description: 'Concise overview with key bullets',
+        value: 'quick_bullets',
+      },
+      {
+        label: 'Detailed summary',
+        description: 'More context and nuance',
+        value: 'detailed',
+      },
+      {
+        label: 'Attendee-facing summary',
+        description: 'External/shareable wording',
+        value: 'attendee_facing',
+      },
+    ], {
+      title: 'Summary Setup',
+      placeHolder: 'Choose summary style',
+      ignoreFocusOut: true,
+    });
+    if (!stylePick) {
+      return;
+    }
+
+    const summaryConfig: SummaryConfig = {
+      title: (titleInput || '').trim() || defaultTitle,
+      audience: audienceInput.trim(),
+      guidance: (noteInput || '').trim(),
+      stylePreset: stylePick.value as SummaryConfig['stylePreset'],
+      styleLabel: stylePick.label,
+    };
+    this._summaryConfigByTranscript.set(transcriptUri, summaryConfig);
+
+    panel.webview.postMessage({
+      command: 'summarySetupReady',
+      summaryConfig,
+    });
+
+    vscode.window.showInformationMessage('Summary setup captured.');
+  }
+
+  private async handleGenerateSummary(
+    transcriptPath: string,
+    transcriptUri: string
+  ): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    const summaryConfig = this._summaryConfigByTranscript.get(transcriptUri);
+    if (!summaryConfig) {
+      vscode.window.showWarningMessage('Configure Summary first.');
+      return;
+    }
+
+    try {
+      const result = await this._client.callTool('protokoll_summarize_transcript', {
+        transcriptPath: this.convertToRelativePath(transcriptPath),
+        audience: summaryConfig.audience,
+        guidance: summaryConfig.guidance,
+        stylePreset: summaryConfig.stylePreset,
+        summaryTitle: summaryConfig.title,
+      }) as { summary?: string; content?: string; text?: string } | string;
+
+      const summaryContent = typeof result === 'string'
+        ? result
+        : (result.summary || result.content || result.text || '').trim();
+
+      if (!summaryContent) {
+        throw new Error('No summary text returned by protokoll_summarize_transcript');
+      }
+
+      const existingSummary = this._generatedSummaryByTranscript.get(transcriptUri);
+      if (existingSummary) {
+        const history = this._summaryHistoryByTranscript.get(transcriptUri) || [];
+        this._summaryHistoryByTranscript.set(transcriptUri, [...history, existingSummary]);
+      }
+
+      this._generatedSummaryByTranscript.set(transcriptUri, {
+        content: summaryContent,
+        generatedAt: new Date().toISOString(),
+      });
+
+      await this.refreshTranscript(transcriptUri);
+      vscode.window.showInformationMessage('Summary generated.');
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to generate summary: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
@@ -960,6 +1163,141 @@ export class TranscriptDetailViewProvider {
     }
   }
 
+  private async handleIdentifyTasks(_transcript: Transcript, transcriptPath: string, transcriptUri: string): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    try {
+      const result = await this._client.callTool('protokoll_identify_tasks_from_transcript', {
+        transcriptPath: this.convertToRelativePath(transcriptPath),
+        maxCandidates: 25,
+        includeTagSuggestions: true,
+      }) as IdentifyTasksResult;
+
+      const candidates = result.candidates || [];
+      if (candidates.length === 0) {
+        vscode.window.showInformationMessage(
+          result.message || 'Protokoll: No task candidates found in this transcript.'
+        );
+        return;
+      }
+      console.log('Protokoll: [TASK IDENTIFY] Candidates found', { transcriptUri, candidateCount: candidates.length });
+
+      const quickPickItems = candidates.map((candidate) => {
+        const detailParts = [
+          `Confidence: ${candidate.confidenceBucket.toUpperCase()}`,
+          candidate.rationale,
+          candidate.suggestedDueDate ? `Due: ${candidate.suggestedDueDate}` : '',
+        ].filter(Boolean);
+
+        return {
+          label: candidate.taskText,
+          description: detailParts.join(' • '),
+          candidate,
+          picked: false, // Default to none selected (review-first constraint)
+        };
+      });
+
+      const selected = await vscode.window.showQuickPick(quickPickItems, {
+        canPickMany: true,
+        title: 'Identify Tasks in Transcript',
+        placeHolder: 'Select which identified tasks to create',
+        ignoreFocusOut: true,
+      });
+
+      if (!selected || selected.length === 0) {
+        vscode.window.showInformationMessage('Protokoll: No tasks selected.');
+        return;
+      }
+
+      const normalize = (text: string): string[] => text
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .filter(token => token.length > 2);
+      const similarity = (a: string, b: string): number => {
+        const aTokens = new Set(normalize(a));
+        const bTokens = new Set(normalize(b));
+        if (aTokens.size === 0 || bTokens.size === 0) {
+          return 0;
+        }
+        const overlap = Array.from(aTokens).filter(token => bTokens.has(token)).length;
+        return overlap / Math.max(aTokens.size, bTokens.size);
+      };
+
+      // Read current transcript metadata so duplicate checks include existing tasks.
+      const latest = await this._client.readTranscript(transcriptUri);
+      const existingTasks = latest.metadata?.tasks || [];
+      const existingDescriptions = existingTasks.map(task => task.description);
+      const createdInThisRun: string[] = [];
+
+      let createdCount = 0;
+      let blockedDuplicates = 0;
+      for (const item of selected) {
+        const candidateText = item.candidate.taskText;
+        const isDuplicate = [...existingDescriptions, ...createdInThisRun].some(existing => {
+          return similarity(candidateText, existing) >= 0.75;
+        });
+
+        if (isDuplicate) {
+          blockedDuplicates += 1;
+          continue;
+        }
+
+        await this._client.callTool('protokoll_create_task', {
+          transcriptPath: this.convertToRelativePath(transcriptPath),
+          description: candidateText,
+        });
+        createdCount += 1;
+        createdInThisRun.push(candidateText);
+      }
+
+      // Optional tags: collect from selected candidates and ask before applying.
+      const suggestedTags = Array.from(new Set(
+        selected.flatMap(item => item.candidate.suggestedTags || [])
+      ));
+      if (suggestedTags.length > 0) {
+        const chosenTags = await vscode.window.showQuickPick(
+          suggestedTags.map(tag => ({ label: tag })),
+          {
+            canPickMany: true,
+            title: 'Apply Suggested Tags',
+            placeHolder: 'Optional: select tags to add to this transcript',
+            ignoreFocusOut: true,
+          }
+        );
+
+        if (chosenTags && chosenTags.length > 0) {
+          await this._client.callTool('protokoll_edit_transcript', {
+            transcriptPath: this.convertToRelativePath(transcriptPath),
+            tagsToAdd: chosenTags.map(tag => tag.label),
+          });
+        }
+      }
+
+      vscode.window.showInformationMessage(
+        `Protokoll: Created ${createdCount} task${createdCount === 1 ? '' : 's'} from identified candidates` +
+        `${blockedDuplicates > 0 ? ` (${blockedDuplicates} duplicate${blockedDuplicates === 1 ? '' : 's'} blocked)` : ''}.`
+      );
+      console.log('Protokoll: [TASK IDENTIFY] Create summary', {
+        transcriptUri,
+        selectedCount: selected.length,
+        createdCount,
+        blockedDuplicates,
+      });
+
+      setTimeout(async () => {
+        await this.refreshTranscript(transcriptUri);
+      }, 500);
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to identify tasks: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
   private async handleCompleteTask(transcript: Transcript, transcriptPath: string, taskId: string, transcriptUri: string): Promise<void> {
     if (!this._client) {
       vscode.window.showErrorMessage('MCP client not initialized');
@@ -1149,6 +1487,13 @@ export class TranscriptDetailViewProvider {
       if (currentTranscript) {
         await this.showTranscript(currentTranscript.uri, currentTranscript.transcript);
       }
+
+      const panel = this._panels.get(transcriptUri);
+      if (panel) {
+        panel.webview.postMessage({
+          command: 'saveSucceeded',
+        });
+      }
     } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to update transcript: ${error instanceof Error ? error.message : String(error)}`
@@ -1160,6 +1505,67 @@ export class TranscriptDetailViewProvider {
           command: 'saveFailed'
         });
       }
+    }
+  }
+
+  private async handleEnhanceFromOriginal(
+    transcript: Transcript,
+    transcriptPath: string,
+    originalText: string,
+    overwriteConfirmed: boolean,
+    transcriptUri: string
+  ): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    const normalizedOriginal = (originalText || '').trim();
+    if (!normalizedOriginal) {
+      vscode.window.showWarningMessage('Original content is empty. Add content before running Enhance.');
+      return;
+    }
+
+    try {
+      // For manual notes, persist the current Original draft first so enhancement
+      // always runs against what the user just wrote.
+      if (transcript.contentType === 'manual_note') {
+        await this._client.callTool('protokoll_update_transcript_content', {
+          transcriptPath: this.convertToRelativePath(transcriptPath),
+          content: originalText,
+        });
+      }
+
+      if (overwriteConfirmed) {
+        vscode.window.showInformationMessage('Re-enhancing from Original...');
+      } else {
+        vscode.window.showInformationMessage('Enhancing from Original...');
+      }
+
+      await this._client.callTool('protokoll_enhance_transcript', {
+        transcriptPath: this.convertToRelativePath(transcriptPath),
+        originalText,
+      });
+
+      await vscode.commands.executeCommand('protokoll.refreshTranscripts');
+      await this.refreshTranscript(transcriptUri);
+
+      const refreshedPanel = this._panels.get(transcriptUri);
+      if (refreshedPanel) {
+        refreshedPanel.webview.postMessage({
+          command: 'enhanceStarted',
+        });
+      }
+    } catch (error) {
+      const panel = this._panels.get(transcriptUri);
+      if (panel) {
+        panel.webview.postMessage({
+          command: 'enhanceFailed',
+        });
+      }
+      vscode.window.showErrorMessage(
+        `Enhancement failed. Existing enhanced content was kept. ${error instanceof Error ? error.message : String(error)}`
+      );
     }
   }
 
@@ -1838,6 +2244,362 @@ export class TranscriptDetailViewProvider {
     } catch (error) {
       console.warn('Could not read entity:', entityType, entityId, error);
       return null;
+    }
+  }
+
+  private getEntitySectionKey(entityType: string): 'projects' | 'people' | 'terms' | 'companies' | undefined {
+    switch (entityType) {
+      case 'project':
+        return 'projects';
+      case 'person':
+        return 'people';
+      case 'term':
+        return 'terms';
+      case 'company':
+        return 'companies';
+      default:
+        return undefined;
+    }
+  }
+
+  private async listEntitiesByType(entityType: string, search: string, limit = 25): Promise<Array<{ id: string; name: string }>> {
+    if (!this._client) {
+      return [];
+    }
+
+    const sectionKey = this.getEntitySectionKey(entityType);
+    if (!sectionKey) {
+      return [];
+    }
+
+    const listResult = await this._client.callTool(`protokoll_list_${sectionKey}`, {
+      search,
+      limit,
+    }) as Record<string, unknown>;
+
+    const entities = listResult[sectionKey] as Array<{ id: string; name: string }> | undefined;
+    if (!Array.isArray(entities)) {
+      return [];
+    }
+
+    return entities
+      .filter((entity) => entity?.id && entity?.name)
+      .map((entity) => ({ id: entity.id, name: entity.name }));
+  }
+
+  private async createEntityByType(entityType: string, rawName: string): Promise<{ id: string; name: string } | undefined> {
+    if (!this._client) {
+      return undefined;
+    }
+
+    const name = rawName.trim();
+    if (!name) {
+      return undefined;
+    }
+
+    let toolName = '';
+    let args: Record<string, unknown> = {};
+
+    switch (entityType) {
+      case 'person':
+        toolName = 'protokoll_add_person';
+        args = { name };
+        break;
+      case 'project':
+        toolName = 'protokoll_add_project';
+        args = { name };
+        break;
+      case 'term':
+        toolName = 'protokoll_add_term';
+        args = { term: name };
+        break;
+      case 'company':
+        toolName = 'protokoll_add_company';
+        args = { name };
+        break;
+      default:
+        return undefined;
+    }
+
+    const createResult = await this._client.callTool(toolName, args) as
+      | { id?: string; name?: string; entity?: { id?: string; name?: string } }
+      | string;
+
+    if (typeof createResult === 'string') {
+      throw new Error(createResult);
+    }
+
+    const createdId = createResult.entity?.id ?? createResult.id;
+    const createdName = createResult.entity?.name ?? createResult.name ?? name;
+    if (!createdId) {
+      throw new Error(`Failed to create ${entityType}: no ID returned`);
+    }
+
+    return {
+      id: createdId,
+      name: createdName,
+    };
+  }
+
+  private async showEntityReferencePickerForType(entityType: string): Promise<{ id: string; name: string; type: string } | undefined> {
+    if (!this._client) {
+      return undefined;
+    }
+
+    interface PickerItem extends vscode.QuickPickItem {
+      id?: string;
+      name?: string;
+      type?: string;
+      source?: 'existing' | 'create';
+    }
+
+    const typeLabel = this.capitalizeFirst(entityType);
+    const picker = vscode.window.createQuickPick<PickerItem>();
+    picker.title = `Add ${typeLabel} Entity Reference`;
+    picker.placeholder = `Search ${typeLabel.toLowerCase()} entities or create a new one`;
+    picker.matchOnDescription = true;
+    picker.matchOnDetail = true;
+    picker.canSelectMany = false;
+
+    const buildItems = (query: string, entities: Array<{ id: string; name: string }>): PickerItem[] => {
+      const createName = query.trim();
+      const items: PickerItem[] = [];
+
+      if (createName.length > 0) {
+        items.push({
+          label: `$(add) Create new ${entityType}: "${createName}"`,
+          description: 'Create and add this entity',
+          name: createName,
+          type: entityType,
+          source: 'create',
+          alwaysShow: true,
+        });
+      }
+
+      if (entities.length > 0) {
+        if (items.length > 0) {
+          items.push({
+            label: '',
+            kind: vscode.QuickPickItemKind.Separator,
+          });
+        }
+        items.push(...entities.map((entity) => ({
+          label: entity.name,
+          description: entity.id,
+          id: entity.id,
+          name: entity.name,
+          type: entityType,
+          source: 'existing' as const,
+        })));
+      }
+
+      if (items.length === 0) {
+        items.push({
+          label: 'No matches yet',
+          description: 'Type to search or create',
+          alwaysShow: true,
+        });
+      }
+
+      return items;
+    };
+
+    let latestQuery = '';
+    let searchTimeout: NodeJS.Timeout | undefined;
+
+    const refreshItems = async (query: string): Promise<void> => {
+      latestQuery = query;
+      const entities = await this.listEntitiesByType(entityType, query, query.trim().length > 0 ? 25 : 10);
+      if (latestQuery !== query) {
+        return;
+      }
+      picker.items = buildItems(query, entities);
+    };
+
+    await refreshItems('');
+
+    picker.onDidChangeValue((value) => {
+      if (searchTimeout) {
+        clearTimeout(searchTimeout);
+      }
+      searchTimeout = setTimeout(() => {
+        refreshItems(value).catch((error) => {
+          console.warn(`Failed to search ${entityType} entities:`, error);
+        });
+      }, 200);
+    });
+
+    return new Promise((resolve) => {
+      picker.onDidAccept(async () => {
+        const selected = picker.selectedItems[0];
+        if (!selected || !selected.type || !selected.source) {
+          resolve(undefined);
+          picker.dispose();
+          return;
+        }
+
+        try {
+          if (selected.source === 'create') {
+            if (!selected.name) {
+              resolve(undefined);
+            } else {
+              const created = await this.createEntityByType(selected.type, selected.name);
+              resolve(created ? { ...created, type: selected.type } : undefined);
+            }
+          } else if (selected.id && selected.name) {
+            resolve({
+              id: selected.id,
+              name: selected.name,
+              type: selected.type,
+            });
+          } else {
+            resolve(undefined);
+          }
+        } catch (error) {
+          vscode.window.showErrorMessage(
+            `Failed to add ${entityType}: ${error instanceof Error ? error.message : String(error)}`
+          );
+          resolve(undefined);
+        } finally {
+          picker.dispose();
+        }
+      });
+
+      picker.onDidHide(() => {
+        resolve(undefined);
+        picker.dispose();
+      });
+
+      picker.show();
+    });
+  }
+
+  private normalizeEntityReferencesForSave(input: unknown): {
+    projects: Array<{ id: string; name: string }>;
+    people: Array<{ id: string; name: string }>;
+    terms: Array<{ id: string; name: string }>;
+    companies: Array<{ id: string; name: string }>;
+  } {
+    const empty = {
+      projects: [] as Array<{ id: string; name: string }>,
+      people: [] as Array<{ id: string; name: string }>,
+      terms: [] as Array<{ id: string; name: string }>,
+      companies: [] as Array<{ id: string; name: string }>,
+    };
+
+    if (!input || typeof input !== 'object') {
+      return empty;
+    }
+
+    const payload = input as Record<string, unknown>;
+
+    const sanitize = (value: unknown): Array<{ id: string; name: string }> => {
+      if (!Array.isArray(value)) {
+        return [];
+      }
+      const deduped = new Map<string, { id: string; name: string }>();
+      for (const item of value) {
+        if (!item || typeof item !== 'object') {
+          continue;
+        }
+        const id = String((item as { id?: unknown }).id ?? '').trim();
+        const name = String((item as { name?: unknown }).name ?? '').trim();
+        if (!id || !name) {
+          continue;
+        }
+        deduped.set(id, { id, name });
+      }
+      return Array.from(deduped.values());
+    };
+
+    return {
+      projects: sanitize(payload.projects),
+      people: sanitize(payload.people),
+      terms: sanitize(payload.terms),
+      companies: sanitize(payload.companies),
+    };
+  }
+
+  private async handlePickEntityReference(
+    panel: vscode.WebviewPanel,
+    transcript: Transcript,
+    entityType: string
+  ): Promise<void> {
+    const selected = await this.showEntityReferencePickerForType(entityType);
+    if (!selected) {
+      panel.webview.postMessage({
+        command: 'entityReferencePickCancelled',
+      });
+      return;
+    }
+
+    const sectionKey = this.getEntitySectionKey(entityType);
+    if (!sectionKey) {
+      return;
+    }
+
+    panel.webview.postMessage({
+      command: 'entityReferencePicked',
+      section: sectionKey,
+      entity: {
+        id: selected.id,
+        name: selected.name,
+      },
+      transcriptUri: transcript.uri,
+    });
+  }
+
+  private async handleSaveEntityReferences(
+    panel: vscode.WebviewPanel,
+    transcript: Transcript,
+    transcriptUri: string,
+    entitiesPayload: unknown
+  ): Promise<void> {
+    if (!this._client) {
+      panel.webview.postMessage({
+        command: 'entityReferencesSaved',
+        success: false,
+        message: 'MCP client not initialized',
+      });
+      return;
+    }
+
+    try {
+      const entities = this.normalizeEntityReferencesForSave(entitiesPayload);
+      const transcriptPath = this.convertToRelativePath(transcript.path || transcript.filename);
+
+      await this._client.callTool('protokoll_update_transcript_entity_references', {
+        transcriptPath,
+        entities,
+      });
+
+      const current = this._currentTranscripts.get(transcriptUri);
+      if (current) {
+        this._currentTranscripts.set(transcriptUri, {
+          uri: current.uri,
+          transcript: {
+            ...current.transcript,
+            entities,
+          },
+        });
+      }
+
+      panel.webview.postMessage({
+        command: 'entityReferencesSaved',
+        success: true,
+      });
+
+      await this.refreshTranscript(transcriptUri);
+      vscode.window.showInformationMessage('Entity references updated');
+    } catch (error) {
+      panel.webview.postMessage({
+        command: 'entityReferencesSaved',
+        success: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      vscode.window.showErrorMessage(
+        `Failed to update entity references: ${error instanceof Error ? error.message : String(error)}`
+      );
     }
   }
 
@@ -3478,6 +4240,7 @@ export class TranscriptDetailViewProvider {
         }
         
         // Run setup immediately (script is at end of body, DOM should be ready)
+        renderEntityReferencesContent();
         setupInlineChatListeners();
         setupRefreshButton();
         setupEditButton();
@@ -3515,71 +4278,27 @@ export class TranscriptDetailViewProvider {
     const transcriptText = content.content ?? (content as { text?: string }).text ?? '*No content available*';
     const tags = metadata.tags ?? [];
 
-    // Entity references come directly from server
+    // Prefer canonical structured entities from readTranscript metadata.
+    // Only fall back to transcript.entities if structured metadata is unavailable.
+    const hasStructuredEntities = !!metadata.entities;
     const entityReferences: {
       projects?: Array<{ id: string; name: string }>;
       people?: Array<{ id: string; name: string }>;
       terms?: Array<{ id: string; name: string }>;
       companies?: Array<{ id: string; name: string }>;
-    } = {
-      projects: metadata.entities?.projects ?? [],
-      people: metadata.entities?.people ?? [],
-      terms: metadata.entities?.terms ?? [],
-      companies: metadata.entities?.companies ?? [],
-    };
-
-    // Add project from metadata if available and not already in entity references
-    if (metadata.projectId && metadata.project) {
-      const projectExists = entityReferences.projects?.some(p => p.id === metadata.projectId);
-      if (!projectExists) {
-        entityReferences.projects = entityReferences.projects ?? [];
-        entityReferences.projects.push({
-          id: metadata.projectId,
-          name: metadata.project,
-        });
-      }
-    }
-    
-    // Also merge with entities from transcript object if available (for backwards compatibility)
-    if (transcript.entities) {
-      if (transcript.entities.projects) {
-        entityReferences.projects = [
-          ...(entityReferences.projects || []),
-          ...transcript.entities.projects.map(p => ({ id: p.id, name: p.name }))
-        ];
-        // Remove duplicates
-        entityReferences.projects = entityReferences.projects.filter((p, index, self) =>
-          index === self.findIndex((t) => t.id === p.id)
-        );
-      }
-      if (transcript.entities.people) {
-        entityReferences.people = [
-          ...(entityReferences.people || []),
-          ...transcript.entities.people.map(p => ({ id: p.id, name: p.name }))
-        ];
-        entityReferences.people = entityReferences.people.filter((p, index, self) =>
-          index === self.findIndex((t) => t.id === p.id)
-        );
-      }
-      if (transcript.entities.terms) {
-        entityReferences.terms = [
-          ...(entityReferences.terms || []),
-          ...transcript.entities.terms.map(t => ({ id: t.id, name: t.name }))
-        ];
-        entityReferences.terms = entityReferences.terms.filter((t, index, self) =>
-          index === self.findIndex((e) => e.id === t.id)
-        );
-      }
-      if (transcript.entities.companies) {
-        entityReferences.companies = [
-          ...(entityReferences.companies || []),
-          ...transcript.entities.companies.map(c => ({ id: c.id, name: c.name }))
-        ];
-        entityReferences.companies = entityReferences.companies.filter((c, index, self) =>
-          index === self.findIndex((e) => e.id === c.id)
-        );
-      }
-    }
+    } = hasStructuredEntities
+      ? {
+          projects: metadata.entities?.projects ?? [],
+          people: metadata.entities?.people ?? [],
+          terms: metadata.entities?.terms ?? [],
+          companies: metadata.entities?.companies ?? [],
+        }
+      : {
+          projects: transcript.entities?.projects ?? [],
+          people: transcript.entities?.people ?? [],
+          terms: transcript.entities?.terms ?? [],
+          companies: transcript.entities?.companies ?? [],
+        };
 
     // Format date/time - use structured metadata from server
     const date = metadata.date ?? transcript.date ?? 'Unknown date';
@@ -3599,6 +4318,25 @@ export class TranscriptDetailViewProvider {
     const projectId = metadata.entities?.projects?.[0]?.id ?? metadata.projectId ?? transcript.entities?.projects?.[0]?.id ?? '';
     const projectName = metadata.entities?.projects?.[0]?.name ?? metadata.project ?? transcript.entities?.projects?.[0]?.name ?? '';
     const transcriptPath = transcript.path || transcript.filename;
+    const isManualNote = transcript.contentType === 'manual_note' || (!content.rawTranscript && !transcript.hasRawTranscript);
+    const hasManualEnhancedContent = !isManualNote
+      ? true
+      : (['enhanced', 'reviewed', 'closed', 'archived'].includes(status) && transcriptText.trim().length > 0);
+    const showEnhancedTab = !isManualNote || hasManualEnhancedContent;
+    const hasOriginalTab = !!content.rawTranscript || isManualNote;
+    const summaryConfig = this._summaryConfigByTranscript.get(transcript.uri);
+    const generatedSummary = this._generatedSummaryByTranscript.get(transcript.uri);
+    const summaryHistoryCount = (this._summaryHistoryByTranscript.get(transcript.uri) || []).length;
+    const hasSummary = !!generatedSummary?.content?.trim();
+    const summaryText = generatedSummary?.content || '';
+    const summaryGeneratedAt = generatedSummary?.generatedAt || '';
+    const summaryFeatureEnabled = vscode.workspace.getConfiguration('protokoll').get<boolean>('features.summaryEnabled', true);
+    const initialTab: 'enhanced' | 'raw' | 'summary' = hasSummary
+      ? 'summary'
+      : (showEnhancedTab ? (isManualNote ? 'raw' : 'enhanced') : 'raw');
+    const originalEditorText = isManualNote
+      ? transcriptText
+      : (content.rawTranscript?.text ?? '');
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -3928,6 +4666,62 @@ export class TranscriptDetailViewProvider {
         .tab-content.active {
             display: block;
         }
+        .original-editor-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .original-editor-status {
+            font-size: 0.85em;
+            color: var(--vscode-descriptionForeground);
+        }
+        .original-editor-status.dirty {
+            color: var(--vscode-editorWarning-foreground);
+        }
+        .original-editor-status.saved {
+            color: var(--vscode-testing-iconPassed);
+        }
+        .original-enhance-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .original-editor-textarea {
+            width: 100%;
+            min-height: 340px;
+            box-sizing: border-box;
+            resize: vertical;
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 6px;
+            padding: 12px;
+            background: var(--vscode-input-background);
+            color: var(--vscode-input-foreground);
+            font-family: var(--vscode-editor-font-family);
+            font-size: var(--vscode-editor-font-size);
+            line-height: 1.5;
+        }
+        .original-editor-textarea:focus {
+            outline: 1px solid var(--vscode-focusBorder);
+            outline-offset: 0;
+        }
+        .enhance-button {
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            padding: 8px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+        }
+        .enhance-button:hover {
+            background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .enhance-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
         .enhancement-timeline {
             margin-top: 16px;
         }
@@ -3980,6 +4774,48 @@ export class TranscriptDetailViewProvider {
             font-size: 0.85em;
             overflow-x: auto;
         }
+        .summary-empty-state {
+            border: 1px dashed var(--vscode-panel-border);
+            border-radius: 6px;
+            padding: 16px;
+            background-color: var(--vscode-editor-inactiveSelectionBackground);
+            max-width: 100ch;
+        }
+        .summary-empty-state h3 {
+            margin: 0 0 8px 0;
+            color: var(--vscode-textLink-foreground);
+            font-size: 1.05em;
+        }
+        .summary-empty-state p {
+            margin: 0 0 12px 0;
+            color: var(--vscode-descriptionForeground);
+        }
+        .summary-content-text {
+            background-color: var(--vscode-editor-background);
+            border-radius: 4px;
+            padding: 12px;
+            max-width: 100ch;
+        }
+        .summary-setup-preview {
+            margin-top: 12px;
+            border-radius: 4px;
+            border: 1px solid var(--vscode-panel-border);
+            background-color: var(--vscode-editor-background);
+            padding: 10px 12px;
+            max-width: 100ch;
+            font-size: 0.9em;
+        }
+        .summary-setup-row {
+            margin-bottom: 6px;
+        }
+        .summary-setup-row:last-child {
+            margin-bottom: 0;
+        }
+        .summary-setup-label {
+            font-weight: 600;
+            color: var(--vscode-descriptionForeground);
+            margin-right: 6px;
+        }
         .edit-button {
             background-color: var(--vscode-button-background);
             color: var(--vscode-button-foreground);
@@ -4010,6 +4846,84 @@ export class TranscriptDetailViewProvider {
             margin-top: 0;
             margin-bottom: 12px;
             font-size: 1.1em;
+        }
+        .entity-references-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+        .entity-references-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .entity-references-status {
+            margin-bottom: 12px;
+            padding: 8px 10px;
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+        .entity-references-status.success {
+            color: var(--vscode-testing-iconPassed);
+            background-color: color-mix(in srgb, var(--vscode-testing-iconPassed) 12%, transparent);
+            border: 1px solid color-mix(in srgb, var(--vscode-testing-iconPassed) 25%, transparent);
+        }
+        .entity-references-status.error {
+            color: var(--vscode-errorForeground);
+            background-color: var(--vscode-inputValidation-errorBackground);
+            border: 1px solid var(--vscode-inputValidation-errorBorder);
+        }
+        .entity-empty {
+            color: var(--vscode-descriptionForeground);
+            font-style: italic;
+            margin-bottom: 12px;
+        }
+        .entity-item-editable {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background-color: var(--vscode-badge-background);
+            color: var(--vscode-badge-foreground);
+            border-radius: 4px;
+            padding: 3px 6px 3px 10px;
+        }
+        .entity-item-link {
+            background: transparent;
+            border: none;
+            color: inherit;
+            font-size: 0.9em;
+            cursor: pointer;
+            padding: 3px 0;
+        }
+        .entity-remove-btn {
+            border: none;
+            background: transparent;
+            color: inherit;
+            cursor: pointer;
+            font-weight: 700;
+            line-height: 1;
+            opacity: 0.8;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+        .entity-remove-btn:hover {
+            opacity: 1;
+            background-color: color-mix(in srgb, var(--vscode-errorForeground) 20%, transparent);
+            color: var(--vscode-errorForeground);
+        }
+        .entity-add-btn {
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px dashed var(--vscode-button-border);
+            border-radius: 4px;
+            padding: 6px 10px;
+            cursor: pointer;
+            font-size: 0.9em;
+        }
+        .entity-add-btn:hover {
+            background-color: var(--vscode-button-secondaryHoverBackground);
         }
         .entity-list {
             display: flex;
@@ -4139,6 +5053,15 @@ export class TranscriptDetailViewProvider {
         }
         .task-add-btn:hover {
             background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .task-actions-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .task-actions-row .task-add-btn {
+            margin-top: 0;
         }
         .empty-tasks {
             color: var(--vscode-descriptionForeground);
@@ -4465,7 +5388,10 @@ export class TranscriptDetailViewProvider {
                         <button class="task-delete-btn" onclick="deleteTask('${this.escapeHtml(task.id)}')" title="Delete task">×</button>
                     </div>
                 `).join('')}
-                <button class="task-add-btn" onclick="addTask()">+ Add Task <span class="kbd-hint">K</span></button>
+                <div class="task-actions-row">
+                    <button class="task-add-btn" onclick="addTask()">+ Add Task <span class="kbd-hint">K</span></button>
+                    <button class="task-add-btn" onclick="identifyTasks()">Identify Tasks</button>
+                </div>
             </div>
         </div>
     </div>
@@ -4486,11 +5412,13 @@ export class TranscriptDetailViewProvider {
     </div>
     <div class="transcript-content-wrapper">
         <div class="content-tabs">
-            <button class="content-tab active" id="enhanced-tab" onclick="switchTab('enhanced')">Enhanced</button>
-            <button class="content-tab ${content.rawTranscript ? '' : 'disabled'}" id="raw-tab" onclick="switchTab('raw')" ${content.rawTranscript ? '' : 'disabled'}>Original</button>
+            ${showEnhancedTab ? `<button class="content-tab ${initialTab === 'enhanced' ? 'active' : ''}" id="enhanced-tab" onclick="switchTab('enhanced')">Enhanced</button>` : ''}
+            <button class="content-tab ${hasOriginalTab ? (initialTab === 'raw' ? 'active' : '') : 'disabled'}" id="raw-tab" onclick="switchTab('raw')" ${hasOriginalTab ? '' : 'disabled'}>Original</button>
+            ${summaryFeatureEnabled ? `<button class="content-tab ${initialTab === 'summary' ? 'active' : ''}" id="summary-tab" onclick="switchTab('summary')">Summary</button>` : ''}
             <button class="content-tab" id="enhancement-tab" onclick="switchTab('enhancement')">Enhancement</button>
         </div>
-        <div class="tab-content active" id="enhanced-content">
+        ${showEnhancedTab ? `
+        <div class="tab-content ${initialTab === 'enhanced' ? 'active' : ''}" id="enhanced-content">
             <div style="display: flex; gap: 8px; margin-bottom: 16px;">
                 <button class="edit-button" onclick="editInEditor()" id="edit-in-editor-btn" title="Edit in VS Code editor (supports voice dictation)">Edit in Editor <span class="kbd-hint">E</span></button>
                 <button class="edit-button" onclick="openSource()" id="open-source-btn" title="View source (read-only)" style="opacity: 0.7;">View Source <span class="kbd-hint">S</span></button>
@@ -4500,20 +5428,61 @@ export class TranscriptDetailViewProvider {
             </div>
             <button class="create-entity-button" id="create-entity-btn" onclick="createEntityFromSelection()" title="Correct this text by creating new entity or mapping to existing">Correct Text</button>
         </div>
-        ${content.rawTranscript ? `
-        <div class="tab-content" id="raw-content">
-            <div class="transcript-content" style="white-space: pre-wrap; font-family: var(--vscode-editor-font-family);">
-                ${this.escapeHtml(content.rawTranscript.text)}
+        ` : ''}
+        ${hasOriginalTab ? `
+        <div class="tab-content ${initialTab === 'raw' ? 'active' : ''}" id="raw-content">
+            ${isManualNote ? `
+            <div class="original-editor-actions">
+                <button class="button" id="save-original-btn" onclick="saveOriginalContent()" disabled>Save Original</button>
+                <span class="original-editor-status" id="original-editor-status">No changes</span>
             </div>
-            ${content.rawTranscript.model || content.rawTranscript.transcribedAt ? `
+            <div class="original-enhance-row">
+                <button class="enhance-button" id="enhance-original-btn" onclick="enhanceFromOriginal()">Enhance</button>
+            </div>
+            <textarea id="original-editor-input" class="original-editor-textarea" placeholder="Type or paste original note content...">${this.escapeHtml(originalEditorText)}</textarea>
+            ` : `
+            <div class="original-enhance-row">
+                <button class="enhance-button" id="enhance-original-btn" onclick="enhanceFromOriginal()">Enhance</button>
+            </div>
+            <div class="transcript-content" style="white-space: pre-wrap; font-family: var(--vscode-editor-font-family);">
+                ${this.escapeHtml(content.rawTranscript?.text ?? '')}
+            </div>
+            ${content.rawTranscript?.model || content.rawTranscript?.transcribedAt ? `
             <div style="margin-top: 16px; padding: 12px; background-color: var(--vscode-editor-inactiveSelectionBackground); border-radius: 4px; font-size: 0.85em; color: var(--vscode-descriptionForeground);">
-                ${content.rawTranscript.model ? `Model: ${this.escapeHtml(content.rawTranscript.model)}` : ''}
-                ${content.rawTranscript.model && content.rawTranscript.transcribedAt ? ' • ' : ''}
-                ${content.rawTranscript.transcribedAt ? `Transcribed: ${this.escapeHtml(this.formatDate(content.rawTranscript.transcribedAt))}` : ''}
+                ${content.rawTranscript?.model ? `Model: ${this.escapeHtml(content.rawTranscript.model)}` : ''}
+                ${content.rawTranscript?.model && content.rawTranscript?.transcribedAt ? ' • ' : ''}
+                ${content.rawTranscript?.transcribedAt ? `Transcribed: ${this.escapeHtml(this.formatDate(content.rawTranscript.transcribedAt))}` : ''}
             </div>
             ` : ''}
+            `}
         </div>
         ` : ''}
+        ${summaryFeatureEnabled ? `<div class="tab-content ${initialTab === 'summary' ? 'active' : ''}" id="summary-content">
+            ${hasSummary ? `
+            <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+                <button class="button button-secondary" id="summary-configure-btn" onclick="startSummarySetup()">Reconfigure</button>
+                <button class="button" id="summary-regenerate-btn" onclick="generateSummary()">Regenerate</button>
+            </div>
+            ${summaryGeneratedAt ? `<div class="last-fetched">Generated: ${this.escapeHtml(this.formatDate(summaryGeneratedAt))}</div>` : ''}
+            ${summaryHistoryCount > 0 ? `<div class="last-fetched">Previous summary versions kept: ${summaryHistoryCount}</div>` : ''}
+            <div class="summary-content-text">${this.markdownToHtml(summaryText)}</div>
+            ` : `
+            <div class="summary-empty-state" id="summary-empty-state">
+                <h3>No summary yet</h3>
+                <p id="summary-setup-description">Generate a summary to create a short, audience-aware overview of this note.</p>
+                <div class="summary-setup-preview" id="summary-setup-preview" style="${summaryConfig ? '' : 'display: none;'}">
+                    <div class="summary-setup-row"><span class="summary-setup-label">Title:</span><span id="summary-setup-title">${this.escapeHtml(summaryConfig?.title || '')}</span></div>
+                    <div class="summary-setup-row"><span class="summary-setup-label">Audience:</span><span id="summary-setup-audience">${this.escapeHtml(summaryConfig?.audience || '')}</span></div>
+                    <div class="summary-setup-row"><span class="summary-setup-label">Style:</span><span id="summary-setup-style">${this.escapeHtml(summaryConfig?.styleLabel || '')}</span></div>
+                    <div class="summary-setup-row"><span class="summary-setup-label">Guidance:</span><span id="summary-setup-guidance">${this.escapeHtml(summaryConfig?.guidance || '(none)')}</span></div>
+                </div>
+                <div style="display: flex; gap: 8px; margin-top: 8px;">
+                    <button class="button button-secondary" id="summary-configure-btn" onclick="startSummarySetup()">Configure Summary</button>
+                    <button class="button" id="summary-generate-btn" onclick="generateSummary()" ${summaryConfig ? '' : 'disabled'}>Generate Summary</button>
+                </div>
+            </div>
+            `}
+        </div>` : ''}
         <div class="tab-content" id="enhancement-content">
             <div id="enhancement-log-container">
                 <div class="loading">Loading enhancement log...</div>
@@ -4527,7 +5496,180 @@ export class TranscriptDetailViewProvider {
         const transcriptUri = ${JSON.stringify(transcript.uri)};
         const projectId = ${JSON.stringify(projectId)};
         const currentTags = ${JSON.stringify(tags)};
+        const isManualNote = ${JSON.stringify(isManualNote)};
+        const showEnhancedTab = ${JSON.stringify(showEnhancedTab)};
+        const hasManualEnhancedContent = ${JSON.stringify(hasManualEnhancedContent)};
+        const originalRawText = ${JSON.stringify(content.rawTranscript?.text ?? '')};
         const originalTranscriptText = ${JSON.stringify(transcriptText)};
+        const originalEditorInitialText = ${JSON.stringify(originalEditorText)};
+        const initialEntityReferences = ${JSON.stringify(entityReferences)};
+        const entitySectionConfig = [
+            { key: 'projects', title: 'Projects', type: 'project', label: 'Project' },
+            { key: 'people', title: 'People', type: 'person', label: 'Person' },
+            { key: 'terms', title: 'Terms', type: 'term', label: 'Term' },
+            { key: 'companies', title: 'Companies', type: 'company', label: 'Company' }
+        ];
+        let isEditingEntityReferences = false;
+        let isSavingEntityReferences = false;
+        let entityReferencesState = normalizeEntityReferences(initialEntityReferences);
+        let activeTabName = ${JSON.stringify(initialTab)};
+        let originalDraft = originalEditorInitialText;
+        let lastSavedOriginal = originalEditorInitialText;
+        let hasUnsavedOriginalChanges = false;
+
+        function normalizeEntityReferences(raw) {
+            const result = { projects: [], people: [], terms: [], companies: [] };
+            if (!raw || typeof raw !== 'object') {
+                return result;
+            }
+
+            for (const key of Object.keys(result)) {
+                const value = raw[key];
+                if (!Array.isArray(value)) {
+                    continue;
+                }
+                const dedupe = new Map();
+                value.forEach(item => {
+                    if (!item || typeof item !== 'object') { return; }
+                    const id = String(item.id || '').trim();
+                    const name = String(item.name || '').trim();
+                    if (!id || !name) { return; }
+                    dedupe.set(id, { id, name });
+                });
+                result[key] = Array.from(dedupe.values());
+            }
+            return result;
+        }
+
+        function showEntityReferenceStatus(message, type) {
+            const statusEl = document.getElementById('entity-references-status');
+            if (!statusEl) {
+                return;
+            }
+            statusEl.textContent = message;
+            statusEl.className = 'entity-references-status ' + type;
+            statusEl.style.display = 'block';
+        }
+
+        function clearEntityReferenceStatus() {
+            const statusEl = document.getElementById('entity-references-status');
+            if (!statusEl) {
+                return;
+            }
+            statusEl.textContent = '';
+            statusEl.className = 'entity-references-status';
+            statusEl.style.display = 'none';
+        }
+
+        function renderEntityReferencesContent() {
+            const container = document.getElementById('entity-references-content');
+            const editBtn = document.getElementById('entity-references-edit-btn');
+            const saveBtn = document.getElementById('entity-references-save-btn');
+            if (!container || !editBtn || !saveBtn) {
+                return;
+            }
+
+            editBtn.style.display = isEditingEntityReferences ? 'none' : 'inline-flex';
+            saveBtn.style.display = isEditingEntityReferences ? 'inline-flex' : 'none';
+            saveBtn.disabled = isSavingEntityReferences;
+            saveBtn.textContent = isSavingEntityReferences ? 'Saving...' : 'Save';
+
+            let hasAnyEntities = false;
+            let html = '';
+
+            entitySectionConfig.forEach(section => {
+                const items = entityReferencesState[section.key] || [];
+                if (!isEditingEntityReferences && items.length === 0) {
+                    return;
+                }
+                if (items.length > 0) {
+                    hasAnyEntities = true;
+                }
+
+                html += '<div class="entity-section"><h3>' + escapeHtml(section.title) + '</h3><div class="entity-list">';
+                if (items.length === 0) {
+                    html += '<span class="entity-empty">No entities</span>';
+                } else {
+                    items.forEach(item => {
+                        const escapedId = escapeHtml(item.id);
+                        const escapedName = escapeHtml(item.name);
+                        if (isEditingEntityReferences) {
+                            html += '<span class="entity-item-editable">';
+                            html += '<button class="entity-item-link" onclick="openEntity(&#39;' + section.type + '&#39;, &#39;' + escapedId + '&#39;)">';
+                            html += '<span class="entity-type-label">' + escapeHtml(section.label) + ':</span> ' + escapedName;
+                            html += '</button>';
+                            html += '<button class="entity-remove-btn" onclick="removeEntityReference(&#39;' + section.key + '&#39;, &#39;' + escapedId + '&#39;)" title="Remove ' + escapeHtml(section.label) + '">×</button>';
+                            html += '</span>';
+                        } else {
+                            html += '<a href="#" class="entity-item" onclick="openEntity(&#39;' + section.type + '&#39;, &#39;' + escapedId + '&#39;); return false;">';
+                            html += '<span class="entity-type-label">' + escapeHtml(section.label) + ':</span> ' + escapedName;
+                            html += '</a>';
+                        }
+                    });
+                }
+                if (isEditingEntityReferences) {
+                    html += '<button class="entity-add-btn" onclick="pickEntityReference(&#39;' + section.type + '&#39;)">+ Add New Entity</button>';
+                }
+                html += '</div></div>';
+            });
+
+            if (!isEditingEntityReferences && !hasAnyEntities) {
+                html = '<div class="entity-empty">No entity references yet.</div>';
+            }
+
+            container.innerHTML = html;
+        }
+
+        function startEditEntityReferences() {
+            isEditingEntityReferences = true;
+            clearEntityReferenceStatus();
+            renderEntityReferencesContent();
+        }
+
+        function removeEntityReference(sectionKey, entityId) {
+            const list = entityReferencesState[sectionKey] || [];
+            entityReferencesState[sectionKey] = list.filter(entity => entity.id !== entityId);
+            renderEntityReferencesContent();
+        }
+
+        function pickEntityReference(entityType) {
+            if (isSavingEntityReferences) {
+                return;
+            }
+            vscode.postMessage({
+                command: 'pickEntityReference',
+                transcriptPath: transcriptPath,
+                entityType: entityType
+            });
+        }
+
+        function saveEntityReferences() {
+            if (!isEditingEntityReferences || isSavingEntityReferences) {
+                return;
+            }
+            isSavingEntityReferences = true;
+            clearEntityReferenceStatus();
+            renderEntityReferencesContent();
+            vscode.postMessage({
+                command: 'saveEntityReferences',
+                transcriptPath: transcriptPath,
+                entities: entityReferencesState
+            });
+        }
+
+        function addPickedEntityReference(sectionKey, entity) {
+            if (!entity || !entity.id || !entity.name) {
+                return;
+            }
+            const current = entityReferencesState[sectionKey] || [];
+            if (current.some(item => item.id === entity.id)) {
+                showEntityReferenceStatus('Entity already added.', 'error');
+                return;
+            }
+            entityReferencesState[sectionKey] = current.concat([{ id: entity.id, name: entity.name }]);
+            clearEntityReferenceStatus();
+            renderEntityReferencesContent();
+        }
 
         function toggleMetadata() {
             const section = document.getElementById('metadata-section');
@@ -4545,7 +5687,138 @@ export class TranscriptDetailViewProvider {
 
         let enhancementLogLoaded = false;
         
+        function setOriginalSaveStatus(message, state) {
+            const statusEl = document.getElementById('original-editor-status');
+            if (!statusEl) {
+                return;
+            }
+            statusEl.textContent = message;
+            statusEl.classList.remove('dirty', 'saved');
+            if (state) {
+                statusEl.classList.add(state);
+            }
+        }
+
+        function updateOriginalDirtyState() {
+            if (!isManualNote) {
+                return;
+            }
+            const saveBtn = document.getElementById('save-original-btn');
+            const editor = document.getElementById('original-editor-input');
+            if (!editor || !saveBtn) {
+                return;
+            }
+            originalDraft = editor.value;
+            hasUnsavedOriginalChanges = originalDraft !== lastSavedOriginal;
+            saveBtn.disabled = !hasUnsavedOriginalChanges;
+            if (hasUnsavedOriginalChanges) {
+                setOriginalSaveStatus('Unsaved changes', 'dirty');
+            } else {
+                setOriginalSaveStatus('No changes', '');
+            }
+        }
+
+        function getCurrentOriginalText() {
+            if (isManualNote) {
+                const editor = document.getElementById('original-editor-input');
+                return editor ? editor.value : '';
+            }
+            return originalRawText;
+        }
+
+        function confirmDiscardOriginalChanges() {
+            if (!isManualNote || !hasUnsavedOriginalChanges) {
+                return true;
+            }
+            return window.confirm('You have unsaved changes in Original. Continue without saving?');
+        }
+
+        function setupOriginalEditor() {
+            if (!isManualNote) {
+                return;
+            }
+            const editor = document.getElementById('original-editor-input');
+            const saveBtn = document.getElementById('save-original-btn');
+            if (!editor || !saveBtn) {
+                return;
+            }
+
+            editor.addEventListener('input', () => {
+                updateOriginalDirtyState();
+            });
+
+            editor.addEventListener('keydown', (e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+                    e.preventDefault();
+                    saveOriginalContent();
+                }
+            });
+
+            updateOriginalDirtyState();
+        }
+
+        function saveOriginalContent() {
+            if (!isManualNote) {
+                return;
+            }
+            const editor = document.getElementById('original-editor-input');
+            const saveBtn = document.getElementById('save-original-btn');
+            if (!editor || !saveBtn || saveBtn.disabled) {
+                return;
+            }
+
+            const newContent = editor.value;
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Saving...';
+            setOriginalSaveStatus('Saving...', '');
+
+            vscode.postMessage({
+                command: 'saveOriginalContent',
+                transcriptPath: transcriptPath,
+                transcriptUri: transcriptUri,
+                newContent: newContent
+            });
+        }
+
+        function enhanceFromOriginal() {
+            const enhanceBtn = document.getElementById('enhance-original-btn');
+            const originalText = getCurrentOriginalText();
+            if (!originalText || !originalText.trim()) {
+                window.alert('Original is empty. Add content before running Enhance.');
+                return;
+            }
+
+            const hasExistingEnhanced = showEnhancedTab && (!isManualNote || hasManualEnhancedContent);
+            if (hasExistingEnhanced) {
+                const confirmed = window.confirm('Enhanced content already exists. Overwrite it with a new enhancement?');
+                if (!confirmed) {
+                    return;
+                }
+            }
+
+            if (enhanceBtn) {
+                enhanceBtn.disabled = true;
+                enhanceBtn.textContent = 'Enhancing...';
+            }
+
+            vscode.postMessage({
+                command: 'enhanceFromOriginal',
+                transcriptPath: transcriptPath,
+                transcriptUri: transcriptUri,
+                originalText: originalText,
+                overwriteConfirmed: hasExistingEnhanced
+            });
+        }
+
         function switchTab(tabName) {
+            if (tabName === activeTabName) {
+                return;
+            }
+
+            if (isManualNote && activeTabName === 'raw' && tabName !== 'raw' && !confirmDiscardOriginalChanges()) {
+                return;
+            }
+
             // Update tab buttons
             document.querySelectorAll('.content-tab').forEach(tab => {
                 tab.classList.remove('active');
@@ -4563,6 +5836,7 @@ export class TranscriptDetailViewProvider {
             if (activeContent) {
                 activeContent.classList.add('active');
             }
+            activeTabName = tabName;
             
             // Lazy load enhancement log when tab is first opened
             if (tabName === 'enhancement' && !enhancementLogLoaded) {
@@ -4577,6 +5851,37 @@ export class TranscriptDetailViewProvider {
                 command: 'loadEnhancementLog',
                 transcriptPath: transcriptPath
             });
+        }
+
+        function applySummarySetup(summaryConfig) {
+            const preview = document.getElementById('summary-setup-preview');
+            const description = document.getElementById('summary-setup-description');
+            const generateButton = document.getElementById('summary-generate-btn');
+            const configureButton = document.getElementById('summary-configure-btn');
+            if (!preview || !generateButton) {
+                return;
+            }
+
+            const titleEl = document.getElementById('summary-setup-title');
+            const audienceEl = document.getElementById('summary-setup-audience');
+            const styleEl = document.getElementById('summary-setup-style');
+            const guidanceEl = document.getElementById('summary-setup-guidance');
+            if (!titleEl || !audienceEl || !styleEl || !guidanceEl) {
+                return;
+            }
+
+            titleEl.textContent = summaryConfig.title || '';
+            audienceEl.textContent = summaryConfig.audience || '';
+            styleEl.textContent = summaryConfig.styleLabel || summaryConfig.stylePreset || '';
+            guidanceEl.textContent = summaryConfig.guidance || '(none)';
+            preview.style.display = 'block';
+            if (description) {
+                description.textContent = 'Summary configuration saved. You can reconfigure it before generation.';
+            }
+            if (configureButton) {
+                configureButton.textContent = 'Reconfigure Summary';
+            }
+            generateButton.disabled = false;
         }
         
         function renderEnhancementLog(data) {
@@ -4665,6 +5970,10 @@ export class TranscriptDetailViewProvider {
                     console.log('Received enhancement log data', message.data);
                     renderEnhancementLog(message.data);
                     break;
+                case 'summarySetupReady':
+                    applySummarySetup(message.summaryConfig || {});
+                    switchTab('summary');
+                    break;
             }
         });
         
@@ -4712,6 +6021,29 @@ export class TranscriptDetailViewProvider {
             vscode.postMessage({
                 command: 'addTask',
                 transcriptPath: transcriptPath
+            });
+        }
+
+        function identifyTasks() {
+            vscode.postMessage({
+                command: 'identifyTasks',
+                transcriptPath: transcriptPath
+            });
+        }
+
+        function startSummarySetup() {
+            vscode.postMessage({
+                command: 'startSummarySetup',
+                transcriptPath: transcriptPath,
+                transcriptUri: transcriptUri
+            });
+        }
+
+        function generateSummary() {
+            vscode.postMessage({
+                command: 'generateSummary',
+                transcriptPath: transcriptPath,
+                transcriptUri: transcriptUri
             });
         }
 
@@ -4803,6 +6135,9 @@ export class TranscriptDetailViewProvider {
         }
 
         function editInEditor() {
+            if (!confirmDiscardOriginalChanges()) {
+                return;
+            }
             vscode.postMessage({
                 command: 'editInEditor',
                 transcriptPath: transcriptPath,
@@ -4902,6 +6237,9 @@ export class TranscriptDetailViewProvider {
         }
 
         function openSource() {
+            if (!confirmDiscardOriginalChanges()) {
+                return;
+            }
             vscode.postMessage({
                 command: 'openSource',
                 transcriptPath: transcriptPath,
@@ -4988,12 +6326,39 @@ export class TranscriptDetailViewProvider {
                     }
                 }
             } else if (message.command === 'saveFailed') {
-                // Re-enable the save button if save failed
-                const saveBtn = document.querySelector('#transcript-content-edit .button');
+                const saveBtn = document.getElementById('save-original-btn');
                 if (saveBtn) {
                     saveBtn.disabled = false;
-                    saveBtn.textContent = 'Save';
+                    saveBtn.textContent = 'Save Original';
+                    setOriginalSaveStatus('Save failed', 'dirty');
                 }
+            } else if (message.command === 'saveSucceeded') {
+                const saveBtn = document.getElementById('save-original-btn');
+                const editor = document.getElementById('original-editor-input');
+                if (saveBtn && editor) {
+                    lastSavedOriginal = editor.value;
+                    hasUnsavedOriginalChanges = false;
+                    saveBtn.disabled = true;
+                    saveBtn.textContent = 'Save Original';
+                    setOriginalSaveStatus('Saved', 'saved');
+                }
+            } else if (message.command === 'enhanceStarted' || message.command === 'enhanceFailed') {
+                const enhanceBtn = document.getElementById('enhance-original-btn');
+                if (enhanceBtn) {
+                    enhanceBtn.disabled = false;
+                    enhanceBtn.textContent = 'Enhance';
+                }
+            } else if (message.command === 'entityReferencePicked') {
+                addPickedEntityReference(message.section, message.entity);
+            } else if (message.command === 'entityReferencesSaved') {
+                isSavingEntityReferences = false;
+                if (message.success) {
+                    isEditingEntityReferences = false;
+                    showEntityReferenceStatus('Entity references saved.', 'success');
+                } else {
+                    showEntityReferenceStatus(message.message || 'Failed to save entity references.', 'error');
+                }
+                renderEntityReferencesContent();
             }
         });
 
@@ -5012,8 +6377,23 @@ export class TranscriptDetailViewProvider {
         }
 
         // Auto-focus the chat input when the view loads
+        window.addEventListener('beforeunload', (event) => {
+            if (isManualNote && hasUnsavedOriginalChanges) {
+                event.preventDefault();
+                event.returnValue = '';
+            }
+        });
+
         document.addEventListener('DOMContentLoaded', () => {
             setupRefreshButton();
+            setupOriginalEditor();
+            if (isManualNote) {
+                switchTab('raw');
+                const editor = document.getElementById('original-editor-input');
+                if (editor) {
+                    setTimeout(() => editor.focus(), 0);
+                }
+            }
             // Don't auto-focus on chat input - let users press 'C' to focus
         });
         
@@ -5657,26 +7037,26 @@ export class TranscriptDetailViewProvider {
     terms?: Array<{ id: string; name: string }>;
     companies?: Array<{ id: string; name: string }>;
   }): string {
-    const hasEntities = 
-      (entities.projects && entities.projects.length > 0) ||
-      (entities.people && entities.people.length > 0) ||
-      (entities.terms && entities.terms.length > 0) ||
-      (entities.companies && entities.companies.length > 0);
-
-    if (!hasEntities) {
-      return '';
-    }
+    const sectionDefs = [
+      { key: 'projects', title: 'Projects', type: 'project', label: 'Project' },
+      { key: 'people', title: 'People', type: 'person', label: 'Person' },
+      { key: 'terms', title: 'Terms', type: 'term', label: 'Term' },
+      { key: 'companies', title: 'Companies', type: 'company', label: 'Company' },
+    ] as const;
 
     const sections: string[] = [];
-
-    if (entities.projects && entities.projects.length > 0) {
+    for (const section of sectionDefs) {
+      const items = entities[section.key] ?? [];
+      if (!items.length) {
+        continue;
+      }
       sections.push(`
-        <div>
-          <h3>Projects</h3>
+        <div class="entity-section">
+          <h3>${section.title}</h3>
           <div class="entity-list">
-            ${entities.projects.map(p => `
-              <a href="#" class="entity-item" onclick="openEntity('project', '${this.escapeHtml(p.id)}'); return false;">
-                <span class="entity-type-label">Project:</span> ${this.escapeHtml(p.name)}
+            ${items.map(item => `
+              <a href="#" class="entity-item" onclick="openEntity('${section.type}', '${this.escapeHtml(item.id)}'); return false;">
+                <span class="entity-type-label">${section.label}:</span> ${this.escapeHtml(item.name)}
               </a>
             `).join('')}
           </div>
@@ -5684,55 +7064,21 @@ export class TranscriptDetailViewProvider {
       `);
     }
 
-    if (entities.people && entities.people.length > 0) {
-      sections.push(`
-        <div>
-          <h3>People</h3>
-          <div class="entity-list">
-            ${entities.people.map(p => `
-              <a href="#" class="entity-item" onclick="openEntity('person', '${this.escapeHtml(p.id)}'); return false;">
-                <span class="entity-type-label">Person:</span> ${this.escapeHtml(p.name)}
-              </a>
-            `).join('')}
-          </div>
-        </div>
-      `);
-    }
-
-    if (entities.terms && entities.terms.length > 0) {
-      sections.push(`
-        <div>
-          <h3>Terms</h3>
-          <div class="entity-list">
-            ${entities.terms.map(t => `
-              <a href="#" class="entity-item" onclick="openEntity('term', '${this.escapeHtml(t.id)}'); return false;">
-                <span class="entity-type-label">Term:</span> ${this.escapeHtml(t.name)}
-              </a>
-            `).join('')}
-          </div>
-        </div>
-      `);
-    }
-
-    if (entities.companies && entities.companies.length > 0) {
-      sections.push(`
-        <div>
-          <h3>Companies</h3>
-          <div class="entity-list">
-            ${entities.companies.map(c => `
-              <a href="#" class="entity-item" onclick="openEntity('company', '${this.escapeHtml(c.id)}'); return false;">
-                <span class="entity-type-label">Company:</span> ${this.escapeHtml(c.name)}
-              </a>
-            `).join('')}
-          </div>
-        </div>
-      `);
-    }
+    const initialContent = sections.length > 0
+      ? sections.join('')
+      : '<div class="entity-empty">No entity references yet.</div>';
 
     return `
-      <div class="entity-references">
-        <h3>Entity References</h3>
-        ${sections.join('')}
+      <div class="entity-references" id="entity-references">
+        <div class="entity-references-header">
+          <h3>Entity References</h3>
+          <div class="entity-references-actions">
+            <button class="button button-secondary" id="entity-references-edit-btn" onclick="startEditEntityReferences()">Edit</button>
+            <button class="button" id="entity-references-save-btn" style="display:none;" onclick="saveEntityReferences()">Save</button>
+          </div>
+        </div>
+        <div id="entity-references-status" class="entity-references-status" style="display:none;"></div>
+        <div id="entity-references-content">${initialContent}</div>
       </div>
     `;
   }

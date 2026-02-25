@@ -794,24 +794,31 @@ export class TranscriptItem extends vscode.TreeItem {
       
       // Get status and use appropriate icon (cast to string to handle legacy values like 'open')
       const status: string = transcript?.status || 'initial';
+      const isManualNote = transcript?.contentType === 'manual_note' || transcript?.hasRawTranscript === false;
       
-      // Show color-coded circles based on status — mirrors STATUS_COLORS in dashboardView.ts:
-      // initial=gray, enhanced=blue, reviewed=green, in_progress/open=orange, closed=purple, archived=gray
-      if (status === 'initial') {
-        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
-      } else if (status === 'enhanced') {
-        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.blue'));
-      } else if (status === 'reviewed') {
-        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.green'));
-      } else if (status === 'in_progress' || status === 'open') {
-        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.orange'));
-      } else if (status === 'closed') {
-        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.purple'));
-      } else if (status === 'archived') {
-        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
+      // Notes get a subtle note icon so they are distinguishable in the shared tree.
+      // Transcripts keep lifecycle color circles for status-at-a-glance.
+      if (isManualNote) {
+        this.iconPath = new vscode.ThemeIcon('note');
       } else {
-        // Fallback for unknown/legacy status values
-        this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
+        // Show color-coded circles based on status — mirrors STATUS_COLORS in dashboardView.ts:
+        // initial=gray, enhanced=blue, reviewed=green, in_progress/open=orange, closed=purple, archived=gray
+        if (status === 'initial') {
+          this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
+        } else if (status === 'enhanced') {
+          this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.blue'));
+        } else if (status === 'reviewed') {
+          this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.green'));
+        } else if (status === 'in_progress' || status === 'open') {
+          this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.orange'));
+        } else if (status === 'closed') {
+          this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.purple'));
+        } else if (status === 'archived') {
+          this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
+        } else {
+          // Fallback for unknown/legacy status values
+          this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
+        }
       }
       
       // Note: description is set by the caller in getChildren() to show project info
@@ -819,7 +826,7 @@ export class TranscriptItem extends vscode.TreeItem {
       
       // Build detailed tooltip
       const projectNames = transcript?.entities?.projects?.map(p => p.name).join(', ') || project || '';
-      const typeLabel = transcript?.hasRawTranscript ? 'Transcript' : 'Note';
+      const typeLabel = isManualNote ? 'Note' : 'Transcript';
       const statusLabel = {
         initial: 'Initial',
         enhanced: 'Enhanced',
