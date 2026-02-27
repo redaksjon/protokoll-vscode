@@ -19,6 +19,7 @@ export class McpClient {
   private serverUrl: string;
   private sseConnection: http.ClientRequest | null = null; // HTTP request for SSE connection (works for both http and https)
   private notificationHandlers: Map<string, Array<(data: unknown) => void>> = new Map();
+  private subscribedResources: Set<string> = new Set(); // Track subscriptions for transparent re-subscribe after session recovery
   private recoveringSession: boolean = false; // Flag to prevent infinite recovery loops
   private onSessionRecoveredCallbacks: Array<() => void | Promise<void>> = []; // Callbacks to run after session recovery
 
@@ -80,19 +81,48 @@ export class McpClient {
    * Check if an error indicates a session problem that requires reinitialization
    */
   private isSessionError(error: unknown, response?: JsonRpcResponse): boolean {
-    // Check HTTP 404 status
-    if (error instanceof Error && error.message.includes('HTTP 404')) {
-      return true;
+    // Check explicit error-message patterns
+    if (error instanceof Error) {
+      const lowerMessage = error.message.toLowerCase();
+      if (lowerMessage.includes('session not found') ||
+          lowerMessage.includes('missing mcp-session-id header') ||
+          lowerMessage.includes('http 404')) {
+        return true;
+      }
     }
     
     // Check JSON-RPC error response
     if (response?.error) {
       const errorMessage = response.error.message?.toLowerCase() || '';
+      const errorCode = response.error.code;
       return errorMessage.includes('session not found') || 
-             errorMessage.includes('session not found');
+             errorMessage.includes('missing mcp-session-id header') ||
+             errorCode === -32000;
     }
     
     return false;
+  }
+
+  /**
+   * Decide whether we should actively recover, avoiding retries on unrelated 404s.
+   */
+  private shouldRecoverSession(error: unknown, response?: JsonRpcResponse): boolean {
+    if (response?.error) {
+      const message = response.error.message?.toLowerCase() || '';
+      const code = response.error.code;
+      return message.includes('session not found') ||
+             message.includes('missing mcp-session-id header') ||
+             code === -32000;
+    }
+
+    if (!(error instanceof Error)) {
+      return false;
+    }
+
+    const lowerMessage = error.message.toLowerCase();
+    const explicitSessionSignal = lowerMessage.includes('session not found') ||
+      lowerMessage.includes('missing mcp-session-id header');
+    return explicitSessionSignal;
   }
 
   /**
@@ -140,9 +170,13 @@ export class McpClient {
       const req = httpModule.request(options, (res) => {
         // Get session ID from response header if present
         const sessionIdHeader = res.headers['mcp-session-id'] as string | undefined;
-        if (sessionIdHeader && !this.sessionId) {
+        if (sessionIdHeader && sessionIdHeader !== this.sessionId) {
+          const previousSession = this.sessionId;
           this.sessionId = sessionIdHeader;
-          // Start SSE connection after we get the session ID
+          // Start (or restart) SSE when session is established/rotated
+          if (previousSession && previousSession !== sessionIdHeader) {
+            console.log(`Protokoll: [SESSION] Session rotated by server (${previousSession} -> ${sessionIdHeader})`);
+          }
           this.startSSEConnection();
         }
 
@@ -169,7 +203,7 @@ export class McpClient {
             }
             
             // Check if this is a session error and we should retry
-            if (retryOnSessionError && !this.recoveringSession && this.isSessionError(error, jsonRpcError || undefined)) {
+            if (retryOnSessionError && !this.recoveringSession && this.shouldRecoverSession(error, jsonRpcError || undefined)) {
               console.warn('Protokoll: [SESSION] Session error detected, attempting to recover...');
               try {
                 await this.recoverSession();
@@ -210,7 +244,7 @@ export class McpClient {
               : JSON.parse(data);
             
             // Check for session errors in JSON-RPC response
-            if (retryOnSessionError && !this.recoveringSession && this.isSessionError(null, responseData)) {
+            if (retryOnSessionError && !this.recoveringSession && this.shouldRecoverSession(null, responseData)) {
               console.warn('Protokoll: [SESSION] Session error in response, attempting to recover...');
               try {
                 await this.recoverSession();
@@ -270,6 +304,18 @@ export class McpClient {
       await this.initialize();
       
       console.log(`Protokoll: [SESSION] ✅ Session recovered (old: ${oldSessionId}, new: ${this.sessionId})`);
+
+      // Re-subscribe to previously subscribed resources
+      if (this.subscribedResources.size > 0) {
+        console.log(`Protokoll: [SESSION] Re-subscribing ${this.subscribedResources.size} resource subscription(s)`);
+        for (const uri of this.subscribedResources) {
+          try {
+            await this.subscribeToResource(uri);
+          } catch (error) {
+            console.error(`Protokoll: [SESSION] Failed to re-subscribe to ${uri}:`, error);
+          }
+        }
+      }
       
       // Notify callbacks that session was recovered (e.g., to re-subscribe)
       console.log(`Protokoll: [SESSION] Notifying ${this.onSessionRecoveredCallbacks.length} callback(s) about recovery`);
@@ -620,8 +666,8 @@ export class McpClient {
             
             // If we get a 404, the session might be invalid
             // Try to recover the session
-            if (res.statusCode === 404 && !this.recoveringSession) {
-              console.warn('Protokoll: [SSE] 404 error - session may be invalid, attempting recovery...');
+            if ((res.statusCode === 404 || res.statusCode === 400) && !this.recoveringSession) {
+              console.warn(`Protokoll: [SSE] ${res.statusCode} error - session may be invalid, attempting recovery...`);
               this.recoverSession().catch((error) => {
                 console.error('Protokoll: [SSE] Failed to recover session:', error);
               });
@@ -686,13 +732,15 @@ export class McpClient {
           console.log('Protokoll: [SSE] ⚠️ Connection closed by server (end event)');
           console.log(`Protokoll: [SSE] Remaining buffer: ${buffer.length} bytes`);
           this.sseConnection = null;
-          // Attempt to reconnect after a delay
-          setTimeout(() => {
-            if (this.sessionId) {
-              console.log('Protokoll: [SSE] 🔄 Attempting to reconnect...');
-              this.startSSEConnection();
-            }
-          }, 5000);
+          // Reconnect only when notifications are actually in use.
+          if (this.sessionId && (this.notificationHandlers.size > 0 || this.subscribedResources.size > 0)) {
+            setTimeout(() => {
+              if (this.sessionId && (this.notificationHandlers.size > 0 || this.subscribedResources.size > 0)) {
+                console.log('Protokoll: [SSE] 🔄 Attempting to reconnect...');
+                this.startSSEConnection();
+              }
+            }, 5000);
+          }
         });
 
         res.on('error', (error) => {
@@ -822,6 +870,7 @@ export class McpClient {
       throw new Error(`Failed to subscribe to resource: ${response.error.message}`);
     }
 
+    this.subscribedResources.add(uri);
     console.log(`Protokoll: [SUBSCRIPTION] ✅ Successfully subscribed to resource: ${uri}`);
   }
 
@@ -847,6 +896,7 @@ export class McpClient {
       throw new Error(`Failed to unsubscribe from resource: ${response.error.message}`);
     }
 
+    this.subscribedResources.delete(uri);
     console.log(`Protokoll: [UNSUBSCRIPTION] ✅ Successfully unsubscribed from resource: ${uri}`);
   }
 
@@ -856,5 +906,6 @@ export class McpClient {
   dispose(): void {
     this.stopSSEConnection();
     this.notificationHandlers.clear();
+    this.subscribedResources.clear();
   }
 }
