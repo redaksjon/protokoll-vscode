@@ -41,6 +41,18 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.addServerConnection",
+        "title": "Add Server Connection",
+        "icon": "$(add)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.switchServerConnection",
+        "title": "Switch Server Connection",
+        "icon": "$(server-process)",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.refreshTranscripts",
         "title": "Refresh",
         "icon": "$(refresh)",
@@ -402,6 +414,16 @@
         {
           "command": "protokoll.refreshChats",
           "when": "view == protokollChats",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.addServerConnection",
+          "when": "view == protokollConnectionStatus",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.switchServerConnection",
+          "when": "view == protokollConnectionStatus",
           "group": "navigation"
         }
       ],
