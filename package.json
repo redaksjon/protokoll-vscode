@@ -2,7 +2,7 @@
   "name": "protokoll-vscode",
   "displayName": "Protokoll",
   "description": "VS Code extension for viewing Protokoll transcripts and entities via HTTP MCP server",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/redaksjon/protokoll-vscode.git"
@@ -38,6 +38,18 @@
       {
         "command": "protokoll.configureServer",
         "title": "Configure Server URL",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.addServerConnection",
+        "title": "Add Server Connection",
+        "icon": "$(add)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.switchServerConnection",
+        "title": "Switch Server Connection",
+        "icon": "$(server-process)",
         "category": "Protokoll"
       },
       {
@@ -402,6 +414,16 @@
         {
           "command": "protokoll.refreshChats",
           "when": "view == protokollChats",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.addServerConnection",
+          "when": "view == protokollConnectionStatus",
+          "group": "navigation"
+        },
+        {
+          "command": "protokoll.switchServerConnection",
+          "when": "view == protokollConnectionStatus",
           "group": "navigation"
         }
       ],
