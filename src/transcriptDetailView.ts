@@ -20,6 +20,7 @@ import { shouldPassContextDirectory } from './serverMode';
 export interface EditableTranscriptInfo {
   transcriptPath: string;
   transcriptUri: string;
+  editTarget: 'enhanced' | 'original';
   originalContent: string;
   /** The header/metadata section (everything before and including the --- separator) */
   header: string;
@@ -339,6 +340,15 @@ export class TranscriptDetailViewProvider {
     });
   }
 
+  private getPanelTranscriptUri(panel: vscode.WebviewPanel, fallbackUri: string): string {
+    for (const [uri, existingPanel] of this._panels.entries()) {
+      if (existingPanel === panel) {
+        return uri;
+      }
+    }
+    return fallbackUri;
+  }
+
   setClient(client: McpClient): void {
     this._client = client;
     
@@ -423,7 +433,8 @@ export class TranscriptDetailViewProvider {
           return;
         }
 
-        const currentTranscript = this._currentTranscripts.get(transcriptUri);
+        const activeTranscriptUri = this.getPanelTranscriptUri(panel, transcriptUri);
+        const currentTranscript = this._currentTranscripts.get(activeTranscriptUri);
         if (!currentTranscript) {
           return;
         }
@@ -432,34 +443,34 @@ export class TranscriptDetailViewProvider {
           case 'changeProject':
             // Defer to next tick so QuickPick can receive focus (webview focus workaround)
             setTimeout(() => {
-              this.handleChangeProject(currentTranscript.transcript, transcriptUri);
+              this.handleChangeProject(currentTranscript.transcript, activeTranscriptUri);
             }, 0);
             break;
           case 'changeDate':
-            await this.handleChangeDate(currentTranscript.transcript, message.transcriptPath, transcriptUri);
+            await this.handleChangeDate(currentTranscript.transcript, message.transcriptPath, activeTranscriptUri);
             break;
           case 'addTag':
-            await this.handleAddTag(currentTranscript.transcript, message.transcriptPath, transcriptUri);
+            await this.handleAddTag(currentTranscript.transcript, message.transcriptPath, activeTranscriptUri);
             break;
           case 'removeTag':
-            await this.handleRemoveTag(currentTranscript.transcript, message.transcriptPath, message.tag, transcriptUri);
+            await this.handleRemoveTag(currentTranscript.transcript, message.transcriptPath, message.tag, activeTranscriptUri);
             break;
           case 'editTitle':
-            await this.handleEditTitle(currentTranscript.transcript, message.transcriptPath, message.newTitle, transcriptUri);
+            await this.handleEditTitle(currentTranscript.transcript, message.transcriptPath, message.newTitle, activeTranscriptUri);
             break;
           case 'editTranscript':
-            await this.handleEditTranscript(currentTranscript.transcript, message.transcriptPath, message.newContent, transcriptUri);
+            await this.handleEditTranscript(currentTranscript.transcript, message.transcriptPath, message.newContent, activeTranscriptUri);
             break;
           case 'saveOriginalContent':
-            await this.handleEditTranscript(currentTranscript.transcript, message.transcriptPath, message.newContent, transcriptUri);
+            await this.handleEditTranscript(currentTranscript.transcript, message.transcriptPath, message.newContent, activeTranscriptUri);
             break;
           case 'enhanceFromOriginal':
             await this.handleEnhanceFromOriginal(
               currentTranscript.transcript,
               message.transcriptPath,
               message.originalText,
-              message.overwriteConfirmed,
-              transcriptUri
+              message.hasExistingEnhanced,
+              activeTranscriptUri
             );
             break;
           case 'openEntity':
@@ -472,7 +483,7 @@ export class TranscriptDetailViewProvider {
             await this.handleSaveEntityReferences(
               panel,
               currentTranscript.transcript,
-              transcriptUri,
+              activeTranscriptUri,
               message.entities
             );
             break;
@@ -480,22 +491,27 @@ export class TranscriptDetailViewProvider {
             // This is handled by the webview itself, but we can acknowledge it
             break;
           case 'reviewTranscription':
-            await this.handleReviewTranscription(currentTranscript.transcript, message.transcriptUri || transcriptUri);
+            await this.handleReviewTranscription(currentTranscript.transcript, message.transcriptUri || activeTranscriptUri);
             break;
           case 'startChatFromInput':
-            await this.handleStartChatFromInput(currentTranscript.transcript, message.message, message.transcriptUri || transcriptUri);
+            await this.handleStartChatFromInput(currentTranscript.transcript, message.message, message.transcriptUri || activeTranscriptUri);
             break;
           case 'openSource':
-            await this.handleOpenSource(currentTranscript.transcript, message.transcriptPath, message.transcriptUri || transcriptUri);
+            await this.handleOpenSource(currentTranscript.transcript, message.transcriptPath, message.transcriptUri || activeTranscriptUri);
             break;
           case 'editInEditor':
-            await this.handleEditInEditor(currentTranscript.transcript, message.transcriptPath, message.transcriptUri || transcriptUri);
+            await this.handleEditInEditor(
+              currentTranscript.transcript,
+              message.transcriptPath,
+              message.transcriptUri || activeTranscriptUri,
+              message.editTarget === 'original' ? 'original' : 'enhanced'
+            );
             break;
           case 'createEntityFromSelection':
-            await this.handleCreateEntityFromSelection(message.selectedText, message.transcriptUri || transcriptUri);
+            await this.handleCreateEntityFromSelection(message.selectedText, message.transcriptUri || activeTranscriptUri);
             break;
           case 'loadEnhancementLog':
-            await this.handleLoadEnhancementLog(panel, message.transcriptPath);
+            await this.handleLoadEnhancementLog(panel, message.transcriptPath, activeTranscriptUri);
             break;
           case 'rejectCorrection': {
             const correctionEntryId = Number(message.correctionEntryId);
@@ -503,8 +519,18 @@ export class TranscriptDetailViewProvider {
               vscode.window.showErrorMessage('Invalid correction entry id');
               break;
             }
-            const activeTranscriptPath = message.transcriptPath || currentTranscript.transcript.path || currentTranscript.transcript.filename;
-            await this.handleRejectCorrection(activeTranscriptPath, correctionEntryId, transcriptUri);
+            const activeTranscriptPathCandidate = currentTranscript.transcript.uri
+              || message.transcriptPath
+              || currentTranscript.transcript.path;
+            if (!activeTranscriptPathCandidate) {
+              vscode.window.showErrorMessage('Transcript reference is missing');
+              break;
+            }
+            const activeTranscriptPath = this.getToolTranscriptPath(
+              activeTranscriptPathCandidate,
+              currentTranscript.transcript.uri || activeTranscriptUri
+            );
+            await this.handleRejectCorrection(activeTranscriptPath, correctionEntryId, activeTranscriptUri);
             break;
           }
           case 'requestRejectCorrection': {
@@ -513,46 +539,56 @@ export class TranscriptDetailViewProvider {
               vscode.window.showErrorMessage('Invalid correction entry id');
               break;
             }
-            const activeTranscriptPath = message.transcriptPath || currentTranscript.transcript.path || currentTranscript.transcript.filename;
+            const activeTranscriptPathCandidate = currentTranscript.transcript.uri
+              || message.transcriptPath
+              || currentTranscript.transcript.path;
+            if (!activeTranscriptPathCandidate) {
+              vscode.window.showErrorMessage('Transcript reference is missing');
+              break;
+            }
+            const activeTranscriptPath = this.getToolTranscriptPath(
+              activeTranscriptPathCandidate,
+              currentTranscript.transcript.uri || activeTranscriptUri
+            );
             await this.handleRejectCorrectionWithConfirmation(
               panel,
               activeTranscriptPath,
               correctionEntryId,
-              transcriptUri
+              activeTranscriptUri
             );
             break;
           }
           case 'refreshTranscript': {
-            await this.refreshTranscript(transcriptUri);
-            const refreshPanel = this._panels.get(transcriptUri);
+            await this.refreshTranscript(activeTranscriptUri);
+            const refreshPanel = this._panels.get(activeTranscriptUri);
             if (refreshPanel) {
               refreshPanel.webview.postMessage({ command: 'refreshComplete' });
             }
             break;
           }
           case 'changeStatus':
-            await this.handleChangeStatus(currentTranscript.transcript, message.transcriptPath, transcriptUri);
+            await this.handleChangeStatus(currentTranscript.transcript, message.transcriptPath, activeTranscriptUri);
             break;
           case 'addTask':
-            await this.handleAddTask(currentTranscript.transcript, message.transcriptPath, transcriptUri);
+            await this.handleAddTask(currentTranscript.transcript, message.transcriptPath, activeTranscriptUri);
             break;
           case 'identifyTasks':
-            await this.handleIdentifyTasks(currentTranscript.transcript, message.transcriptPath, transcriptUri);
+            await this.handleIdentifyTasks(currentTranscript.transcript, message.transcriptPath, activeTranscriptUri);
             break;
           case 'completeTask':
-            await this.handleCompleteTask(currentTranscript.transcript, message.transcriptPath, message.taskId, transcriptUri);
+            await this.handleCompleteTask(currentTranscript.transcript, message.transcriptPath, message.taskId, activeTranscriptUri);
             break;
           case 'deleteTask':
-            await this.handleDeleteTask(currentTranscript.transcript, message.transcriptPath, message.taskId, transcriptUri);
+            await this.handleDeleteTask(currentTranscript.transcript, message.transcriptPath, message.taskId, activeTranscriptUri);
             break;
           case 'startSummarySetup':
-            await this.handleStartSummarySetup(currentTranscript.transcript, transcriptUri);
+            await this.handleStartSummarySetup(currentTranscript.transcript, activeTranscriptUri);
             break;
           case 'generateSummary':
-            await this.handleGenerateSummary(message.transcriptPath, transcriptUri);
+            await this.handleGenerateSummary(message.transcriptPath, activeTranscriptUri);
             break;
           case 'deleteSummary':
-            await this.handleDeleteSummary(message.transcriptPath, transcriptUri, message.summaryId);
+            await this.handleDeleteSummary(message.transcriptPath, activeTranscriptUri, message.summaryId);
             break;
         }
       },
@@ -560,12 +596,13 @@ export class TranscriptDetailViewProvider {
     );
 
     panel.onDidDispose(async () => {
+      const activeTranscriptUri = this.getPanelTranscriptUri(panel, transcriptUri);
       // Unsubscribe from this transcript when panel is closed
-      console.log(`Protokoll: [TRANSCRIPT VIEW] Panel disposed, unsubscribing from: ${transcriptUri}`);
+      console.log(`Protokoll: [TRANSCRIPT VIEW] Panel disposed, unsubscribing from: ${activeTranscriptUri}`);
       if (this._client) {
         try {
-          await this._client.unsubscribeFromResource(transcriptUri);
-          console.log(`Protokoll: [TRANSCRIPT VIEW] ✅ Unsubscribed from transcript: ${transcriptUri}`);
+          await this._client.unsubscribeFromResource(activeTranscriptUri);
+          console.log(`Protokoll: [TRANSCRIPT VIEW] ✅ Unsubscribed from transcript: ${activeTranscriptUri}`);
         } catch (error) {
           console.error(`Protokoll: [TRANSCRIPT VIEW] ❌ Failed to unsubscribe from transcript:`, error);
         }
@@ -573,8 +610,8 @@ export class TranscriptDetailViewProvider {
         console.warn(`Protokoll: [TRANSCRIPT VIEW] ⚠️ No client available to unsubscribe`);
       }
       
-      this._panels.delete(transcriptUri);
-      this._currentTranscripts.delete(transcriptUri);
+      this._panels.delete(activeTranscriptUri);
+      this._currentTranscripts.delete(activeTranscriptUri);
     }, null);
 
     // Subscribe to this transcript for change notifications
@@ -713,7 +750,7 @@ export class TranscriptDetailViewProvider {
     try {
       const summaryToolName = await this.resolveSummaryToolName();
       const result = await this._client.callTool(summaryToolName, {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+        transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         audience: summaryConfig.audience,
         guidance: summaryConfig.guidance,
         stylePreset: summaryConfig.stylePreset,
@@ -787,7 +824,7 @@ export class TranscriptDetailViewProvider {
     }
     try {
       await this._client.callTool('protokoll_delete_transcript_summary', {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+        transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         summaryId,
       });
       await this.refreshTranscript(transcriptUri);
@@ -809,6 +846,10 @@ export class TranscriptDetailViewProvider {
    * Extracts the relative portion after '/notes/' or returns the path as-is if already relative
    */
   private convertToRelativePath(absolutePath: string): string {
+    if (!absolutePath || absolutePath.trim().length === 0) {
+      throw new Error('Transcript reference is missing');
+    }
+
     // If it's already a relative path (doesn't start with / and no drive letter), return as-is
     if (!absolutePath.startsWith('/') && !absolutePath.match(/^[A-Za-z]:/)) {
       return absolutePath;
@@ -831,8 +872,21 @@ export class TranscriptDetailViewProvider {
       return pathParts.slice(yearIndex).join('/');
     }
 
-    // Fallback: return just the filename
-    return pathParts[pathParts.length - 1] || absolutePath;
+    // Keep absolute path as-is instead of degrading to filename-only fallback.
+    return absolutePath;
+  }
+
+  private getToolTranscriptPath(transcriptPath: string, transcriptUri?: string): string {
+    if (transcriptUri && transcriptUri.startsWith('protokoll://transcript/')) {
+      return this.canonicalizeTranscriptUri(transcriptUri);
+    }
+    if (transcriptPath && transcriptPath.startsWith('protokoll://transcript/')) {
+      return this.canonicalizeTranscriptUri(transcriptPath);
+    }
+    if (!transcriptPath || transcriptPath.trim().length === 0) {
+      throw new Error('Transcript reference is missing');
+    }
+    return this.convertToRelativePath(transcriptPath);
   }
 
   private canonicalizeTranscriptUri(uri: string): string {
@@ -1044,8 +1098,8 @@ export class TranscriptDetailViewProvider {
       }
 
       // Update transcript - convert absolute path to relative path
-      const rawPath = transcript.path || transcript.filename;
-      const transcriptPath = this.convertToRelativePath(rawPath);
+      const rawPath = transcript.uri || transcript.path;
+      const transcriptPath = this.getToolTranscriptPath(rawPath, transcriptUri);
       
       // Log for debugging
       console.log(`Protokoll: Updating transcript with path: ${transcriptPath}, projectId: ${projectId}`);
@@ -1131,11 +1185,11 @@ export class TranscriptDetailViewProvider {
       }
 
       // Convert absolute path to relative path
-      const rawPath = transcript.path || transcript.filename;
-      const relativePath = this.convertToRelativePath(rawPath);
+      const rawPath = transcript.uri || transcript.path;
+      const transcriptTarget = this.getToolTranscriptPath(rawPath, transcriptUri);
       
       // Log for debugging
-      console.log(`Protokoll: Changing transcript date with path: ${relativePath}, newDate: ${dateInput}`);
+      console.log(`Protokoll: Changing transcript date with path: ${transcriptTarget}, newDate: ${dateInput}`);
       
       // Show progress
       await vscode.window.withProgress({
@@ -1145,7 +1199,7 @@ export class TranscriptDetailViewProvider {
       }, async () => {
         try {
           const result = await this._client!.callTool('protokoll_change_transcript_date', {
-            transcriptPath: relativePath,
+            transcriptPath: transcriptTarget,
             newDate: dateInput,
           }) as { success?: boolean; moved?: boolean; outputPath?: string; message?: string };
           
@@ -1217,7 +1271,7 @@ export class TranscriptDetailViewProvider {
 
       // Use edit_transcript tool to add the tag
       await this._client.callTool('protokoll_edit_transcript', {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+        transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         tagsToAdd: [newTag.trim()],
       });
 
@@ -1249,7 +1303,7 @@ export class TranscriptDetailViewProvider {
     try {
       // Use edit_transcript tool to remove the tag
       await this._client.callTool('protokoll_edit_transcript', {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+        transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         tagsToRemove: [tag],
       });
 
@@ -1298,8 +1352,8 @@ export class TranscriptDetailViewProvider {
     }
 
     try {
-      await this._client.callTool('protokoll_set_status', {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+      await this._client.callTool('protokoll_edit_transcript', {
+        transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         status: selected.value,
       });
 
@@ -1336,7 +1390,7 @@ export class TranscriptDetailViewProvider {
 
     try {
       await this._client.callTool('protokoll_create_task', {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+        transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         description: description.trim(),
       });
 
@@ -1361,7 +1415,7 @@ export class TranscriptDetailViewProvider {
 
     try {
       const result = await this._client.callTool('protokoll_identify_tasks_from_transcript', {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+        transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         maxCandidates: 25,
         includeTagSuggestions: true,
       }) as IdentifyTasksResult;
@@ -1437,7 +1491,7 @@ export class TranscriptDetailViewProvider {
         }
 
         await this._client.callTool('protokoll_create_task', {
-          transcriptPath: this.convertToRelativePath(transcriptPath),
+          transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
           description: candidateText,
         });
         createdCount += 1;
@@ -1461,7 +1515,7 @@ export class TranscriptDetailViewProvider {
 
         if (chosenTags && chosenTags.length > 0) {
           await this._client.callTool('protokoll_edit_transcript', {
-            transcriptPath: this.convertToRelativePath(transcriptPath),
+            transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
             tagsToAdd: chosenTags.map(tag => tag.label),
           });
         }
@@ -1496,7 +1550,7 @@ export class TranscriptDetailViewProvider {
 
     try {
       await this._client.callTool('protokoll_complete_task', {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+        transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         taskId,
       });
 
@@ -1529,7 +1583,7 @@ export class TranscriptDetailViewProvider {
 
     try {
       await this._client.callTool('protokoll_delete_task', {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+        transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         taskId,
       });
 
@@ -1554,7 +1608,7 @@ export class TranscriptDetailViewProvider {
 
     try {
       const result = await this._client.callTool('protokoll_edit_transcript', {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+        transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         title: newTitle.trim(),
       }) as {
         success?: boolean;
@@ -1666,7 +1720,7 @@ export class TranscriptDetailViewProvider {
     try {
       // Use the new update_transcript_content tool to directly update the content
       await this._client.callTool('protokoll_update_transcript_content', {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+        transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         content: newContent,
       });
 
@@ -1702,7 +1756,7 @@ export class TranscriptDetailViewProvider {
     transcript: Transcript,
     transcriptPath: string,
     originalText: string,
-    overwriteConfirmed: boolean,
+    hasExistingEnhanced: boolean,
     transcriptUri: string
   ): Promise<void> {
     if (!this._client) {
@@ -1716,47 +1770,87 @@ export class TranscriptDetailViewProvider {
       return;
     }
 
-    try {
-      // For manual notes, persist the current Original draft first so enhancement
-      // always runs against what the user just wrote.
-      if (transcript.contentType === 'manual_note') {
-        await this._client.callTool('protokoll_update_transcript_content', {
-          transcriptPath: this.convertToRelativePath(transcriptPath),
-          content: originalText,
-        });
-      }
+    const panel = this._panels.get(transcriptUri);
 
-      if (overwriteConfirmed) {
-        vscode.window.showInformationMessage('Re-enhancing from Original...');
-      } else {
-        vscode.window.showInformationMessage('Enhancing from Original...');
-      }
-
-      await this._client.callTool('protokoll_enhance_transcript', {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
-        originalText,
-      });
-
-      await vscode.commands.executeCommand('protokoll.refreshTranscripts');
-      await this.refreshTranscript(transcriptUri);
-
-      const refreshedPanel = this._panels.get(transcriptUri);
-      if (refreshedPanel) {
-        refreshedPanel.webview.postMessage({
-          command: 'enhanceStarted',
-        });
-      }
-    } catch (error) {
-      const panel = this._panels.get(transcriptUri);
-      if (panel) {
-        panel.webview.postMessage({
-          command: 'enhanceFailed',
-        });
-      }
-      vscode.window.showErrorMessage(
-        `Enhancement failed. Existing enhanced content was kept. ${error instanceof Error ? error.message : String(error)}`
+    if (hasExistingEnhanced) {
+      const decision = await vscode.window.showWarningMessage(
+        'Enhanced content already exists. Replace it with a new enhancement?',
+        { modal: true },
+        'Replace'
       );
+      if (decision !== 'Replace') {
+        if (panel) {
+          panel.webview.postMessage({
+            command: 'enhanceCancelled',
+          });
+        }
+        return;
+      }
     }
+
+    // Give immediate visual feedback before any server roundtrips.
+    if (panel) {
+      panel.webview.postMessage({
+        command: 'enhanceStarted',
+      });
+    }
+
+    if (hasExistingEnhanced) {
+      vscode.window.showInformationMessage('Re-enhancing from Original (running in background)...');
+    } else {
+      vscode.window.showInformationMessage('Enhancing from Original (running in background)...');
+    }
+
+    const toolTranscriptPath = this.getToolTranscriptPath(transcriptPath, transcriptUri);
+
+    void (async () => {
+      try {
+        // For manual notes, persist the current Original draft first so enhancement
+        // always runs against what the user just wrote.
+        if (transcript.contentType === 'manual_note') {
+          await this._client!.callTool('protokoll_update_transcript_content', {
+            transcriptPath: toolTranscriptPath,
+            content: originalText,
+          });
+        }
+
+        await this._client!.callTool('protokoll_edit_transcript', {
+          transcriptPath: toolTranscriptPath,
+          status: 'in_progress',
+        });
+
+        if (this._onTranscriptChanged) {
+          await this._onTranscriptChanged(transcriptUri, { status: 'in_progress' as TranscriptStatus });
+        }
+
+        await this._client!.callTool('protokoll_enhance_transcript', {
+          transcriptPath: toolTranscriptPath,
+          originalText,
+        });
+
+        // Fallback refresh path: keep SSE-driven updates as primary, but also
+        // refresh explicitly so users still see results if notifications lag.
+        await vscode.commands.executeCommand('protokoll.refreshTranscripts');
+        await this.refreshTranscript(transcriptUri);
+
+        const activePanel = this._panels.get(transcriptUri);
+        if (activePanel) {
+          activePanel.webview.postMessage({
+            command: 'enhanceCompleted',
+          });
+        }
+      } catch (error) {
+        const activePanel = this._panels.get(transcriptUri);
+        if (activePanel) {
+          activePanel.webview.postMessage({
+            command: 'enhanceFailed',
+          });
+        }
+        vscode.window.showErrorMessage(
+          `Enhancement failed. Existing enhanced content was kept. ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    })();
   }
 
   public async handleOpenEntity(entityType: string, entityId: string): Promise<void> {
@@ -1866,7 +1960,8 @@ export class TranscriptDetailViewProvider {
    */
   private async handleLoadEnhancementLog(
     panel: vscode.WebviewPanel,
-    transcriptPath: string
+    transcriptPath: string,
+    transcriptUri: string
   ): Promise<void> {
     if (!this._client) {
       return;
@@ -1875,7 +1970,7 @@ export class TranscriptDetailViewProvider {
     try {
       // Call protokoll_get_enhancement_log
       const response = await this._client.callTool('protokoll_get_enhancement_log', {
-        transcriptPath,
+        transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         limit: 100,
       }) as {
         entries?: Array<{
@@ -1952,8 +2047,9 @@ export class TranscriptDetailViewProvider {
     }
 
     try {
+      const toolTranscriptPath = this.getToolTranscriptPath(transcriptPath, transcriptUri);
       const response = await this._client.callTool('protokoll_reject_correction', {
-        transcriptPath,
+        transcriptPath: toolTranscriptPath,
         correctionEntryId,
       }) as {
         success?: boolean;
@@ -2038,13 +2134,18 @@ export class TranscriptDetailViewProvider {
     }
 
     try {
+      const transcriptRef = transcriptPath.startsWith('protokoll://transcript/')
+        ? transcriptPath
+        : this.getToolTranscriptPath(transcriptPath, undefined);
       // Read the transcript
       const transcriptContent = await this._client.callTool('protokoll_read_transcript', {
-        transcriptPath,
+        transcriptPath: transcriptRef,
       }) as TranscriptContent;
 
       // Build URI
-      const uri = `protokoll://transcript/${transcriptPath.replace(/\.pkl$/, '')}`;
+      const uri = transcriptRef.startsWith('protokoll://transcript/')
+        ? transcriptRef.replace(/\.pkl$/i, '')
+        : `protokoll://transcript/${transcriptPath.replace(/\.pkl$/, '')}`;
 
       // Construct a Transcript object from TranscriptContent
       const transcript: Transcript = {
@@ -2364,7 +2465,12 @@ export class TranscriptDetailViewProvider {
    * Only the body content is shown - metadata is preserved separately.
    * Saves are synced back to the MCP server.
    */
-  private async handleEditInEditor(transcript: Transcript, transcriptPath: string, transcriptUri: string): Promise<void> {
+  private async handleEditInEditor(
+    transcript: Transcript,
+    transcriptPath: string,
+    transcriptUri: string,
+    editTarget: 'enhanced' | 'original' = 'enhanced'
+  ): Promise<void> {
     if (!this._client) {
       vscode.window.showErrorMessage('MCP client not initialized');
       return;
@@ -2374,8 +2480,9 @@ export class TranscriptDetailViewProvider {
       // Fetch transcript content from MCP server - returns structured JSON
       const content: TranscriptContent = await this._client.readTranscript(transcriptUri);
       
-      // With structured response, content.content is already the body text (no header parsing needed)
-      const body = content.content;
+      const body = editTarget === 'original'
+        ? (content.rawTranscript?.text ?? content.content)
+        : content.content;
       
       // Create a temp file with title in filename for clear tab title
       const title = transcript.title || transcript.filename || 'Transcript';
@@ -2389,8 +2496,11 @@ export class TranscriptDetailViewProvider {
       // Track this file for save syncing
       // Note: With PKL format, metadata is stored separately - no header needed
       editableTranscriptFiles.set(tempFilePath, {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+        // Use canonical transcript URI for save-back to avoid brittle path guessing.
+        // Server-side resolveTranscriptPath supports Protokoll URIs directly.
+        transcriptPath: transcriptUri,
         transcriptUri: transcriptUri,
+        editTarget,
         originalContent: content.content,
         header: '', // No header with PKL format - metadata is separate
         originalBody: body,
@@ -2406,7 +2516,7 @@ export class TranscriptDetailViewProvider {
       
       // Show Save & Close action
       vscode.window.showInformationMessage(
-        `Editing: ${title}`,
+        `Editing ${editTarget === 'original' ? 'Original' : 'Enhanced'}: ${title}`,
         'Save & Close'
       ).then(async (action) => {
         if (action === 'Save & Close') {
@@ -2839,7 +2949,10 @@ export class TranscriptDetailViewProvider {
 
     try {
       const entities = this.normalizeEntityReferencesForSave(entitiesPayload);
-      const transcriptPath = this.convertToRelativePath(transcript.path || transcript.filename);
+      const transcriptPath = this.getToolTranscriptPath(
+        transcript.uri || transcript.path,
+        transcriptUri
+      );
 
       await this._client.callTool('protokoll_update_transcript_entity_references', {
         transcriptPath,
@@ -2878,7 +2991,8 @@ export class TranscriptDetailViewProvider {
 
   private async showEntityPicker(
     selectedText: string,
-    transcriptPath: string
+    transcriptPath: string,
+    transcriptUri?: string
   ): Promise<{ id: string; name: string; type: string; source: 'suggestion' | 'search' | 'create-new' } | undefined> {
     interface EntityPickerItem extends vscode.QuickPickItem {
       id?: string;
@@ -2893,7 +3007,7 @@ export class TranscriptDetailViewProvider {
     // Step 1: Get weight model suggestions
     try {
       const predictions = await this._client!.callTool('protokoll_predict_entities', {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+        transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         maxPredictions: 5
       }) as { success?: boolean; predictions?: Array<{ entityId: string; score: number; source: string }> };
       
@@ -3093,15 +3207,18 @@ export class TranscriptDetailViewProvider {
         return;
       }
       
-      const transcriptPath = currentTranscript.transcript.path || currentTranscript.transcript.filename;
-      const selectedEntity = await this.showEntityPicker(selectedText, transcriptPath);
+      const transcriptRef = this.getToolTranscriptPath(
+        currentTranscript.transcript.uri || currentTranscript.transcript.path,
+        transcriptUri
+      );
+      const selectedEntity = await this.showEntityPicker(selectedText, transcriptRef, transcriptUri);
       
       if (!selectedEntity) {
         return;
       }
       
       const correctionArgs: Record<string, unknown> = {
-        transcriptPath: this.convertToRelativePath(transcriptPath),
+        transcriptPath: transcriptRef,
         selectedText: selectedText.trim(),
         entityType: selectedEntity.type
       };
@@ -4590,7 +4707,7 @@ export class TranscriptDetailViewProvider {
     // Get project info from structured metadata
     const projectId = metadata.entities?.projects?.[0]?.id ?? metadata.projectId ?? transcript.entities?.projects?.[0]?.id ?? '';
     const projectName = metadata.entities?.projects?.[0]?.name ?? metadata.project ?? transcript.entities?.projects?.[0]?.name ?? '';
-    const transcriptPath = transcript.path || transcript.filename;
+    const transcriptPath = transcript.uri;
     const isManualNote = transcript.contentType === 'manual_note' || (!content.rawTranscript && !transcript.hasRawTranscript);
     const hasManualEnhancedContent = !isManualNote
       ? true
@@ -4979,19 +5096,25 @@ export class TranscriptDetailViewProvider {
             outline-offset: 0;
         }
         .enhance-button {
-            background-color: var(--vscode-button-secondaryBackground);
-            color: var(--vscode-button-secondaryForeground);
-            border: 1px solid var(--vscode-button-border);
-            padding: 8px 12px;
-            border-radius: 4px;
+            background-color: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            padding: 8px 16px;
+            border-radius: 3px;
             cursor: pointer;
             font-size: 0.9em;
+            line-height: 1.2;
+            min-height: 36px;
+            box-sizing: border-box;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
         .enhance-button:hover {
-            background-color: var(--vscode-button-secondaryHoverBackground);
+            background-color: var(--vscode-button-hoverBackground);
         }
         .enhance-button:disabled {
-            opacity: 0.5;
+            opacity: 0.6;
             cursor: not-allowed;
         }
         .enhancement-timeline {
@@ -5128,8 +5251,12 @@ export class TranscriptDetailViewProvider {
             border-radius: 3px;
             cursor: pointer;
             font-size: 0.9em;
-            margin-bottom: 16px;
-            display: inline-block;
+            line-height: 1.2;
+            min-height: 36px;
+            box-sizing: border-box;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
         .edit-button:hover {
             background-color: var(--vscode-button-hoverBackground);
@@ -5823,7 +5950,7 @@ export class TranscriptDetailViewProvider {
         ${showEnhancedTab ? `
         <div class="tab-content ${initialTab === 'enhanced' ? 'active' : ''}" id="enhanced-content">
             <div style="display: flex; gap: 8px; margin-bottom: 16px;">
-                <button class="edit-button" onclick="editInEditor()" id="edit-in-editor-btn" title="Edit in VS Code editor (supports voice dictation)">Edit in Editor <span class="kbd-hint">E</span></button>
+                <button class="edit-button" onclick="editInEditor('enhanced')" id="edit-in-editor-btn" title="Edit Enhanced content in VS Code editor (supports voice dictation).">Edit Enhanced <span class="kbd-hint">E</span></button>
                 <button class="edit-button" onclick="openSource()" id="open-source-btn" title="View source (read-only)" style="opacity: 0.7;">View Source <span class="kbd-hint">S</span></button>
             </div>
             <div class="transcript-content" id="transcript-content-display">
@@ -5842,15 +5969,15 @@ export class TranscriptDetailViewProvider {
         <div class="tab-content ${initialTab === 'raw' ? 'active' : ''}" id="raw-content">
             ${isManualNote ? `
             <div class="original-editor-actions">
+                <button class="button button-secondary" id="edit-original-in-editor-btn" onclick="editInEditor('original')">Edit Original in Editor</button>
                 <button class="button" id="save-original-btn" onclick="saveOriginalContent()" disabled>Save Original</button>
-                <span class="original-editor-status" id="original-editor-status">No changes</span>
-            </div>
-            <div class="original-enhance-row">
                 <button class="enhance-button" id="enhance-original-btn" onclick="enhanceFromOriginal()">Enhance</button>
+                <span class="original-editor-status" id="original-editor-status">No changes</span>
             </div>
             <textarea id="original-editor-input" class="original-editor-textarea" placeholder="Type or paste original note content...">${this.escapeHtml(originalEditorText)}</textarea>
             ` : `
-            <div class="original-enhance-row">
+            <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+                <button class="edit-button" onclick="editInEditor('original')" title="Edit Original transcript text in VS Code editor.">Edit Original in Editor</button>
                 <button class="enhance-button" id="enhance-original-btn" onclick="enhanceFromOriginal()">Enhance</button>
             </div>
             <div class="transcript-content" style="white-space: pre-wrap; font-family: var(--vscode-editor-font-family);">
@@ -6123,6 +6250,14 @@ export class TranscriptDetailViewProvider {
         }
 
         let enhancementLogLoaded = false;
+
+        function setEnhancementTabInProgress(inProgress) {
+            const enhancedTab = document.getElementById('enhanced-tab');
+            if (!enhancedTab) {
+                return;
+            }
+            enhancedTab.textContent = inProgress ? 'Enhanced (In Progress)' : 'Enhanced';
+        }
         
         function setOriginalSaveStatus(message, state) {
             const statusEl = document.getElementById('original-editor-status');
@@ -6226,16 +6361,10 @@ export class TranscriptDetailViewProvider {
             }
 
             const hasExistingEnhanced = showEnhancedTab && (!isManualNote || hasManualEnhancedContent);
-            if (hasExistingEnhanced) {
-                const confirmed = window.confirm('Enhanced content already exists. Overwrite it with a new enhancement?');
-                if (!confirmed) {
-                    return;
-                }
-            }
 
             if (enhanceBtn) {
                 enhanceBtn.disabled = true;
-                enhanceBtn.textContent = 'Enhancing...';
+                enhanceBtn.textContent = hasExistingEnhanced ? 'Confirming...' : 'Enhancing...';
             }
 
             vscode.postMessage({
@@ -6243,7 +6372,7 @@ export class TranscriptDetailViewProvider {
                 transcriptPath: transcriptPath,
                 transcriptUri: transcriptUri,
                 originalText: originalText,
-                overwriteConfirmed: hasExistingEnhanced
+                hasExistingEnhanced: hasExistingEnhanced
             });
         }
 
@@ -6754,14 +6883,16 @@ export class TranscriptDetailViewProvider {
             actions.style.display = 'none';
         }
 
-        function editInEditor() {
-            if (!confirmDiscardOriginalChanges()) {
+        function editInEditor(target) {
+            const editTarget = target || (activeTabName === 'raw' ? 'original' : 'enhanced');
+            if (editTarget === 'enhanced' && !confirmDiscardOriginalChanges()) {
                 return;
             }
             vscode.postMessage({
                 command: 'editInEditor',
                 transcriptPath: transcriptPath,
-                transcriptUri: transcriptUri
+                transcriptUri: transcriptUri,
+                editTarget: editTarget
             });
         }
 
@@ -6968,12 +7099,29 @@ export class TranscriptDetailViewProvider {
                     saveBtn.textContent = 'Save Original';
                     setOriginalSaveStatus('Saved', 'saved');
                 }
-            } else if (message.command === 'enhanceStarted' || message.command === 'enhanceFailed') {
+            } else if (message.command === 'enhanceStarted') {
+                setEnhancementTabInProgress(true);
+            } else if (message.command === 'enhanceCompleted') {
                 const enhanceBtn = document.getElementById('enhance-original-btn');
                 if (enhanceBtn) {
                     enhanceBtn.disabled = false;
                     enhanceBtn.textContent = 'Enhance';
                 }
+                setEnhancementTabInProgress(false);
+            } else if (message.command === 'enhanceFailed') {
+                const enhanceBtn = document.getElementById('enhance-original-btn');
+                if (enhanceBtn) {
+                    enhanceBtn.disabled = false;
+                    enhanceBtn.textContent = 'Enhance';
+                }
+                setEnhancementTabInProgress(false);
+            } else if (message.command === 'enhanceCancelled') {
+                const enhanceBtn = document.getElementById('enhance-original-btn');
+                if (enhanceBtn) {
+                    enhanceBtn.disabled = false;
+                    enhanceBtn.textContent = 'Enhance';
+                }
+                setEnhancementTabInProgress(false);
             } else if (message.command === 'entityReferencePicked') {
                 addPickedEntityReference(message.section, message.entity);
             } else if (message.command === 'entityReferencesSaved') {

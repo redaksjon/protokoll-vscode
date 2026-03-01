@@ -12,6 +12,9 @@ interface YearMonth {
   month: string;
 }
 
+const DEFAULT_STATUS_FILTERS = ['initial', 'enhanced', 'reviewed', 'in_progress', 'closed'];
+const VALID_STATUS_FILTERS = new Set(['initial', 'enhanced', 'reviewed', 'in_progress', 'closed', 'archived']);
+
 export class TranscriptsViewProvider implements vscode.TreeDataProvider<TranscriptItem> {
   private _onDidChangeTreeData: vscode.EventEmitter<TranscriptItem | undefined | null | void> = 
     new vscode.EventEmitter<TranscriptItem | undefined | null | void>();
@@ -22,7 +25,7 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   private transcripts: Transcript[] = [];
   private hasMorePages = false;
   private selectedProjectFilter: string | null = null; // Project ID to filter by
-  private selectedStatusFilters: Set<string> = new Set(['initial', 'enhanced', 'reviewed', 'in_progress', 'closed']); // Statuses to show (archived excluded by default)
+  private selectedStatusFilters: Set<string> = new Set(DEFAULT_STATUS_FILTERS); // Statuses to show (archived excluded by default)
   private sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc' = 'date-desc'; // Default: date descending
   private treeView: vscode.TreeView<TranscriptItem> | null = null;
 
@@ -41,8 +44,18 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     
     // Load status filters (workspace-specific)
     const savedStatusFilters = this.context.workspaceState.get<string[]>('protokoll.statusFilters');
-    if (savedStatusFilters) {
-      this.selectedStatusFilters = new Set(savedStatusFilters);
+    if (savedStatusFilters && savedStatusFilters.length > 0) {
+      const sanitized = savedStatusFilters.filter(status => VALID_STATUS_FILTERS.has(status));
+      if (sanitized.length > 0) {
+        this.selectedStatusFilters = new Set(sanitized);
+      } else {
+        this.selectedStatusFilters = new Set(DEFAULT_STATUS_FILTERS);
+        void this.context.workspaceState.update('protokoll.statusFilters', DEFAULT_STATUS_FILTERS);
+      }
+    } else if (savedStatusFilters && savedStatusFilters.length === 0) {
+      // Recover from persisted "show nothing" state to avoid a blank transcripts view.
+      this.selectedStatusFilters = new Set(DEFAULT_STATUS_FILTERS);
+      void this.context.workspaceState.update('protokoll.statusFilters', DEFAULT_STATUS_FILTERS);
     }
     
     // Load sort order (workspace-specific)
@@ -134,7 +147,11 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   }
 
   setStatusFilters(statuses: Set<string>): void {
-    this.selectedStatusFilters = statuses;
+    // Never persist an empty status set; it makes the tree appear broken.
+    const sanitized = Array.from(statuses).filter(status => VALID_STATUS_FILTERS.has(status));
+    this.selectedStatusFilters = sanitized.length > 0
+      ? new Set(sanitized)
+      : new Set(DEFAULT_STATUS_FILTERS);
     // Save to workspace state
     this.saveWorkspaceSettings().catch(err => {
       log('Failed to save status filters to workspace state', err);
@@ -188,11 +205,30 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     try {
       log('TranscriptsViewProvider.refresh: Calling listTranscripts', { projectFilter: this.selectedProjectFilter });
       
-      const response: TranscriptsListResponse = await this.client.listTranscripts({
+      let response: TranscriptsListResponse = await this.client.listTranscripts({
         limit,
         offset: 0,
         projectId: this.selectedProjectFilter || undefined,
       });
+
+      // Auto-recover from stale project filter states that hide everything.
+      if (response.transcripts.length === 0 && this.selectedProjectFilter) {
+        log('TranscriptsViewProvider.refresh: Project filter returned no transcripts, retrying without filter', {
+          projectFilter: this.selectedProjectFilter,
+        });
+        response = await this.client.listTranscripts({
+          limit,
+          offset: 0,
+        });
+        if (response.transcripts.length > 0) {
+          const oldFilter = this.selectedProjectFilter;
+          this.selectedProjectFilter = null;
+          await this.saveWorkspaceSettings();
+          vscode.window.showInformationMessage(
+            `Protokoll: Cleared project filter "${oldFilter}" because it returned no transcripts.`
+          );
+        }
+      }
 
       log('TranscriptsViewProvider.refresh: Got response', { 
         transcriptsCount: response.transcripts.length,

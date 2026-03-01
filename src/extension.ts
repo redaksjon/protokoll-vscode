@@ -49,6 +49,26 @@ function createServerConnectionId(url: string): string {
   return Buffer.from(url).toString('base64url');
 }
 
+export function resolveTranscriptToolRef(transcript: Transcript): string {
+  if (transcript.uri && transcript.uri.startsWith('protokoll://transcript/')) {
+    return transcript.uri.replace(/^protokoll:\/\/transcript\/\.\.\//, 'protokoll://transcript/');
+  }
+  if (transcript.path && transcript.path.trim().length > 0) {
+    return transcript.path;
+  }
+  throw new Error(`Transcript reference is missing for "${transcript.filename}"`);
+}
+
+function resolveEditableTranscriptRef(transcriptUri: string, transcriptPath: string): string {
+  if (transcriptUri && transcriptUri.startsWith('protokoll://transcript/')) {
+    return transcriptUri.replace(/^protokoll:\/\/transcript\/\.\.\//, 'protokoll://transcript/');
+  }
+  if (transcriptPath && transcriptPath.trim().length > 0) {
+    return transcriptPath;
+  }
+  throw new Error('Transcript reference is missing for save sync');
+}
+
 function getActiveServerConnection(): ServerConnectionEntry | undefined {
   return serverConnections.find((connection) => connection.id === activeServerId);
 }
@@ -527,17 +547,26 @@ export async function activate(context: vscode.ExtensionContext) {
           // Merge the preserved header with the edited body
           const fullContent = transcriptInfo.header + editedBody;
           
-          log(`Protokoll: Syncing edited transcript to server: ${transcriptInfo.transcriptPath}`);
+          const transcriptRef = resolveEditableTranscriptRef(
+            transcriptInfo.transcriptUri,
+            transcriptInfo.transcriptPath
+          );
+          log(`Protokoll: Syncing edited transcript to server: ${transcriptRef}`);
           await mcpClient.callTool('protokoll_update_transcript_content', {
-            transcriptPath: transcriptInfo.transcriptPath,
+            transcriptPath: transcriptRef,
             content: fullContent,
+            contentTarget: transcriptInfo.editTarget,
           });
           
           // Update the original body to reflect the saved state
           transcriptInfo.originalBody = editedBody;
           transcriptInfo.originalContent = fullContent;
           
-          vscode.window.showInformationMessage('Protokoll: Transcript saved to server');
+          vscode.window.showInformationMessage(
+            transcriptInfo.editTarget === 'original'
+              ? 'Protokoll: Original content saved to server'
+              : 'Protokoll: Enhanced content saved to server'
+          );
           
           // Refresh the transcript detail view if open
           if (transcriptDetailViewProvider) {
@@ -1659,12 +1688,11 @@ export async function activate(context: vscode.ExtensionContext) {
       }
 
       try {
-        // Extract transcript path from URI or use filename
-        const transcriptPath = item.transcript.path || item.transcript.filename;
+        const transcriptRef = resolveTranscriptToolRef(item.transcript);
         
         // Call the edit transcript tool
         await mcpClient.callTool('protokoll_edit_transcript', {
-          transcriptPath: transcriptPath,
+          transcriptPath: transcriptRef,
           title: newTitle.trim(),
         });
 
@@ -1775,9 +1803,9 @@ export async function activate(context: vscode.ExtensionContext) {
           continue;
         }
         try {
-          const transcriptPath = item.transcript.path || item.transcript.filename;
+          const transcriptRef = resolveTranscriptToolRef(item.transcript);
           await client.callTool('protokoll_edit_transcript', {
-            transcriptPath: transcriptPath,
+            transcriptPath: transcriptRef,
             projectId: selected.id,
           });
         } catch (error) {
@@ -1901,9 +1929,9 @@ export async function activate(context: vscode.ExtensionContext) {
         }
         processed += 1;
 
-        const transcriptPath = transcript.path || transcript.filename;
+        const transcriptRef = resolveTranscriptToolRef(transcript);
         const identifyResult = await mcpClient.callTool('protokoll_identify_tasks_from_transcript', {
-          transcriptPath,
+          transcriptPath: transcriptRef,
           maxCandidates: 25,
           includeTagSuggestions: true,
         }) as { candidates?: IdentifyTaskCandidate[] };
@@ -1952,7 +1980,7 @@ export async function activate(context: vscode.ExtensionContext) {
           }
 
           await mcpClient.callTool('protokoll_create_task', {
-            transcriptPath,
+            transcriptPath: transcriptRef,
             description: taskText,
           });
           totalCreated += 1;
@@ -1974,7 +2002,7 @@ export async function activate(context: vscode.ExtensionContext) {
           );
           if (selectedTags && selectedTags.length > 0) {
             await mcpClient.callTool('protokoll_edit_transcript', {
-              transcriptPath,
+              transcriptPath: transcriptRef,
               tagsToAdd: selectedTags.map(tag => tag.label),
             });
           }
@@ -2036,9 +2064,9 @@ export async function activate(context: vscode.ExtensionContext) {
         continue;
       }
       try {
-        const transcriptPath = item.transcript.path || item.transcript.filename;
+        const transcriptRef = resolveTranscriptToolRef(item.transcript);
         await client.callTool('protokoll_edit_transcript', {
-          transcriptPath: transcriptPath,
+          transcriptPath: transcriptRef,
           status: selected.id,
         });
         succeededUris.push(item.transcript.uri);

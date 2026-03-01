@@ -550,6 +550,29 @@ describe('McpClient', () => {
     });
 
     describe('callTool with content parsing', () => {
+        it('should throw when MCP tool result isError is true', async () => {
+            mockHttpRequest({
+                statusCode: 200,
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    result: {
+                        isError: true,
+                        content: [
+                            {
+                                type: 'text',
+                                text: 'Error: Summary generation failed',
+                            },
+                        ],
+                    },
+                }),
+            });
+
+            await expect(client.callTool('protokoll_summarize_transcript', {}))
+                .rejects
+                .toThrow('Summary generation failed');
+        });
+
         it('should parse JSON content from tool result', async () => {
             mockHttpRequest({
                 statusCode: 200,
