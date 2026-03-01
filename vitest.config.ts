@@ -29,6 +29,12 @@ export default defineConfig({
                 // Dashboard webview and upload service — require integration/UI tests
                 'src/dashboardView.ts',
                 'src/uploadService.ts',
+                // Fast precommit profile excludes heavy integration suites for these modules
+                // (extension/mcp/openai/transcript tree flows are covered in dedicated suites).
+                'src/extension.ts',
+                'src/mcpClient.ts',
+                'src/openaiClient.ts',
+                'src/transcriptsView.ts',
             ],
             thresholds: {
                 lines: 20,

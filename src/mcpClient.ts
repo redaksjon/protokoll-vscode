@@ -15,6 +15,7 @@ import type {
 } from './types';
 
 export class McpClient {
+  private static readonly REQUEST_TIMEOUT_MS = 15000;
   private sessionId: string | null = null;
   private serverUrl: string;
   private sseConnection: http.ClientRequest | null = null; // HTTP request for SSE connection (works for both http and https)
@@ -150,6 +151,15 @@ export class McpClient {
 
   private async sendRequest(request: JsonRpcRequest, retryOnSessionError: boolean = true): Promise<JsonRpcResponse> {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const settle = (fn: () => void) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        fn();
+      };
+
       const url = new URL(`${this.serverUrl}/mcp`);
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -182,7 +192,7 @@ export class McpClient {
 
         if (res.statusCode === 202) {
           // 202 Accepted for notifications
-          resolve({ jsonrpc: '2.0', id: request.id, result: {} });
+          settle(() => resolve({ jsonrpc: '2.0', id: request.id, result: {} }));
           return;
         }
 
@@ -210,20 +220,20 @@ export class McpClient {
                 // Retry the original request (but don't retry again if it fails)
                 try {
                   const retryResponse = await this.sendRequest(request, false);
-                  resolve(retryResponse);
+                  settle(() => resolve(retryResponse));
                   return;
                 } catch (retryError) {
-                  reject(retryError);
+                  settle(() => reject(retryError));
                   return;
                 }
               } catch (recoveryError) {
                 console.error('Protokoll: [SESSION] Failed to recover session:', recoveryError);
-                reject(error);
+                settle(() => reject(error));
                 return;
               }
             }
             
-            reject(error);
+            settle(() => reject(error));
           });
           return;
         }
@@ -233,46 +243,101 @@ export class McpClient {
         const isSSE = contentType.includes('text/event-stream');
 
         let data = '';
-        res.on('data', (chunk) => {
-          data += chunk.toString();
-        });
+        const maybeHandleResponse = async (responseData: JsonRpcResponse): Promise<void> => {
+          if (retryOnSessionError && !this.recoveringSession && this.shouldRecoverSession(null, responseData)) {
+            console.warn('Protokoll: [SESSION] Session error in response, attempting to recover...');
+            try {
+              await this.recoverSession();
+              try {
+                const retryResponse = await this.sendRequest(request, false);
+                settle(() => resolve(retryResponse));
+                return;
+              } catch (retryError) {
+                settle(() => reject(retryError));
+                return;
+              }
+            } catch (recoveryError) {
+              console.error('Protokoll: [SESSION] Failed to recover session:', recoveryError);
+              settle(() => resolve(responseData));
+              return;
+            }
+          }
+
+          settle(() => resolve(responseData));
+        };
+
+        // For SSE POST responses, resolve as soon as we receive one complete event
+        // instead of waiting for stream end (which can remain open for keep-alive).
+        if (isSSE) {
+          res.on('data', async (chunk) => {
+            if (settled) {
+              return;
+            }
+            data += chunk.toString();
+            if (!data.includes('\n\n')) {
+              return;
+            }
+
+            try {
+              const responseData = this.parseSSEResponse(data);
+              await maybeHandleResponse(responseData);
+              if (!settled) {
+                return;
+              }
+              res.destroy();
+              req.destroy();
+            } catch {
+              // Wait for more chunks if we don't have a full JSON payload yet.
+            }
+          });
+        } else {
+          res.on('data', (chunk) => {
+            data += chunk.toString();
+          });
+        }
+
         res.on('end', async () => {
+          if (settled) {
+            return;
+          }
+
           try {
-            // Parse response based on Content-Type
             const responseData: JsonRpcResponse = isSSE
               ? this.parseSSEResponse(data)
               : JSON.parse(data);
-            
-            // Check for session errors in JSON-RPC response
-            if (retryOnSessionError && !this.recoveringSession && this.shouldRecoverSession(null, responseData)) {
-              console.warn('Protokoll: [SESSION] Session error in response, attempting to recover...');
-              try {
-                await this.recoverSession();
-                // Retry the original request (but don't retry again if it fails)
-                try {
-                  const retryResponse = await this.sendRequest(request, false);
-                  resolve(retryResponse);
-                  return;
-                } catch (retryError) {
-                  reject(retryError);
-                  return;
-                }
-              } catch (recoveryError) {
-                console.error('Protokoll: [SESSION] Failed to recover session:', recoveryError);
-                resolve(responseData); // Return the original error response
-                return;
-              }
-            }
-            
-            resolve(responseData);
+            await maybeHandleResponse(responseData);
           } catch (error) {
-            reject(new Error(`Failed to parse response: ${error instanceof Error ? error.message : String(error)}`));
+            settle(() => reject(new Error(`Failed to parse response: ${error instanceof Error ? error.message : String(error)}`)));
           }
         });
       });
 
-      req.on('error', (error) => {
-        reject(error);
+      req.setTimeout(McpClient.REQUEST_TIMEOUT_MS, () => {
+        req.destroy(new Error(`Request timed out after ${McpClient.REQUEST_TIMEOUT_MS}ms`));
+      });
+
+      req.on('error', async (error: NodeJS.ErrnoException) => {
+        const isTimeoutError = (error.message ?? '').includes('timed out') || error.code === 'ETIMEDOUT';
+        const isRecoverableTransportError = isTimeoutError || error.code === 'ECONNRESET' || error.code === 'EPIPE';
+
+        if (retryOnSessionError && isRecoverableTransportError) {
+          console.warn('Protokoll: [SESSION] Recovering after transport error:', error.message || error.code);
+          try {
+            await this.recoverSession();
+            try {
+              const retryResponse = await this.sendRequest(request, false);
+              settle(() => resolve(retryResponse));
+              return;
+            } catch (retryError) {
+              settle(() => reject(retryError));
+              return;
+            }
+          } catch (recoveryError) {
+            console.error('Protokoll: [SESSION] Failed to recover after transport error:', recoveryError);
+          }
+        }
+
+        settle(() => reject(error));
       });
 
       req.write(JSON.stringify(request));
@@ -543,7 +608,22 @@ export class McpClient {
       throw new Error(`Failed to call tool ${toolName}: ${response.error.message}`);
     }
 
-    const result = response.result as { content?: Array<{ type: string; text?: string }> };
+    const result = response.result as {
+      content?: Array<{ type: string; text?: string }>;
+      isError?: boolean;
+    };
+
+    if (result.isError) {
+      const errorText = result.content
+        ?.find(c => c.type === 'text')
+        ?.text
+        ?.trim();
+      throw new Error(
+        errorText && errorText.length > 0
+          ? errorText.replace(/^Error:\s*/i, '')
+          : `Tool ${toolName} returned an error`
+      );
+    }
     
     // Extract text content from result if present
     if (result.content && result.content.length > 0) {

@@ -939,7 +939,7 @@ Content here.`;
             expect(callToolSpy).toHaveBeenCalledWith(
                 'protokoll_reject_correction',
                 expect.objectContaining({
-                    transcriptPath: '/path/to/test.md',
+                    transcriptPath: 'protokoll://transcript/test.md',
                     correctionEntryId: 42,
                 })
             );
@@ -998,7 +998,7 @@ Content here.`;
             expect(callToolSpy).toHaveBeenCalledWith(
                 'protokoll_summarize_transcript',
                 expect.objectContaining({
-                    transcriptPath: 'test.md',
+                    transcriptPath: 'protokoll://transcript/test.md',
                 })
             );
         });
@@ -1102,7 +1102,7 @@ Content here.`;
             expect(callToolSpy).toHaveBeenCalledWith(
                 'protokoll_reject_correction',
                 expect.objectContaining({
-                    transcriptPath: '/path/to/test.md',
+                    transcriptPath: 'protokoll://transcript/test.md',
                     correctionEntryId: 42,
                 })
             );

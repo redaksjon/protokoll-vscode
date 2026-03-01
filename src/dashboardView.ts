@@ -40,6 +40,11 @@ export class DashboardViewProvider {
   private _watchdogTimer: NodeJS.Timeout | undefined;
   /** 500ms debounce: coalesces rapid SSE events into a single refresh. */
   private _debounceTimer: NodeJS.Timeout | undefined;
+  /** Small TTL cache to avoid repeated expensive stats scans. */
+  private _statsCache: {
+    fetchedAtMs: number;
+    data: { totalCount: number; projects: Array<{ id: string | null; name: string; total: number; statuses: Record<string, number> }> };
+  } | null = null;
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
 
@@ -279,8 +284,30 @@ export class DashboardViewProvider {
     }
 
     try {
-      const result = await this._mcpClient.listTranscripts({ limit: 10000 });
-      const transcripts = result.transcripts ?? [];
+      const now = Date.now();
+      if (this._statsCache && now - this._statsCache.fetchedAtMs < 15_000) {
+        return this._statsCache.data;
+      }
+
+      const transcripts: Array<{
+        entities?: { projects?: Array<{ id?: string; name?: string }> };
+        status?: string;
+      }> = [];
+      const pageLimit = 250;
+      const maxPages = 40; // Caps dashboard stats at 10k rows.
+      let offset = 0;
+      for (let page = 0; page < maxPages; page++) {
+        const pageResult = await this._mcpClient.listTranscripts({ limit: pageLimit, offset });
+        const rows = (pageResult.transcripts || []) as Array<{
+          entities?: { projects?: Array<{ id?: string; name?: string }> };
+          status?: string;
+        }>;
+        transcripts.push(...rows);
+        if (!pageResult.pagination?.hasMore || rows.length === 0) {
+          break;
+        }
+        offset += pageLimit;
+      }
 
       const projectMap = new Map<string, { id: string | null; statuses: Record<string, number> }>();
       let totalCount = 0;
@@ -321,7 +348,12 @@ export class DashboardViewProvider {
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
 
-      return { totalCount, projects };
+      const data = { totalCount, projects };
+      this._statsCache = {
+        fetchedAtMs: now,
+        data,
+      };
+      return data;
     } catch (err) {
       console.error('Protokoll: [DASHBOARD] Failed to fetch stats:', err);
       return { totalCount: 0, projects: [] };
