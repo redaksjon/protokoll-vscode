@@ -1104,44 +1104,88 @@ export class TranscriptDetailViewProvider {
       // Log for debugging
       console.log(`Protokoll: Updating transcript with path: ${transcriptPath}, projectId: ${projectId}`);
       
+      let editResult: {
+        success?: boolean;
+        originalPath?: string;
+        outputPath?: string;
+        renamed?: boolean;
+        message?: string;
+      } | undefined;
       try {
-        const result = await this._client.callTool('protokoll_edit_transcript', {
+        editResult = await this._client.callTool('protokoll_edit_transcript', {
           transcriptPath: transcriptPath,
           projectId: projectId,
-        });
+        }) as {
+          success?: boolean;
+          originalPath?: string;
+          outputPath?: string;
+          renamed?: boolean;
+          message?: string;
+        };
         
-        console.log(`Protokoll: Edit transcript result:`, result);
+        console.log(`Protokoll: Edit transcript result:`, editResult);
         vscode.window.showInformationMessage(`Protokoll: Transcript assigned to project "${projectName}"`);
       } catch (toolError) {
         console.error(`Protokoll: Error calling protokoll_edit_transcript:`, toolError);
         throw toolError; // Re-throw to be caught by outer catch
       }
 
-      // Refresh the transcripts list view
-      await vscode.commands.executeCommand('protokoll.refreshTranscripts');
+      // Project routing may move/rename the transcript path. In that case we cannot
+      // safely do an in-place update by the old URI, so request a full list refresh.
+      const movedTranscript = !!editResult?.renamed
+        || (editResult?.originalPath && editResult?.outputPath && editResult.originalPath !== editResult.outputPath);
+      if (movedTranscript) {
+        await this._onTranscriptChanged?.();
+      }
 
-      // Update the local transcript object with the new project info
+      // Re-read from server so we only render persisted metadata (no optimistic local-only state).
+      // This keeps detail + list views consistent and avoids showing project changes that did not persist.
+      let latestContent: TranscriptContent | null = null;
+      if (!movedTranscript) {
+        try {
+          latestContent = await this._client.readTranscript(transcriptUri);
+        } catch (readError) {
+          console.warn('Protokoll: Could not re-read transcript after project change, falling back to list refresh', readError);
+          await this._onTranscriptChanged?.();
+        }
+      }
+
+      // Update local transcript state from persisted server data.
       const currentTranscript = this._currentTranscripts.get(transcriptUri);
       if (currentTranscript) {
-        // Update the transcript object with the new project
+        const persistedProjects = latestContent?.metadata.entities?.projects;
+        const nextProjects = persistedProjects && persistedProjects.length > 0
+          ? persistedProjects
+          : [{ id: projectId, name: projectName }];
         const updatedTranscript: Transcript = {
           ...currentTranscript.transcript,
+          title: latestContent?.title || currentTranscript.transcript.title,
+          status: latestContent?.metadata.status || currentTranscript.transcript.status,
           entities: {
             ...currentTranscript.transcript.entities,
-            projects: [{
-              id: projectId,
-              name: projectName,
-            }],
+            ...(latestContent?.metadata.entities || {}),
+            projects: nextProjects,
           },
         };
         
-        // Update the stored transcript
         this._currentTranscripts.set(transcriptUri, {
           uri: transcriptUri,
           transcript: updatedTranscript,
         });
         
-        // Refresh the detail view with updated transcript
+        // Update list view (prefer in-place; callback implementation falls back to full refresh).
+        const listUpdates: Partial<Transcript> = {
+          entities: updatedTranscript.entities,
+        };
+        if (updatedTranscript.title !== undefined) {
+          listUpdates.title = updatedTranscript.title;
+        }
+        if (updatedTranscript.status !== undefined) {
+          listUpdates.status = updatedTranscript.status;
+        }
+        await this._onTranscriptChanged?.(transcriptUri, listUpdates);
+
+        // Refresh detail view with persisted state
         await this.showTranscript(transcriptUri, updatedTranscript);
       }
     } catch (error) {

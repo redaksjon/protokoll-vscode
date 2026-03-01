@@ -169,6 +169,78 @@ export async function activate(context: vscode.ExtensionContext) {
   try {
     mcpClient = new McpClient(serverUrl);
     clearServerModeCache(); // Clear cached server mode on new connection
+
+    let notificationRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+    let notificationRefreshInFlight = false;
+    let pendingTranscriptRefresh = false;
+    let pendingEntityRefresh = false;
+    let pendingOpenTranscriptRefresh = false;
+
+    const runNotificationRefreshQueue = async (): Promise<void> => {
+      if (notificationRefreshInFlight) {
+        return;
+      }
+      notificationRefreshInFlight = true;
+      try {
+        do {
+          const refreshTranscripts = pendingTranscriptRefresh;
+          const refreshEntities = pendingEntityRefresh;
+          const refreshOpenTranscripts = pendingOpenTranscriptRefresh;
+          pendingTranscriptRefresh = false;
+          pendingEntityRefresh = false;
+          pendingOpenTranscriptRefresh = false;
+
+          if (refreshTranscripts && transcriptsViewProvider) {
+            await transcriptsViewProvider.refresh();
+          }
+
+          if (refreshEntities) {
+            if (peopleViewProvider) {
+              await peopleViewProvider.refresh();
+            }
+            if (termsViewProvider) {
+              await termsViewProvider.refresh();
+            }
+            if (projectsViewProvider) {
+              await projectsViewProvider.refresh();
+            }
+            if (companiesViewProvider) {
+              await companiesViewProvider.refresh();
+            }
+          }
+
+          if (refreshOpenTranscripts && transcriptDetailViewProvider) {
+            const allOpenTranscripts = transcriptDetailViewProvider.getAllOpenTranscripts();
+            for (const openTranscript of allOpenTranscripts) {
+              try {
+                await transcriptDetailViewProvider.refreshTranscript(openTranscript.uri);
+              } catch (error) {
+                console.warn(`Protokoll: [EXTENSION] ⚠️ Failed to refresh transcript ${openTranscript.uri}:`, error);
+              }
+            }
+          }
+        } while (pendingTranscriptRefresh || pendingEntityRefresh || pendingOpenTranscriptRefresh);
+      } finally {
+        notificationRefreshInFlight = false;
+      }
+    };
+
+    const scheduleNotificationRefresh = (options: {
+      transcripts?: boolean;
+      entities?: boolean;
+      openTranscripts?: boolean;
+    }): void => {
+      pendingTranscriptRefresh = pendingTranscriptRefresh || options.transcripts === true;
+      pendingEntityRefresh = pendingEntityRefresh || options.entities === true;
+      pendingOpenTranscriptRefresh = pendingOpenTranscriptRefresh || options.openTranscripts === true;
+      if (notificationRefreshTimer) {
+        clearTimeout(notificationRefreshTimer);
+      }
+      notificationRefreshTimer = setTimeout(() => {
+        notificationRefreshTimer = undefined;
+        void runNotificationRefreshQueue();
+      }, 250);
+    };
     
     // Check server health
     const isHealthy = await mcpClient.healthCheck();
@@ -206,44 +278,7 @@ export async function activate(context: vscode.ExtensionContext) {
         console.log('Protokoll: [EXTENSION] Registering notification handler for resources_changed');
         mcpClient.onNotification('notifications/resources_changed', async () => {
           console.log('Protokoll: [EXTENSION] 📢 Received resources_changed notification, refreshing views');
-          
-          // Refresh transcripts view
-          if (transcriptsViewProvider) {
-            await transcriptsViewProvider.refresh();
-          } else {
-            console.warn('Protokoll: [EXTENSION] ⚠️ transcriptsViewProvider is null, cannot refresh');
-          }
-          
-          // Refresh entity views
-          if (peopleViewProvider) {
-            await peopleViewProvider.refresh();
-          }
-          if (termsViewProvider) {
-            await termsViewProvider.refresh();
-          }
-          if (projectsViewProvider) {
-            await projectsViewProvider.refresh();
-          }
-          if (companiesViewProvider) {
-            await companiesViewProvider.refresh();
-          }
-          
-          // Also refresh any open transcript detail views, as they might need to update
-          // (e.g., if a transcript was renamed, the list will have the new name)
-          if (transcriptDetailViewProvider) {
-            const allOpenTranscripts = transcriptDetailViewProvider.getAllOpenTranscripts();
-            console.log(`Protokoll: [EXTENSION] Refreshing ${allOpenTranscripts.length} open transcript detail view(s)`);
-            for (const openTranscript of allOpenTranscripts) {
-              try {
-                // Refresh each open transcript to pick up any changes
-                await transcriptDetailViewProvider.refreshTranscript(openTranscript.uri);
-              } catch (error) {
-                console.warn(`Protokoll: [EXTENSION] ⚠️ Failed to refresh transcript ${openTranscript.uri}:`, error);
-                // If refresh fails (e.g., URI changed due to rename), try to find the new URI
-                // by refreshing the transcripts list and matching by content/metadata
-              }
-            }
-          }
+          scheduleNotificationRefresh({ transcripts: true, entities: true, openTranscripts: true });
         });
         
         // Subscribe to individual resource change notifications
@@ -261,11 +296,7 @@ export async function activate(context: vscode.ExtensionContext) {
           // Check if this is a transcript list URI
           if (params.uri.startsWith('protokoll://transcripts')) {
             console.log('Protokoll: [EXTENSION] This is a transcripts list URI, refreshing list');
-            if (transcriptsViewProvider) {
-              await transcriptsViewProvider.refresh();
-            } else {
-              console.warn('Protokoll: [EXTENSION] ⚠️ transcriptsViewProvider is null');
-            }
+            scheduleNotificationRefresh({ transcripts: true });
             return;
           }
           
@@ -273,6 +304,7 @@ export async function activate(context: vscode.ExtensionContext) {
           if (params.uri.startsWith('protokoll://entity/')) {
             console.log('Protokoll: [EXTENSION] This is an entity URI, refreshing if open');
             console.log(`Protokoll: [EXTENSION] Notification URI: ${params.uri}`);
+            scheduleNotificationRefresh({ entities: true });
             if (transcriptDetailViewProvider) {
               // Refresh the entity view if it's open
               await transcriptDetailViewProvider.refreshEntity(params.uri);
@@ -286,9 +318,7 @@ export async function activate(context: vscode.ExtensionContext) {
             console.log('Protokoll: [EXTENSION] This is an individual transcript URI, refreshing if open');
             console.log(`Protokoll: [EXTENSION] Notification URI: ${params.uri}`);
             // Refresh transcripts list so status changes (e.g. archived) are reflected when filters exclude that status
-            if (transcriptsViewProvider) {
-              await transcriptsViewProvider.refresh();
-            }
+            scheduleNotificationRefresh({ transcripts: true });
             if (transcriptDetailViewProvider) {
               // Refresh the transcript view if it's open
               const currentTranscript = transcriptDetailViewProvider.getCurrentTranscript(params.uri);
@@ -2407,8 +2437,6 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // Auto-refresh transcripts on activation (only if server is connected)
   if (transcriptsViewProvider && serverConnected && mcpClient) {
-    await transcriptsViewProvider.refresh();
-    
     // Subscribe to transcripts list changes
     try {
       console.log('Protokoll: [EXTENSION] Setting up subscription to transcripts list...');

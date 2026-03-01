@@ -30,12 +30,13 @@ class TermItem extends vscode.TreeItem {
     public readonly type: TermItemType,
     public readonly term?: Term,
     label?: string,
-    collapsibleState?: vscode.TreeItemCollapsibleState
+    collapsibleState?: vscode.TreeItemCollapsibleState,
+    treeId?: string
   ) {
     super(label || term?.name || '', collapsibleState || vscode.TreeItemCollapsibleState.None);
 
     if (type === 'term' && term) {
-      this.id = `term-${term.id}`;
+      this.id = treeId || `term-${term.id}`;
       this.tooltip = this.buildTooltip(term);
       this.description = this.buildDescription(term);
       this.contextValue = 'term';
@@ -264,7 +265,15 @@ export class TermsViewProvider implements vscode.TreeDataProvider<TermItem> {
     }
 
     if (!element) {
-      const items: TermItem[] = this.terms.map(term => new TermItem('term', term));
+      const seenIds = new Map<string, number>();
+      const items: TermItem[] = this.terms.map((term, index) => {
+        const baseId = (term.id || '').trim() || (term.name || '').trim() || `index-${index}`;
+        const occurrence = (seenIds.get(baseId) || 0) + 1;
+        seenIds.set(baseId, occurrence);
+        const suffix = occurrence === 1 ? '' : `-${occurrence}`;
+        const treeId = `term-${baseId}${suffix}`;
+        return new TermItem('term', term, undefined, undefined, treeId);
+      });
       
       if (this.terms.length < this.total) {
         items.push(new TermItem('load-more', undefined, 'Load More...'));
