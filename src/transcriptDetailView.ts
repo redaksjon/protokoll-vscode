@@ -995,9 +995,10 @@ export class TranscriptDetailViewProvider {
       // Only pass contextDirectory if server is in local mode
       const shouldPass = await shouldPassContextDirectory(this._client);
       const contextDirectory = shouldPass ? this.getDefaultContextDirectory() : undefined;
+      const toolContextArgs = contextDirectory ? { contextDirectory } : {};
       const projectsResult = await this._client.callTool(
         'protokoll_list_projects',
-        contextDirectory ? { contextDirectory } : {}
+        toolContextArgs
       ) as {
         projects?: Array<{ id: string; name: string; active?: boolean }>;
       };
@@ -1074,6 +1075,7 @@ export class TranscriptDetailViewProvider {
 
         const addResult = await this._client.callTool('protokoll_add_project', {
           name: projectNameInput.trim(),
+          ...toolContextArgs,
         }) as { id?: string; name?: string; entity?: { id: string; name: string } };
 
         // Support both { id, name } and { entity: { id, name } } response formats
@@ -1115,6 +1117,7 @@ export class TranscriptDetailViewProvider {
         editResult = await this._client.callTool('protokoll_edit_transcript', {
           transcriptPath: transcriptPath,
           projectId: projectId,
+          ...toolContextArgs,
         }) as {
           success?: boolean;
           originalPath?: string;
