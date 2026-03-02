@@ -2599,13 +2599,14 @@ export async function activate(context: vscode.ExtensionContext) {
               if (transcriptsViewProvider) {
                 await transcriptsViewProvider.refresh();
               }
-              const action = await vscode.window.showInformationMessage(
+              void vscode.window.showInformationMessage(
                 `Audio uploaded successfully! Tracking ID: ${result.uuid?.substring(0, 8)}`,
                 'Open Dashboard'
-              );
-              if (action === 'Open Dashboard') {
-                await vscode.commands.executeCommand('protokoll.openDashboard');
-              }
+              ).then((action) => {
+                if (action === 'Open Dashboard') {
+                  void vscode.commands.executeCommand('protokoll.openDashboard');
+                }
+              });
             } else {
               vscode.window.showErrorMessage(`Upload failed: ${result.error}`);
             }
