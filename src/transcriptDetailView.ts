@@ -4677,7 +4677,6 @@ export class TranscriptDetailViewProvider {
         }
         
         // Run setup immediately (script is at end of body, DOM should be ready)
-        renderEntityReferencesContent();
         setupInlineChatListeners();
         setupRefreshButton();
         setupEditButton();
