@@ -77,3 +77,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.package.outputs.vsix_file }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "${{ steps.package.outputs.vsix_file }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
