@@ -74,12 +74,6 @@ jobs:
           path: ${{ steps.package.outputs.vsix_file }}
       - name: Upload VSIX to GitHub Release
         if: steps.publish-tag.outputs.should_publish == 'true' && github.event_name == 'release'
-<<<<<<< HEAD
-        run: gh release upload "${{ github.event.release.tag_name }}" "${{ steps.package.outputs.vsix_file }}"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-=======
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.package.outputs.vsix_file }}
->>>>>>> main
