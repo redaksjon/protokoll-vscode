@@ -6,6 +6,7 @@
 import OpenAI from 'openai';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 import type { McpClient } from './mcpClient';
+import { getProxyUrl, isProxyBypassed, getStrictSSL } from './proxyUtils';
 
 export interface ToolDefinition {
   name: string;
@@ -23,7 +24,22 @@ export class OpenAIClient {
   private availableTools: Map<string, ToolDefinition> = new Map();
 
   constructor(apiKey: string) {
-    this.client = new OpenAI({ apiKey });
+    const proxyUrl = getProxyUrl();
+    if (proxyUrl && !isProxyBypassed('https://api.openai.com')) {
+      // Node.js 24+ ships undici which powers global fetch.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { ProxyAgent } = require('undici') as typeof import('undici');
+      const dispatcher = new ProxyAgent({
+        uri: proxyUrl,
+        requestTls: { rejectUnauthorized: getStrictSSL() },
+      });
+      this.client = new OpenAI({
+        apiKey,
+        fetchOptions: { dispatcher } as Record<string, unknown>,
+      });
+    } else {
+      this.client = new OpenAI({ apiKey });
+    }
   }
 
   setMcpClient(client: McpClient): void {

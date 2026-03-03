@@ -11,6 +11,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { URL } from 'url';
+import { getProxyAgent } from './proxyUtils';
 
 const AUDIO_MIME_TYPES: Record<string, string> = {
   mp3: 'audio/mpeg',
@@ -129,8 +130,9 @@ export class UploadService {
 
         const url = new URL(`${options.serverUrl.replace(/\/+$/, '')}/audio/upload`);
         const httpModule = url.protocol === 'https:' ? https : http;
+        const proxyAgent = getProxyAgent(url.toString());
 
-        const requestOptions = {
+        const requestOptions: http.RequestOptions | https.RequestOptions = {
           hostname: url.hostname,
           port: url.port || (url.protocol === 'https:' ? 443 : 80),
           path: url.pathname,
@@ -148,6 +150,7 @@ export class UploadService {
               : {}),
           },
           timeout: 60_000, // 60-second timeout — large files can be slow
+          ...(proxyAgent ? { agent: proxyAgent } : {}),
         };
 
         const req = httpModule.request(requestOptions, (res) => {

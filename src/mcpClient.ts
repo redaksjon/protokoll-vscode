@@ -13,6 +13,7 @@ import type {
   McpResourceResponse,
   McpResourcesListResponse,
 } from './types';
+import { getProxyAgent } from './proxyUtils';
 
 export class McpClient {
   private static readonly REQUEST_TIMEOUT_MS = 15000;
@@ -190,12 +191,14 @@ export class McpClient {
         headers['Mcp-Session-Id'] = this.sessionId;
       }
       headers = this.appendAuthHeaders(headers);
-      const options = {
+      const proxyAgent = getProxyAgent(url.toString());
+      const options: http.RequestOptions | https.RequestOptions = {
         hostname: url.hostname,
         port: url.port || (url.protocol === 'https:' ? 443 : 80),
         path: url.pathname,
         method: 'POST',
         headers,
+        ...(proxyAgent ? { agent: proxyAgent } : {}),
       };
 
       const httpModule = url.protocol === 'https:' ? https : http;
@@ -535,13 +538,15 @@ export class McpClient {
     return new Promise((resolve) => {
       const url = new URL(`${this.serverUrl}/health`);
       const httpModule = url.protocol === 'https:' ? https : http;
-      const options = {
+      const proxyAgent = getProxyAgent(url.toString());
+      const options: http.RequestOptions | https.RequestOptions = {
         hostname: url.hostname,
         port: url.port || (url.protocol === 'https:' ? 443 : 80),
         path: url.pathname,
         method: 'GET',
         headers: this.appendAuthHeaders({}),
         timeout: 5000,
+        ...(proxyAgent ? { agent: proxyAgent } : {}),
       };
 
       const req = httpModule.request(options, (res) => {
@@ -752,7 +757,8 @@ export class McpClient {
       const url = new URL(`${this.serverUrl}/mcp`);
       const httpModule = url.protocol === 'https:' ? https : http;
       
-      const options = {
+      const proxyAgent = getProxyAgent(url.toString());
+      const options: http.RequestOptions | https.RequestOptions = {
         hostname: url.hostname,
         port: url.port || (url.protocol === 'https:' ? 443 : 80),
         path: url.pathname,
@@ -763,6 +769,7 @@ export class McpClient {
           'Mcp-Session-Id': this.sessionId,
         }),
         timeout: 0, // Disable timeout for SSE connections
+        ...(proxyAgent ? { agent: proxyAgent } : {}),
       };
 
       const req = httpModule.request(options, (res) => {
