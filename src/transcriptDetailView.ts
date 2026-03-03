@@ -157,6 +157,7 @@ export function getTranscriptContentProvider(): TranscriptContentProvider {
 
 export class TranscriptDetailViewProvider {
   public static readonly viewType = 'protokoll.transcriptDetail';
+  private static readonly ENHANCE_TOOL_TIMEOUT_MS = 5 * 60 * 1000;
 
   private _panels: Map<string, vscode.WebviewPanel> = new Map();
   private _entityPanels: Map<string, vscode.WebviewPanel> = new Map(); // Track entity panels
@@ -459,10 +460,22 @@ export class TranscriptDetailViewProvider {
             await this.handleEditTitle(currentTranscript.transcript, message.transcriptPath, message.newTitle, activeTranscriptUri);
             break;
           case 'editTranscript':
-            await this.handleEditTranscript(currentTranscript.transcript, message.transcriptPath, message.newContent, activeTranscriptUri);
+            await this.handleEditTranscript(
+              currentTranscript.transcript,
+              message.transcriptPath,
+              message.newContent,
+              activeTranscriptUri,
+              'enhanced'
+            );
             break;
           case 'saveOriginalContent':
-            await this.handleEditTranscript(currentTranscript.transcript, message.transcriptPath, message.newContent, activeTranscriptUri);
+            await this.handleEditTranscript(
+              currentTranscript.transcript,
+              message.transcriptPath,
+              message.newContent,
+              activeTranscriptUri,
+              'original'
+            );
             break;
           case 'enhanceFromOriginal':
             await this.handleEnhanceFromOriginal(
@@ -1758,7 +1771,13 @@ export class TranscriptDetailViewProvider {
     }
   }
 
-  private async handleEditTranscript(transcript: Transcript, transcriptPath: string, newContent: string, transcriptUri: string): Promise<void> {
+  private async handleEditTranscript(
+    transcript: Transcript,
+    transcriptPath: string,
+    newContent: string,
+    transcriptUri: string,
+    contentTarget: 'enhanced' | 'original' = 'enhanced'
+  ): Promise<void> {
     if (!this._client) {
       vscode.window.showErrorMessage('MCP client not initialized');
       return;
@@ -1769,9 +1788,14 @@ export class TranscriptDetailViewProvider {
       await this._client.callTool('protokoll_update_transcript_content', {
         transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
         content: newContent,
+        contentTarget,
       });
 
-      vscode.window.showInformationMessage('Protokoll: Transcript content updated');
+      vscode.window.showInformationMessage(
+        contentTarget === 'original'
+          ? 'Protokoll: Original transcript content updated'
+          : 'Protokoll: Enhanced transcript content updated'
+      );
 
       // Refresh the detail view immediately to show the updated content
       const currentTranscript = this._currentTranscripts.get(transcriptUri);
@@ -1858,6 +1882,7 @@ export class TranscriptDetailViewProvider {
           await this._client!.callTool('protokoll_update_transcript_content', {
             transcriptPath: toolTranscriptPath,
             content: originalText,
+            contentTarget: 'original',
           });
         }
 
@@ -1870,10 +1895,16 @@ export class TranscriptDetailViewProvider {
           await this._onTranscriptChanged(transcriptUri, { status: 'in_progress' as TranscriptStatus });
         }
 
-        await this._client!.callTool('protokoll_enhance_transcript', {
-          transcriptPath: toolTranscriptPath,
-          originalText,
-        });
+        await this._client!.callTool(
+          'protokoll_enhance_transcript',
+          {
+            transcriptPath: toolTranscriptPath,
+            originalText,
+          },
+          {
+            timeoutMs: TranscriptDetailViewProvider.ENHANCE_TOOL_TIMEOUT_MS,
+          }
+        );
 
         // Fallback refresh path: keep SSE-driven updates as primary, but also
         // refresh explicitly so users still see results if notifications lag.
@@ -1887,6 +1918,21 @@ export class TranscriptDetailViewProvider {
           });
         }
       } catch (error) {
+        if (this.isRequestTimeoutError(error)) {
+          const timeoutSeconds = Math.round(TranscriptDetailViewProvider.ENHANCE_TOOL_TIMEOUT_MS / 1000);
+          vscode.window.showWarningMessage(
+            `Enhancement is still running on the server. The extension request timed out after ${timeoutSeconds}s, but no failure was reported by MCP yet. Keeping the transcript in progress and watching for completion.`
+          );
+          const activePanel = this._panels.get(transcriptUri);
+          if (activePanel) {
+            activePanel.webview.postMessage({
+              command: 'enhanceDeferred',
+            });
+          }
+          this.monitorEnhancementAfterTimeout(transcriptUri);
+          return;
+        }
+
         const activePanel = this._panels.get(transcriptUri);
         if (activePanel) {
           activePanel.webview.postMessage({
@@ -1896,6 +1942,46 @@ export class TranscriptDetailViewProvider {
         vscode.window.showErrorMessage(
           `Enhancement failed. Existing enhanced content was kept. ${error instanceof Error ? error.message : String(error)}`
         );
+      }
+    })();
+  }
+
+  private isRequestTimeoutError(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+    const message = error.message.toLowerCase();
+    return message.includes('timed out') || message.includes('etimedout');
+  }
+
+  private monitorEnhancementAfterTimeout(transcriptUri: string): void {
+    void (async () => {
+      const maxAttempts = 18; // ~3 minutes at 10s intervals
+      const intervalMs = 10_000;
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+        if (!this._client) {
+          return;
+        }
+
+        try {
+          const content = await this._client.readTranscript(transcriptUri);
+          const status = content.metadata.status;
+          if (status && status !== 'in_progress') {
+            await vscode.commands.executeCommand('protokoll.refreshTranscripts');
+            await this.refreshTranscript(transcriptUri);
+            const activePanel = this._panels.get(transcriptUri);
+            if (activePanel) {
+              activePanel.webview.postMessage({
+                command: 'enhanceCompleted',
+              });
+            }
+            return;
+          }
+        } catch (pollError) {
+          console.warn('Protokoll: Enhancement status polling after timeout failed', pollError);
+        }
       }
     })();
   }
@@ -5101,6 +5187,33 @@ export class TranscriptDetailViewProvider {
         .tab-content.active {
             display: block;
         }
+        .tab-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            flex-wrap: nowrap;
+            margin-bottom: 12px;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .tab-toolbar-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            min-width: 0;
+            flex: 1 1 auto;
+        }
+        .tab-toolbar-right {
+            display: flex;
+            align-items: center;
+            margin-left: auto;
+        }
+        .tab-toolbar-right .button,
+        .tab-toolbar-right .edit-button {
+            margin-left: 0;
+        }
         .original-editor-actions {
             display: flex;
             align-items: center;
@@ -5995,9 +6108,14 @@ export class TranscriptDetailViewProvider {
         </div>
         ${showEnhancedTab ? `
         <div class="tab-content ${initialTab === 'enhanced' ? 'active' : ''}" id="enhanced-content">
-            <div style="display: flex; gap: 8px; margin-bottom: 16px;">
-                <button class="edit-button" onclick="editInEditor('enhanced')" id="edit-in-editor-btn" title="Edit Enhanced content in VS Code editor (supports voice dictation).">Edit Enhanced <span class="kbd-hint">E</span></button>
-                <button class="edit-button" onclick="openSource()" id="open-source-btn" title="View source (read-only)" style="opacity: 0.7;">View Source <span class="kbd-hint">S</span></button>
+            <div class="tab-toolbar" style="margin-bottom: 16px;">
+                <div class="tab-toolbar-left">
+                    <button class="edit-button" onclick="editInEditor('enhanced')" id="edit-in-editor-btn" title="Edit Enhanced content in VS Code editor (supports voice dictation).">Edit Enhanced <span class="kbd-hint">E</span></button>
+                    <button class="edit-button" onclick="openSource()" id="open-source-btn" title="View source (read-only)" style="opacity: 0.7;">View Source <span class="kbd-hint">S</span></button>
+                </div>
+                <div class="tab-toolbar-right">
+                    <button class="button button-secondary" onclick="copyTabContent('enhanced', this)" title="Copy enhanced text">Copy Enhanced</button>
+                </div>
             </div>
             <div class="transcript-content" id="transcript-content-display">
                 ${this.markdownToHtml(transcriptText)}
@@ -6014,17 +6132,27 @@ export class TranscriptDetailViewProvider {
         ${hasOriginalTab ? `
         <div class="tab-content ${initialTab === 'raw' ? 'active' : ''}" id="raw-content">
             ${isManualNote ? `
-            <div class="original-editor-actions">
-                <button class="button button-secondary" id="edit-original-in-editor-btn" onclick="editInEditor('original')">Edit Original in Editor</button>
-                <button class="button" id="save-original-btn" onclick="saveOriginalContent()" disabled>Save Original</button>
-                <button class="enhance-button" id="enhance-original-btn" onclick="enhanceFromOriginal()">Enhance</button>
-                <span class="original-editor-status" id="original-editor-status">No changes</span>
+            <div class="tab-toolbar">
+                <div class="tab-toolbar-left">
+                    <button class="button button-secondary" id="edit-original-in-editor-btn" onclick="editInEditor('original')">Edit Original in Editor</button>
+                    <button class="button" id="save-original-btn" onclick="saveOriginalContent()" disabled>Save Original</button>
+                    <button class="enhance-button" id="enhance-original-btn" onclick="enhanceFromOriginal()">Enhance</button>
+                    <span class="original-editor-status" id="original-editor-status">No changes</span>
+                </div>
+                <div class="tab-toolbar-right">
+                    <button class="button button-secondary" onclick="copyTabContent('original', this)">Copy Original</button>
+                </div>
             </div>
             <textarea id="original-editor-input" class="original-editor-textarea" placeholder="Type or paste original note content...">${this.escapeHtml(originalEditorText)}</textarea>
             ` : `
-            <div style="display: flex; gap: 8px; margin-bottom: 12px;">
-                <button class="edit-button" onclick="editInEditor('original')" title="Edit Original transcript text in VS Code editor.">Edit Original in Editor</button>
-                <button class="enhance-button" id="enhance-original-btn" onclick="enhanceFromOriginal()">Enhance</button>
+            <div class="tab-toolbar">
+                <div class="tab-toolbar-left">
+                    <button class="edit-button" onclick="editInEditor('original')" title="Edit Original transcript text in VS Code editor.">Edit Original in Editor</button>
+                    <button class="enhance-button" id="enhance-original-btn" onclick="enhanceFromOriginal()">Enhance</button>
+                </div>
+                <div class="tab-toolbar-right">
+                    <button class="button button-secondary" onclick="copyTabContent('original', this)">Copy Original</button>
+                </div>
             </div>
             <div class="transcript-content" style="white-space: pre-wrap; font-family: var(--vscode-editor-font-family);">
                 ${this.escapeHtml(content.rawTranscript?.text ?? '')}
@@ -6041,9 +6169,14 @@ export class TranscriptDetailViewProvider {
         ` : ''}
         ${summaryFeatureEnabled ? `<div class="tab-content ${initialTab === 'summary' ? 'active' : ''}" id="summary-content">
             ${hasSummary ? `
-            <div style="display: flex; gap: 8px; margin-bottom: 12px;">
-                <button class="button button-secondary" id="summary-configure-btn" onclick="startSummarySetup()">Reconfigure</button>
-                <button class="button" id="summary-regenerate-btn" onclick="generateSummary()">Generate New Summary</button>
+            <div class="tab-toolbar">
+                <div class="tab-toolbar-left">
+                    <button class="button button-secondary" id="summary-configure-btn" onclick="startSummarySetup()">Reconfigure</button>
+                    <button class="button" id="summary-regenerate-btn" onclick="generateSummary()">Generate New Summary</button>
+                </div>
+                <div class="tab-toolbar-right">
+                    <button class="button button-secondary" onclick="copyTabContent('summary', this)">Copy Summary</button>
+                </div>
             </div>
             <div class="last-fetched">Saved summaries: ${summaries.length}</div>
             <div class="summary-layout">
@@ -6107,6 +6240,7 @@ export class TranscriptDetailViewProvider {
         const hasManualEnhancedContent = ${JSON.stringify(hasManualEnhancedContent)};
         const originalRawText = ${JSON.stringify(content.rawTranscript?.text ?? '')};
         const originalTranscriptText = ${JSON.stringify(transcriptText)};
+        const summaryEntries = ${JSON.stringify(summaries.map(summary => ({ id: summary.id, content: summary.content || '' })))};
         const originalEditorInitialText = ${JSON.stringify(originalEditorText)};
         const initialEntityReferences = ${JSON.stringify(entityReferences)};
         const entitySectionConfig = [
@@ -6342,6 +6476,79 @@ export class TranscriptDetailViewProvider {
                 return editor ? editor.value : '';
             }
             return originalRawText;
+        }
+
+        function getCurrentSummaryText() {
+            const activeSummaryItem = document.querySelector('.summary-item.active');
+            const activeSummaryId = activeSummaryItem ? activeSummaryItem.getAttribute('data-summary-id') : '';
+            if (!activeSummaryId) {
+                return '';
+            }
+            const activeSummary = summaryEntries.find(summary => summary.id === activeSummaryId);
+            return activeSummary ? activeSummary.content : '';
+        }
+
+        function fallbackCopyText(text) {
+            const tempTextArea = document.createElement('textarea');
+            tempTextArea.value = text;
+            tempTextArea.setAttribute('readonly', '');
+            tempTextArea.style.position = 'absolute';
+            tempTextArea.style.left = '-9999px';
+            document.body.appendChild(tempTextArea);
+            tempTextArea.select();
+            const didCopy = document.execCommand('copy');
+            document.body.removeChild(tempTextArea);
+            if (!didCopy) {
+                throw new Error('execCommand copy failed');
+            }
+        }
+
+        async function copyTabContent(kind, button) {
+            let textToCopy = '';
+            let successLabel = 'Copied';
+
+            if (kind === 'original') {
+                textToCopy = getCurrentOriginalText();
+                successLabel = 'Copied Original';
+            } else if (kind === 'enhanced') {
+                textToCopy = originalTranscriptText || '';
+                successLabel = 'Copied Enhanced';
+            } else if (kind === 'summary') {
+                textToCopy = getCurrentSummaryText();
+                successLabel = 'Copied Summary';
+            }
+
+            if (!textToCopy || !textToCopy.trim()) {
+                window.alert('Nothing to copy yet.');
+                return;
+            }
+
+            try {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(textToCopy);
+                } else {
+                    fallbackCopyText(textToCopy);
+                }
+            } catch (error) {
+                try {
+                    fallbackCopyText(textToCopy);
+                } catch (fallbackError) {
+                    console.error('Failed to copy transcript content', { error, fallbackError });
+                    window.alert('Unable to copy text. Please try again.');
+                    return;
+                }
+            }
+
+            if (button) {
+                const originalLabel = button.dataset.originalLabel || button.textContent || 'Copy';
+                button.dataset.originalLabel = originalLabel;
+                button.textContent = successLabel;
+                button.disabled = true;
+                window.setTimeout(() => {
+                    button.textContent = originalLabel;
+                    button.disabled = false;
+                }, 1200);
+            }
         }
 
         function confirmDiscardOriginalChanges() {
@@ -7161,6 +7368,13 @@ export class TranscriptDetailViewProvider {
                     enhanceBtn.textContent = 'Enhance';
                 }
                 setEnhancementTabInProgress(false);
+            } else if (message.command === 'enhanceDeferred') {
+                const enhanceBtn = document.getElementById('enhance-original-btn');
+                if (enhanceBtn) {
+                    enhanceBtn.disabled = false;
+                    enhanceBtn.textContent = 'Enhance';
+                }
+                setEnhancementTabInProgress(true);
             } else if (message.command === 'enhanceCancelled') {
                 const enhanceBtn = document.getElementById('enhance-original-btn');
                 if (enhanceBtn) {

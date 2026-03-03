@@ -149,7 +149,11 @@ export class McpClient {
     return JSON.parse(jsonStr);
   }
 
-  private async sendRequest(request: JsonRpcRequest, retryOnSessionError: boolean = true): Promise<JsonRpcResponse> {
+  private async sendRequest(
+    request: JsonRpcRequest,
+    retryOnSessionError: boolean = true,
+    timeoutMs: number = McpClient.REQUEST_TIMEOUT_MS
+  ): Promise<JsonRpcResponse> {
     return new Promise((resolve, reject) => {
       let settled = false;
       const settle = (fn: () => void) => {
@@ -219,7 +223,7 @@ export class McpClient {
                 await this.recoverSession();
                 // Retry the original request (but don't retry again if it fails)
                 try {
-                  const retryResponse = await this.sendRequest(request, false);
+                  const retryResponse = await this.sendRequest(request, false, timeoutMs);
                   settle(() => resolve(retryResponse));
                   return;
                 } catch (retryError) {
@@ -249,7 +253,7 @@ export class McpClient {
             try {
               await this.recoverSession();
               try {
-                const retryResponse = await this.sendRequest(request, false);
+                const retryResponse = await this.sendRequest(request, false, timeoutMs);
                 settle(() => resolve(retryResponse));
                 return;
               } catch (retryError) {
@@ -312,9 +316,11 @@ export class McpClient {
         });
       });
 
-      req.setTimeout(McpClient.REQUEST_TIMEOUT_MS, () => {
-        req.destroy(new Error(`Request timed out after ${McpClient.REQUEST_TIMEOUT_MS}ms`));
-      });
+      if (timeoutMs > 0) {
+        req.setTimeout(timeoutMs, () => {
+          req.destroy(new Error(`Request timed out after ${timeoutMs}ms`));
+        });
+      }
 
       req.on('error', async (error: NodeJS.ErrnoException) => {
         const isTimeoutError = (error.message ?? '').includes('timed out') || error.code === 'ETIMEDOUT';
@@ -325,7 +331,7 @@ export class McpClient {
           try {
             await this.recoverSession();
             try {
-              const retryResponse = await this.sendRequest(request, false);
+              const retryResponse = await this.sendRequest(request, false, timeoutMs);
               settle(() => resolve(retryResponse));
               return;
             } catch (retryError) {
@@ -591,7 +597,11 @@ export class McpClient {
   /**
    * Call an MCP tool
    */
-  async callTool(toolName: string, args: Record<string, unknown>): Promise<unknown> {
+  async callTool(
+    toolName: string,
+    args: Record<string, unknown>,
+    options?: { timeoutMs?: number }
+  ): Promise<unknown> {
     const request: JsonRpcRequest = {
       jsonrpc: '2.0',
       id: Date.now(),
@@ -602,7 +612,11 @@ export class McpClient {
       },
     };
 
-    const response = await this.sendRequest(request);
+    const response = await this.sendRequest(
+      request,
+      true,
+      options?.timeoutMs ?? McpClient.REQUEST_TIMEOUT_MS
+    );
     
     if (response.error) {
       throw new Error(`Failed to call tool ${toolName}: ${response.error.message}`);
