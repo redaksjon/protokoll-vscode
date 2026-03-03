@@ -17,7 +17,7 @@ A VS Code extension for viewing Protokoll transcripts and entities via the HTTP 
 
 - VS Code 1.90.0 or higher
 - Node.js 24.0.0 or higher
-- A running Protokoll HTTP MCP server (default: `http://127.0.0.1:3001`)
+- A running Protokoll HTTP MCP server (default: `http://127.0.0.1:3002`)
 
 ## Installation
 
@@ -47,7 +47,7 @@ code --install-extension protokoll-vscode-0.1.1-dev.0.vsix
 ### First Time Setup
 
 1. When you first activate the extension, you'll be prompted to configure the server URL
-2. Enter the URL of your Protokoll HTTP MCP server (e.g., `http://127.0.0.1:3000`)
+2. Enter the URL of your Protokoll HTTP MCP server (e.g., `http://127.0.0.1:3002`)
 3. The extension will connect to the server and load available transcripts
 
 ### Viewing Transcripts
@@ -65,7 +65,8 @@ code --install-extension protokoll-vscode-0.1.1-dev.0.vsix
 
 The extension supports the following settings:
 
-- `protokoll.serverUrl`: URL of the Protokoll HTTP MCP server (default: `http://127.0.0.1:3001`)
+- `protokoll.serverUrl`: URL of the Protokoll HTTP MCP server (default: `http://127.0.0.1:3002`)
+- `protokoll.apiKey`: Optional API key for secured servers (sent as `Authorization: Bearer` and `X-API-Key`)
 - `protokoll.transcriptsDirectory`: Default directory path for transcripts (optional)
 
 ## Development

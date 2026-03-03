@@ -516,9 +516,15 @@
       "properties": {
         "protokoll.serverUrl": {
           "type": "string",
-          "default": "http://127.0.0.1:3001",
+          "default": "http://127.0.0.1:3002",
           "description": "URL of the Protokoll HTTP MCP server",
-          "markdownDescription": "URL of the Protokoll HTTP MCP server (e.g., `http://127.0.0.1:3001`)"
+          "markdownDescription": "URL of the Protokoll HTTP MCP server (e.g., `http://127.0.0.1:3002`)"
+        },
+        "protokoll.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Optional API key for secured Protokoll HTTP servers",
+          "markdownDescription": "Optional API key used for both `Authorization: Bearer` and `X-API-Key` headers on all HTTP MCP requests."
         },
         "protokoll.transcriptsDirectory": {
           "type": "string",

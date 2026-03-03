@@ -23,10 +23,27 @@ export class McpClient {
   private subscribedResources: Set<string> = new Set(); // Track subscriptions for transparent re-subscribe after session recovery
   private recoveringSession: boolean = false; // Flag to prevent infinite recovery loops
   private onSessionRecoveredCallbacks: Array<() => void | Promise<void>> = []; // Callbacks to run after session recovery
+  private apiKey?: string;
 
-  constructor(serverUrl: string) {
+  constructor(serverUrl: string, options?: { apiKey?: string }) {
     // Remove trailing slash to ensure consistent URL handling
     this.serverUrl = serverUrl.replace(/\/+$/, '');
+    this.apiKey = options?.apiKey && options.apiKey.trim().length > 0 ? options.apiKey.trim() : undefined;
+  }
+
+  setApiKey(apiKey?: string): void {
+    this.apiKey = apiKey && apiKey.trim().length > 0 ? apiKey.trim() : undefined;
+  }
+
+  private appendAuthHeaders(headers: Record<string, string>): Record<string, string> {
+    if (!this.apiKey) {
+      return headers;
+    }
+    return {
+      ...headers,
+      Authorization: `Bearer ${this.apiKey}`,
+      'X-API-Key': this.apiKey,
+    };
   }
 
   /**
@@ -165,13 +182,14 @@ export class McpClient {
       };
 
       const url = new URL(`${this.serverUrl}/mcp`);
-      const headers: Record<string, string> = {
+      let headers: Record<string, string> = {
         'Content-Type': 'application/json',
         'Accept': 'application/json, text/event-stream',
       };
       if (this.sessionId) {
         headers['Mcp-Session-Id'] = this.sessionId;
       }
+      headers = this.appendAuthHeaders(headers);
       const options = {
         hostname: url.hostname,
         port: url.port || (url.protocol === 'https:' ? 443 : 80),
@@ -522,6 +540,7 @@ export class McpClient {
         port: url.port || (url.protocol === 'https:' ? 443 : 80),
         path: url.pathname,
         method: 'GET',
+        headers: this.appendAuthHeaders({}),
         timeout: 5000,
       };
 
@@ -738,11 +757,11 @@ export class McpClient {
         port: url.port || (url.protocol === 'https:' ? 443 : 80),
         path: url.pathname,
         method: 'GET',
-        headers: {
+        headers: this.appendAuthHeaders({
           'Accept': 'text/event-stream',
           'Cache-Control': 'no-cache', // eslint-disable-line @typescript-eslint/naming-convention
           'Mcp-Session-Id': this.sessionId,
-        },
+        }),
         timeout: 0, // Disable timeout for SSE connections
       };
 
