@@ -28,6 +28,7 @@ export interface UploadOptions {
   serverUrl: string;   // e.g., "http://127.0.0.1:3001"
   title?: string;      // Optional title hint
   project?: string;    // Optional project hint
+  apiKey?: string;     // Optional API key for secured servers
 }
 
 export interface UploadResult {
@@ -139,6 +140,12 @@ export class UploadService {
             'Content-Type': `multipart/form-data; boundary=${boundary}`,
             // eslint-disable-next-line @typescript-eslint/naming-convention
             'Content-Length': body.length,
+            ...(options.apiKey && options.apiKey.trim().length > 0
+              ? {
+                  Authorization: `Bearer ${options.apiKey.trim()}`,
+                  'X-API-Key': options.apiKey.trim(),
+                }
+              : {}),
           },
           timeout: 60_000, // 60-second timeout — large files can be slow
         };

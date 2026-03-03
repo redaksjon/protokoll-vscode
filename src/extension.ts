@@ -41,6 +41,20 @@ function getDefaultContextDirectory(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }
 
+function getConfigurationScopeUri(): vscode.Uri | undefined {
+  return vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+}
+
+function getProtokollConfiguration(): vscode.WorkspaceConfiguration {
+  return vscode.workspace.getConfiguration('protokoll', getConfigurationScopeUri());
+}
+
+function getConfiguredApiKey(): string | undefined {
+  const raw = getProtokollConfiguration().get<string>('apiKey', '');
+  const trimmed = raw?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 function normalizeServerUrl(url: string): string {
   return url.trim().replace(/\/+$/, '');
 }
@@ -114,8 +128,9 @@ export async function activate(context: vscode.ExtensionContext) {
   console.log('Protokoll: [ACTIVATION] Extension activate() called');
 
   // Initialize MCP client
-  const config = vscode.workspace.getConfiguration('protokoll');
-  const rawServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3001');
+  const config = getProtokollConfiguration();
+  const rawServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3002');
+  const configuredApiKey = getConfiguredApiKey();
   const fallbackServerUrl = normalizeServerUrl(rawServerUrl);
   const hasConfiguredUrl = context.globalState.get<boolean>('protokoll.hasConfiguredUrl', false);
   const storedConnections = context.globalState.get<Array<{ id: string; name: string; url: string }>>(SERVER_CONNECTIONS_KEY, []);
@@ -167,7 +182,7 @@ export async function activate(context: vscode.ExtensionContext) {
   let shouldPromptForConfig = false;
   
   try {
-    mcpClient = new McpClient(serverUrl);
+    mcpClient = new McpClient(serverUrl, { apiKey: configuredApiKey });
     clearServerModeCache(); // Clear cached server mode on new connection
 
     let notificationRefreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -884,7 +899,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     const previousClient = mcpClient;
     try {
-      const newClient = new McpClient(cleanUrl);
+      const newClient = new McpClient(cleanUrl, { apiKey: getConfiguredApiKey() });
       clearServerModeCache();
       const isHealthy = await newClient.healthCheck();
       mcpClient = newClient;
@@ -930,14 +945,14 @@ export async function activate(context: vscode.ExtensionContext) {
   const configureServerCommand = vscode.commands.registerCommand(
     'protokoll.configureServer',
     async () => {
-      const config = vscode.workspace.getConfiguration('protokoll');
+      const config = getProtokollConfiguration();
       const active = getActiveServerConnection();
-      const currentUrl = active?.url || config.get<string>('serverUrl', 'http://127.0.0.1:3001');
+      const currentUrl = active?.url || config.get<string>('serverUrl', 'http://127.0.0.1:3002');
       
       const input = await vscode.window.showInputBox({
         prompt: 'Enter the Protokoll HTTP MCP server URL',
         value: currentUrl,
-        placeHolder: 'http://127.0.0.1:3001',
+        placeHolder: 'http://127.0.0.1:3002',
         validateInput: (value) => {
           if (!value || value.trim() === '') {
             return 'Server URL cannot be empty';
@@ -985,7 +1000,7 @@ export async function activate(context: vscode.ExtensionContext) {
     async () => {
       const urlInput = await vscode.window.showInputBox({
         prompt: 'Enter the Protokoll HTTP MCP server URL to add',
-        placeHolder: 'http://127.0.0.1:3001',
+        placeHolder: 'http://127.0.0.1:3002',
         validateInput: (value) => {
           if (!value || value.trim() === '') {
             return 'Server URL cannot be empty';
@@ -2405,13 +2420,13 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // Refresh transcripts when configuration changes
   const configWatcher = vscode.workspace.onDidChangeConfiguration(async (e) => {
-    if (e.affectsConfiguration('protokoll.serverUrl')) {
+    if (e.affectsConfiguration('protokoll.serverUrl') || e.affectsConfiguration('protokoll.apiKey')) {
       if (ignoreNextServerUrlConfigChange) {
         ignoreNextServerUrlConfigChange = false;
         return;
       }
-      const config = vscode.workspace.getConfiguration('protokoll');
-      const rawServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3000');
+      const config = getProtokollConfiguration();
+      const rawServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3002');
       const serverUrl = normalizeServerUrl(rawServerUrl);
       if (!serverUrl) {
         return;
@@ -2578,7 +2593,8 @@ export async function activate(context: vscode.ExtensionContext) {
       }
 
       // 4. Perform upload with progress notification
-      const serverUrl = vscode.workspace.getConfiguration('protokoll').get<string>('serverUrl', 'http://127.0.0.1:3001') || 'http://127.0.0.1:3001';
+      const serverUrl = getProtokollConfiguration().get<string>('serverUrl', 'http://127.0.0.1:3002') || 'http://127.0.0.1:3002';
+      const apiKey = getConfiguredApiKey();
 
       await vscode.window.withProgress(
         {
@@ -2593,6 +2609,7 @@ export async function activate(context: vscode.ExtensionContext) {
               serverUrl,
               title: title && title.trim() ? title.trim() : undefined,
               project: project && project.trim() ? project.trim() : undefined,
+              apiKey,
             });
 
             if (result.success) {
