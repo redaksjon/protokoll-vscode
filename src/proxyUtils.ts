@@ -12,11 +12,59 @@
 import * as vscode from 'vscode';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import type * as http from 'http';
-import { Agent as HttpAgent } from 'node:http';
-import { Agent as HttpsAgent } from 'node:https';
+import { Agent as HttpAgent } from 'http';
+import { Agent as HttpsAgent } from 'https';
 import { URL } from 'url';
 
+const directHttpAgent = new HttpAgent({ keepAlive: true });
+const directHttpsAgent = new HttpsAgent({ keepAlive: true });
+const PROXY_ENV_KEYS = [
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'all_proxy',
+];
+const originalProxyEnv = new Map<string, string | undefined>();
+let proxyEnvironmentBypassApplied = false;
+
+function getConfiguredProxyBypass(): boolean {
+  const envOverride = process.env.PROTOKOLL_PROXY_BYPASS?.trim().toLowerCase();
+  if (envOverride === '1' || envOverride === 'true' || envOverride === 'yes') {
+    return true;
+  }
+
+  const activeEditorUri = vscode.window.activeTextEditor?.document.uri;
+  if (activeEditorUri) {
+    const activeEditorValue = vscode.workspace.getConfiguration('protokoll', activeEditorUri).get<boolean>('proxyBypass');
+    if (activeEditorValue === true) {
+      return true;
+    }
+  }
+
+  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    const folderValue = vscode.workspace.getConfiguration('protokoll', folder.uri).get<boolean>('proxyBypass');
+    if (folderValue === true) {
+      return true;
+    }
+  }
+
+  const folderUri = vscode.workspace.workspaceFolders?.[0]?.uri;
+  if (folderUri) {
+    const folderValue = vscode.workspace.getConfiguration('protokoll', folderUri).get<boolean>('proxyBypass');
+    if (typeof folderValue === 'boolean') {
+      return folderValue;
+    }
+  }
+  return vscode.workspace.getConfiguration('protokoll').get<boolean>('proxyBypass', false);
+}
+
 export function getProxyUrl(): string | undefined {
+  if (getConfiguredProxyBypass()) {
+    return undefined;
+  }
+
   const httpConfig = vscode.workspace.getConfiguration('http');
   const vscodeSetting = httpConfig.get<string>('proxy');
   if (vscodeSetting && vscodeSetting.trim().length > 0) {
@@ -67,6 +115,39 @@ export function getStrictSSL(): boolean {
   return httpConfig.get<boolean>('proxyStrictSSL', true);
 }
 
+export function applyProxyEnvironmentPolicy(): void {
+  const bypass = getConfiguredProxyBypass();
+  if (bypass) {
+    if (!proxyEnvironmentBypassApplied) {
+      for (const key of PROXY_ENV_KEYS) {
+        originalProxyEnv.set(key, process.env[key]);
+      }
+    }
+    for (const key of PROXY_ENV_KEYS) {
+      delete process.env[key];
+    }
+    process.env.NO_PROXY = '*';
+    process.env.no_proxy = '*';
+    proxyEnvironmentBypassApplied = true;
+    return;
+  }
+
+  if (!proxyEnvironmentBypassApplied) {
+    return;
+  }
+
+  for (const key of PROXY_ENV_KEYS) {
+    const originalValue = originalProxyEnv.get(key);
+    if (typeof originalValue === 'string') {
+      process.env[key] = originalValue;
+    } else {
+      delete process.env[key];
+    }
+  }
+  originalProxyEnv.clear();
+  proxyEnvironmentBypassApplied = false;
+}
+
 /**
  * Return a proxy-aware HTTP agent for the given target URL, or `undefined`
  * when no proxy applies (direct connection).  Used by code that calls
@@ -96,12 +177,14 @@ export function getProxyAgent(targetUrl: string): http.Agent | undefined {
  * existing getProxyAgent() logic.
  */
 export function resolveAgent(targetUrl: string): http.Agent | undefined {
-  const bypass = vscode.workspace.getConfiguration('protokoll').get<boolean>('proxyBypass', false);
+  const bypass = getConfiguredProxyBypass();
   if (bypass) {
-    const isHttps = targetUrl.startsWith('https:');
-    return isHttps
-      ? new HttpsAgent({ keepAlive: true })
-      : new HttpAgent({ keepAlive: true });
+    try {
+      const isHttps = new URL(targetUrl).protocol === 'https:';
+      return isHttps ? directHttpsAgent : directHttpAgent;
+    } catch {
+      return directHttpAgent;
+    }
   }
   return getProxyAgent(targetUrl);
 }

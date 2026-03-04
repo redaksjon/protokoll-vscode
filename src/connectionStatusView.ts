@@ -25,7 +25,6 @@ export class ConnectionStatusViewProvider implements vscode.TreeDataProvider<Con
   private isConnected: boolean = false;
   private sessionId: string | null = null;
   private connections: ServerConnectionEntry[] = [];
-  private activeServerId: string | null = null;
 
   constructor(private context: vscode.ExtensionContext) {
     // Load initial state from config
@@ -51,13 +50,16 @@ export class ConnectionStatusViewProvider implements vscode.TreeDataProvider<Con
   }
 
   setConnections(connections: ServerConnectionEntry[], activeServerId: string | null): void {
-    this.connections = [...connections];
-    this.activeServerId = activeServerId;
-    const active = this.connections.find((connection) => connection.id === activeServerId);
+    // Single-connection model: always use one effective connection.
+    const active = connections.find((connection) => connection.id === activeServerId) ?? connections[0];
+    this.connections = active ? [active] : [];
     if (active) {
       this.serverUrl = active.url;
       this.isConnected = active.isConnected ?? false;
       this.sessionId = active.sessionId ?? null;
+    } else {
+      this.isConnected = false;
+      this.sessionId = null;
     }
     this._onDidChangeTreeData.fire();
   }
@@ -65,17 +67,12 @@ export class ConnectionStatusViewProvider implements vscode.TreeDataProvider<Con
   setConnectionStatus(connected: boolean, sessionId: string | null = null): void {
     this.isConnected = connected;
     this.sessionId = sessionId;
-    if (this.activeServerId) {
-      this.connections = this.connections.map((connection) => {
-        if (connection.id !== this.activeServerId) {
-          return connection;
-        }
-        return {
-          ...connection,
-          isConnected: connected,
-          sessionId,
-        };
-      });
+    if (this.connections.length > 0) {
+      this.connections = [{
+        ...this.connections[0],
+        isConnected: connected,
+        sessionId,
+      }];
     }
     this._onDidChangeTreeData.fire();
   }
@@ -99,12 +96,6 @@ export class ConnectionStatusViewProvider implements vscode.TreeDataProvider<Con
           }
         ),
         new ConnectionStatusItem(
-          `Active: ${this.connections.find((connection) => connection.id === this.activeServerId)?.name || 'None'}`,
-          'active-server',
-          vscode.TreeItemCollapsibleState.None,
-          'server-process'
-        ),
-        new ConnectionStatusItem(
           `Server: ${this.serverUrl || 'Not configured'}`,
           'server-url',
           vscode.TreeItemCollapsibleState.None,
@@ -113,12 +104,6 @@ export class ConnectionStatusViewProvider implements vscode.TreeDataProvider<Con
             command: 'protokoll.configureServer',
             title: 'Change Server URL',
           }
-        ),
-        new ConnectionStatusItem(
-          `Servers (${this.connections.length})`,
-          'servers-root',
-          vscode.TreeItemCollapsibleState.Expanded,
-          'list-tree'
         ),
       ];
 
@@ -141,29 +126,6 @@ export class ConnectionStatusViewProvider implements vscode.TreeDataProvider<Con
       }
 
       return items;
-    }
-
-    if (element.id === 'servers-root') {
-      return this.connections.map((connection) => {
-        const isActive = connection.id === this.activeServerId;
-        const statusLabel = connection.isConnected ? 'Connected' : 'Disconnected';
-        const sessionPreview = connection.sessionId ? ` • ${connection.sessionId.substring(0, 8)}...` : '';
-        return new ConnectionStatusItem(
-          connection.name,
-          `server-connection:${connection.id}`,
-          vscode.TreeItemCollapsibleState.None,
-          isActive ? 'server-environment' : 'server',
-          {
-            command: 'protokoll.switchServerConnection',
-            title: 'Switch Server Connection',
-            arguments: [connection.id],
-          },
-          `${connection.url}\n${statusLabel}${sessionPreview}\n\nClick to switch to this server`,
-          connection.sessionId ?? undefined,
-          connection.url,
-          isActive ? statusLabel : undefined
-        );
-      });
     }
 
     return [];

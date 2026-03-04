@@ -96,8 +96,22 @@ export class PeopleViewProvider implements vscode.TreeDataProvider<PersonItem> {
   private treeView: vscode.TreeView<PersonItem> | null = null;
   private _isLoading = false;
   private _hasAttemptedLoad = false;
+  private lastErrorMessage: string | null = null;
+  private lastErrorAt: number = 0;
 
   constructor(private context: vscode.ExtensionContext) {}
+
+  private showErrorMessageOnce(message: string): void {
+    const now = Date.now();
+    const suppressWindowMs = 15000;
+    if (this.lastErrorMessage === message && (now - this.lastErrorAt) < suppressWindowMs) {
+      log('PeopleViewProvider.showErrorMessageOnce: Suppressed duplicate error message', { message });
+      return;
+    }
+    this.lastErrorMessage = message;
+    this.lastErrorAt = now;
+    vscode.window.showErrorMessage(message);
+  }
 
   setTreeView(treeView: vscode.TreeView<PersonItem>): void {
     this.treeView = treeView;
@@ -163,9 +177,8 @@ export class PeopleViewProvider implements vscode.TreeDataProvider<PersonItem> {
       await this.loadPeople();
     } catch (error) {
       log('PeopleViewProvider.refresh: ERROR', { error: error instanceof Error ? error.message : String(error) });
-      vscode.window.showErrorMessage(
-        `Failed to load people: ${error instanceof Error ? error.message : String(error)}`
-      );
+      const message = `Failed to load people: ${error instanceof Error ? error.message : String(error)}`;
+      this.showErrorMessageOnce(message);
     }
   }
 
@@ -189,9 +202,8 @@ export class PeopleViewProvider implements vscode.TreeDataProvider<PersonItem> {
       await this.loadPeople(true);
     } catch (error) {
       log('PeopleViewProvider.loadMore: ERROR', { error: error instanceof Error ? error.message : String(error) });
-      vscode.window.showErrorMessage(
-        `Failed to load more people: ${error instanceof Error ? error.message : String(error)}`
-      );
+      const message = `Failed to load more people: ${error instanceof Error ? error.message : String(error)}`;
+      this.showErrorMessageOnce(message);
     }
   }
 

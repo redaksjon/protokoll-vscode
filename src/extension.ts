@@ -19,6 +19,7 @@ import type { Transcript, TranscriptContent, TranscriptStatus, TranscriptContent
 import { log, initLogger } from './logger';
 import { shouldPassContextDirectory, clearServerModeCache } from './serverMode';
 import { UploadService } from './uploadService';
+import { applyProxyEnvironmentPolicy } from './proxyUtils';
 
 let mcpClient: McpClient | null = null;
 let transcriptsViewProvider: TranscriptsViewProvider | null = null;
@@ -34,8 +35,7 @@ let dashboardViewProvider: DashboardViewProvider | null = null;
 let serverConnections: ServerConnectionEntry[] = [];
 let activeServerId: string | null = null;
 
-const SERVER_CONNECTIONS_KEY = 'protokoll.serverConnections';
-const ACTIVE_SERVER_ID_KEY = 'protokoll.activeServerId';
+const SINGLE_CONNECTION_ID = 'default-server';
 
 function getDefaultContextDirectory(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -59,10 +59,6 @@ function normalizeServerUrl(url: string): string {
   return url.trim().replace(/\/+$/, '');
 }
 
-function createServerConnectionId(url: string): string {
-  return Buffer.from(url).toString('base64url');
-}
-
 export function resolveTranscriptToolRef(transcript: Transcript): string {
   if (transcript.uri && transcript.uri.startsWith('protokoll://transcript/')) {
     return transcript.uri.replace(/^protokoll:\/\/transcript\/\.\.\//, 'protokoll://transcript/');
@@ -81,10 +77,6 @@ function resolveEditableTranscriptRef(transcriptUri: string, transcriptPath: str
     return transcriptPath;
   }
   throw new Error('Transcript reference is missing for save sync');
-}
-
-function getActiveServerConnection(): ServerConnectionEntry | undefined {
-  return serverConnections.find((connection) => connection.id === activeServerId);
 }
 
 function applyClientToProviders(client: McpClient): void {
@@ -126,6 +118,10 @@ initLogger(outputChannel);
 export async function activate(context: vscode.ExtensionContext) {
   log('Protokoll extension is now active');
   console.log('Protokoll: [ACTIVATION] Extension activate() called');
+  applyProxyEnvironmentPolicy();
+  // Clear legacy multi-server state from earlier versions.
+  await context.globalState.update('protokoll.serverConnections', undefined);
+  await context.globalState.update('protokoll.activeServerId', undefined);
 
   // Initialize MCP client
   const config = getProtokollConfiguration();
@@ -133,35 +129,15 @@ export async function activate(context: vscode.ExtensionContext) {
   const configuredApiKey = getConfiguredApiKey();
   const fallbackServerUrl = normalizeServerUrl(rawServerUrl);
   const hasConfiguredUrl = context.globalState.get<boolean>('protokoll.hasConfiguredUrl', false);
-  const storedConnections = context.globalState.get<Array<{ id: string; name: string; url: string }>>(SERVER_CONNECTIONS_KEY, []);
-  const storedActiveServerId = context.globalState.get<string | null>(ACTIVE_SERVER_ID_KEY, null);
-
-  serverConnections = storedConnections.map((connection) => ({
-    ...connection,
+  const serverUrl = fallbackServerUrl;
+  serverConnections = [{
+    id: SINGLE_CONNECTION_ID,
+    name: 'Server',
+    url: serverUrl,
     isConnected: false,
     sessionId: null,
-  }));
-  activeServerId = storedActiveServerId;
-
-  if (serverConnections.length === 0) {
-    const id = createServerConnectionId(fallbackServerUrl);
-    serverConnections = [{
-      id,
-      name: 'Default Server',
-      url: fallbackServerUrl,
-      isConnected: false,
-      sessionId: null,
-    }];
-    activeServerId = id;
-    await context.globalState.update(SERVER_CONNECTIONS_KEY, serverConnections.map(({ id: entryId, name, url }) => ({ id: entryId, name, url })));
-    await context.globalState.update(ACTIVE_SERVER_ID_KEY, activeServerId);
-  }
-
-  const activeConnection = getActiveServerConnection() || serverConnections[0];
-  const serverUrl = activeConnection ? activeConnection.url : fallbackServerUrl;
-  if (!activeServerId && activeConnection) {
-    activeServerId = activeConnection.id;
-  }
+  }];
+  activeServerId = SINGLE_CONNECTION_ID;
 
   // Check if server URL is configured or if we should prompt
   if (!serverUrl || serverUrl === '') {
@@ -260,11 +236,13 @@ export async function activate(context: vscode.ExtensionContext) {
     // Check server health
     const isHealthy = await mcpClient.healthCheck();
     if (!isHealthy) {
-      if (activeServerId) {
-        serverConnections = serverConnections.map((connection) => connection.id === activeServerId
-          ? { ...connection, isConnected: false, sessionId: null }
-          : connection);
-      }
+      serverConnections = [{
+        id: SINGLE_CONNECTION_ID,
+        name: 'Server',
+        url: serverUrl,
+        isConnected: false,
+        sessionId: null,
+      }];
       // If server is not healthy and user hasn't configured URL yet, we'll prompt them
       if (!hasConfiguredUrl) {
         shouldPromptForConfig = true;
@@ -279,11 +257,13 @@ export async function activate(context: vscode.ExtensionContext) {
       try {
         await mcpClient.initialize();
         serverConnected = true;
-        if (activeServerId) {
-          serverConnections = serverConnections.map((connection) => connection.id === activeServerId
-            ? { ...connection, isConnected: true, sessionId: mcpClient?.getSessionId() ?? null }
-            : connection);
-        }
+        serverConnections = [{
+          id: SINGLE_CONNECTION_ID,
+          name: 'Server',
+          url: serverUrl,
+          isConnected: true,
+          sessionId: mcpClient?.getSessionId() ?? null,
+        }];
         vscode.window.showInformationMessage(`Protokoll: Connected to ${serverUrl}`);
         
         // Note: connectionStatusViewProvider is not yet initialized at this point
@@ -861,38 +841,32 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
-  const persistConnections = async (): Promise<void> => {
-    await context.globalState.update(
-      SERVER_CONNECTIONS_KEY,
-      serverConnections.map(({ id, name, url }) => ({ id, name, url }))
-    );
-    await context.globalState.update(ACTIVE_SERVER_ID_KEY, activeServerId);
-  };
-
   const syncConnectionStatusView = (): void => {
     if (!connectionStatusViewProvider) {
       return;
     }
     connectionStatusViewProvider.setConnections(serverConnections, activeServerId);
-    const active = getActiveServerConnection();
+    const active = serverConnections[0];
     if (active) {
       connectionStatusViewProvider.setServerUrl(active.url);
       connectionStatusViewProvider.setConnectionStatus(active.isConnected ?? false, active.sessionId ?? null);
     }
   };
 
-  let ignoreNextServerUrlConfigChange = false;
+  const setSingleConnection = (url: string, isConnected: boolean, sessionId: string | null): void => {
+    serverConnections = [{
+      id: SINGLE_CONNECTION_ID,
+      name: 'Server',
+      url,
+      isConnected,
+      sessionId,
+    }];
+    activeServerId = SINGLE_CONNECTION_ID;
+  };
 
   const connectToActiveServer = async (showSuccessMessage: boolean, updateConfig: boolean = true): Promise<void> => {
-    const active = getActiveServerConnection();
-    if (!active) {
-      vscode.window.showErrorMessage('Protokoll: No active server configured.');
-      return;
-    }
-
-    const cleanUrl = normalizeServerUrl(active.url);
+    const cleanUrl = normalizeServerUrl(config.get<string>('serverUrl', 'http://127.0.0.1:3002') || 'http://127.0.0.1:3002');
     if (updateConfig) {
-      ignoreNextServerUrlConfigChange = true;
       await config.update('serverUrl', cleanUrl, true);
     }
     await context.globalState.update('protokoll.hasConfiguredUrl', true);
@@ -908,9 +882,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (isHealthy) {
         await newClient.initialize();
         const sessionId = newClient.getSessionId();
-        serverConnections = serverConnections.map((connection) => connection.id === active.id
-          ? { ...connection, url: cleanUrl, isConnected: true, sessionId }
-          : connection);
+        setSingleConnection(cleanUrl, true, sessionId);
         syncConnectionStatusView();
         if (transcriptsViewProvider) {
           await transcriptsViewProvider.refresh();
@@ -919,9 +891,7 @@ export async function activate(context: vscode.ExtensionContext) {
           vscode.window.showInformationMessage(`Protokoll: Connected to ${cleanUrl}`);
         }
       } else {
-        serverConnections = serverConnections.map((connection) => connection.id === active.id
-          ? { ...connection, url: cleanUrl, isConnected: false, sessionId: null }
-          : connection);
+        setSingleConnection(cleanUrl, false, null);
         syncConnectionStatusView();
         vscode.window.showWarningMessage(`Protokoll: Server at ${cleanUrl} is not responding`);
       }
@@ -929,16 +899,12 @@ export async function activate(context: vscode.ExtensionContext) {
       if (previousClient && previousClient !== newClient) {
         previousClient.dispose();
       }
-      await persistConnections();
     } catch (error) {
-      serverConnections = serverConnections.map((connection) => connection.id === active.id
-        ? { ...connection, url: cleanUrl, isConnected: false, sessionId: null }
-        : connection);
+      setSingleConnection(cleanUrl, false, null);
       syncConnectionStatusView();
       vscode.window.showErrorMessage(
         `Protokoll: Failed to connect: ${error instanceof Error ? error.message : String(error)}`
       );
-      await persistConnections();
     }
   };
 
@@ -946,8 +912,7 @@ export async function activate(context: vscode.ExtensionContext) {
     'protokoll.configureServer',
     async () => {
       const config = getProtokollConfiguration();
-      const active = getActiveServerConnection();
-      const currentUrl = active?.url || config.get<string>('serverUrl', 'http://127.0.0.1:3002');
+      const currentUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3002');
       
       const input = await vscode.window.showInputBox({
         prompt: 'Enter the Protokoll HTTP MCP server URL',
@@ -968,29 +933,10 @@ export async function activate(context: vscode.ExtensionContext) {
 
       if (input) {
         const cleanUrl = normalizeServerUrl(input);
-        const existing = serverConnections.find((connection) => connection.url === cleanUrl);
-        if (existing) {
-          activeServerId = existing.id;
-          syncConnectionStatusView();
-          await persistConnections();
-          await connectToActiveServer(true);
-          return;
-        }
-
-        const baseName = `Server ${serverConnections.length + 1}`;
-        const newId = createServerConnectionId(cleanUrl);
-        serverConnections.push({
-          id: newId,
-          name: baseName,
-          url: cleanUrl,
-          isConnected: false,
-          sessionId: null,
-        });
-        activeServerId = newId;
+        await config.update('serverUrl', cleanUrl, true);
+        setSingleConnection(cleanUrl, false, null);
         syncConnectionStatusView();
-        await persistConnections();
-        vscode.window.showInformationMessage(`Protokoll: Added ${baseName} (${cleanUrl})`);
-        await connectToActiveServer(true);
+        await connectToActiveServer(true, false);
       }
     }
   );
@@ -998,98 +944,16 @@ export async function activate(context: vscode.ExtensionContext) {
   const addServerConnectionCommand = vscode.commands.registerCommand(
     'protokoll.addServerConnection',
     async () => {
-      const urlInput = await vscode.window.showInputBox({
-        prompt: 'Enter the Protokoll HTTP MCP server URL to add',
-        placeHolder: 'http://127.0.0.1:3002',
-        validateInput: (value) => {
-          if (!value || value.trim() === '') {
-            return 'Server URL cannot be empty';
-          }
-          try {
-            new URL(value);
-            return null;
-          } catch {
-            return 'Invalid URL format';
-          }
-        },
-      });
-
-      if (!urlInput) {
-        return;
-      }
-
-      const cleanUrl = normalizeServerUrl(urlInput);
-      const existing = serverConnections.find((connection) => connection.url === cleanUrl);
-      if (existing) {
-        const action = await vscode.window.showInformationMessage(
-          `Server already exists as "${existing.name}". Switch to it?`,
-          'Switch'
-        );
-        if (action === 'Switch') {
-          activeServerId = existing.id;
-          syncConnectionStatusView();
-          await persistConnections();
-          await connectToActiveServer(true);
-        }
-        return;
-      }
-
-      const nameInput = await vscode.window.showInputBox({
-        prompt: 'Name this server connection',
-        value: `Server ${serverConnections.length + 1}`,
-        validateInput: (value) => value.trim() === '' ? 'Connection name cannot be empty' : null,
-      });
-
-      if (!nameInput) {
-        return;
-      }
-
-      const newId = createServerConnectionId(cleanUrl);
-      serverConnections.push({
-        id: newId,
-        name: nameInput.trim(),
-        url: cleanUrl,
-        isConnected: false,
-        sessionId: null,
-      });
-      activeServerId = newId;
-      syncConnectionStatusView();
-      await persistConnections();
-      await connectToActiveServer(true);
+      // Single-connection model: this command now routes to "configure server".
+      await vscode.commands.executeCommand('protokoll.configureServer');
     }
   );
 
   const switchServerConnectionCommand = vscode.commands.registerCommand(
     'protokoll.switchServerConnection',
-    async (serverId?: string) => {
-      let targetId = serverId;
-      if (!targetId) {
-        const picks = serverConnections.map((connection) => ({
-          label: connection.name,
-          description: connection.url,
-          picked: connection.id === activeServerId,
-          id: connection.id,
-        }));
-        const selected = await vscode.window.showQuickPick(picks, {
-          title: 'Switch Protokoll Server',
-          placeHolder: 'Choose the active server context',
-        });
-        if (!selected) {
-          return;
-        }
-        targetId = selected.id;
-      }
-
-      const target = serverConnections.find((connection) => connection.id === targetId);
-      if (!target) {
-        vscode.window.showErrorMessage('Protokoll: Selected server was not found.');
-        return;
-      }
-
-      activeServerId = target.id;
-      syncConnectionStatusView();
-      await persistConnections();
-      await connectToActiveServer(true);
+    async () => {
+      // Single-connection model: reconnect the configured server.
+      await connectToActiveServer(true, false);
     }
   );
 
@@ -2421,31 +2285,15 @@ export async function activate(context: vscode.ExtensionContext) {
   // Refresh transcripts when configuration changes
   const configWatcher = vscode.workspace.onDidChangeConfiguration(async (e) => {
     if (e.affectsConfiguration('protokoll.serverUrl') || e.affectsConfiguration('protokoll.apiKey') || e.affectsConfiguration('protokoll.proxyBypass')) {
-      if (ignoreNextServerUrlConfigChange) {
-        ignoreNextServerUrlConfigChange = false;
-        return;
-      }
+      applyProxyEnvironmentPolicy();
       const config = getProtokollConfiguration();
       const rawServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3002');
       const serverUrl = normalizeServerUrl(rawServerUrl);
       if (!serverUrl) {
         return;
       }
-
-      let target = serverConnections.find((connection) => connection.url === serverUrl);
-      if (!target) {
-        target = {
-          id: createServerConnectionId(serverUrl),
-          name: `Server ${serverConnections.length + 1}`,
-          url: serverUrl,
-          isConnected: false,
-          sessionId: null,
-        };
-        serverConnections.push(target);
-      }
-      activeServerId = target.id;
+      setSingleConnection(serverUrl, false, null);
       syncConnectionStatusView();
-      await persistConnections();
       await connectToActiveServer(false, false);
     }
   });

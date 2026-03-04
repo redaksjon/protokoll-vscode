@@ -97,8 +97,22 @@ export class TermsViewProvider implements vscode.TreeDataProvider<TermItem> {
   private treeView: vscode.TreeView<TermItem> | null = null;
   private _isLoading = false;
   private _hasAttemptedLoad = false;
+  private lastErrorMessage: string | null = null;
+  private lastErrorAt: number = 0;
 
   constructor(private context: vscode.ExtensionContext) {}
+
+  private showErrorMessageOnce(message: string): void {
+    const now = Date.now();
+    const suppressWindowMs = 15000;
+    if (this.lastErrorMessage === message && (now - this.lastErrorAt) < suppressWindowMs) {
+      log('TermsViewProvider.showErrorMessageOnce: Suppressed duplicate error message', { message });
+      return;
+    }
+    this.lastErrorMessage = message;
+    this.lastErrorAt = now;
+    vscode.window.showErrorMessage(message);
+  }
 
   setTreeView(treeView: vscode.TreeView<TermItem>): void {
     this.treeView = treeView;
@@ -151,9 +165,8 @@ export class TermsViewProvider implements vscode.TreeDataProvider<TermItem> {
       await this.loadTerms();
     } catch (error) {
       log('TermsViewProvider.refresh: ERROR', { error: error instanceof Error ? error.message : String(error) });
-      vscode.window.showErrorMessage(
-        `Failed to load terms: ${error instanceof Error ? error.message : String(error)}`
-      );
+      const message = `Failed to load terms: ${error instanceof Error ? error.message : String(error)}`;
+      this.showErrorMessageOnce(message);
     }
   }
 
@@ -173,9 +186,8 @@ export class TermsViewProvider implements vscode.TreeDataProvider<TermItem> {
       await this.loadTerms(true);
     } catch (error) {
       log('TermsViewProvider.loadMore: ERROR', { error: error instanceof Error ? error.message : String(error) });
-      vscode.window.showErrorMessage(
-        `Failed to load more terms: ${error instanceof Error ? error.message : String(error)}`
-      );
+      const message = `Failed to load more terms: ${error instanceof Error ? error.message : String(error)}`;
+      this.showErrorMessageOnce(message);
     }
   }
 
