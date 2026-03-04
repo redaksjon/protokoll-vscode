@@ -262,6 +262,35 @@ Content here.`;
             expect(html).toContain('id="enhanced-tab"');
         });
 
+        it('should render deleted status badge for deleted transcripts', () => {
+            const transcript: Transcript = {
+                uri: 'protokoll://transcript/deleted.md',
+                path: '/path/to/deleted.md',
+                filename: 'deleted.md',
+                date: '2026-01-31',
+                title: 'Deleted Transcript',
+                status: 'deleted',
+                contentType: 'audio_transcript',
+            };
+
+            const content: TranscriptContent = {
+                uri: transcript.uri,
+                path: transcript.path,
+                title: transcript.title || transcript.filename,
+                metadata: {
+                    date: transcript.date,
+                    status: 'deleted',
+                    tags: [],
+                },
+                content: 'Soft-deleted content should remain readable.',
+            };
+
+            const html = provider.getWebviewContent(transcript, content);
+            expect(html).toContain('status-badge deleted');
+            expect(html).toContain('🗑️ Deleted');
+            expect(html).toContain('.status-badge.deleted');
+        });
+
         it('should render enhance action in original tab for audio transcripts', () => {
             const transcript: Transcript = {
                 uri: 'protokoll://transcript/audio.md',
@@ -365,6 +394,16 @@ Content here.`;
         it('should handle empty string', () => {
             const escaped = (provider as any).escapeHtml('');
             expect(escaped).toBe('');
+        });
+    });
+
+    describe('status helpers', () => {
+        it('should map deleted status to trash icon', () => {
+            expect((provider as any).getStatusIcon('deleted')).toBe('🗑️');
+        });
+
+        it('should map deleted status to Deleted label', () => {
+            expect((provider as any).getStatusLabel('deleted')).toBe('Deleted');
         });
     });
 
@@ -1563,11 +1602,26 @@ Actual content.`;
             expect(html).toContain('<li>');
         });
 
+        it('should close a list when regular content follows', () => {
+            const markdown = '- Item 1\n- Item 2\nFollowing text';
+            const html = (provider as any).markdownToHtml(markdown);
+            expect(html).toContain('<ul><li>Item 1</li><li>Item 2</li></ul>');
+            expect(html).toContain('Following text');
+        });
+
         it('should convert ordered lists', () => {
             const markdown = '1. First\n2. Second';
             const html = (provider as any).markdownToHtml(markdown);
             expect(html).toContain('<ol>');
             expect(html).toContain('<li>');
+        });
+
+        it('should close and reopen lists when list type changes', () => {
+            const markdown = '- First\n1. Second\n- Third';
+            const html = (provider as any).markdownToHtml(markdown);
+            expect(html).toContain('<ul><li>First</li></ul>');
+            expect(html).toContain('<ol><li>Second</li></ol>');
+            expect(html).toContain('<ul><li>Third</li></ul>');
         });
 
         it('should convert links', () => {
@@ -1582,11 +1636,155 @@ Actual content.`;
             expect(html).toContain('<p>');
         });
 
+        it('should ignore empty paragraph blocks', () => {
+            const markdown = '\n\nParagraph only';
+            const html = (provider as any).markdownToHtml(markdown);
+            expect(html).toBe('<p>Paragraph only</p>');
+        });
+
         it('should escape HTML special characters', () => {
             const markdown = '<script>alert("xss")</script>';
             const html = (provider as any).markdownToHtml(markdown);
             expect(html).not.toContain('<script>');
             expect(html).toContain('&lt;');
+        });
+    });
+
+    describe('optimistic transcript metadata updates', () => {
+        const transcriptUri = 'protokoll://transcript/test.md';
+        const baseTranscript: Transcript = {
+            uri: transcriptUri,
+            path: '/path/to/test.md',
+            filename: 'test.md',
+            title: 'Old Title',
+            status: 'enhanced',
+            date: '2026-01-31',
+        };
+
+        beforeEach(() => {
+            (provider as any)._currentTranscripts.set(transcriptUri, {
+                uri: transcriptUri,
+                transcript: { ...baseTranscript },
+            });
+            (provider as any)._onTranscriptChanged = vi.fn().mockResolvedValue(undefined);
+            vi.spyOn(provider, 'showTranscript').mockResolvedValue(undefined);
+        });
+
+        it('optimistically updates title before server confirmation', async () => {
+            let resolveEdit: (value: unknown) => void = () => undefined;
+            const callToolPromise = new Promise(resolve => {
+                resolveEdit = resolve;
+            });
+            const callTool = vi.fn().mockReturnValue(callToolPromise);
+            const readTranscript = vi.fn().mockResolvedValue({
+                title: 'New Title',
+                metadata: {
+                    status: 'enhanced',
+                    entities: {},
+                },
+            });
+
+            (provider as any)._client = {
+                callTool,
+                readTranscript,
+            };
+
+            const pending = (provider as any).handleEditTitle(
+                { ...baseTranscript },
+                baseTranscript.path,
+                'New Title',
+                transcriptUri
+            );
+
+            await Promise.resolve();
+
+            const optimistic = (provider as any)._currentTranscripts.get(transcriptUri)?.transcript;
+            expect(optimistic.title).toBe('New Title');
+
+            resolveEdit({ success: true, renamed: false });
+            await pending;
+
+            expect(callTool).toHaveBeenCalledWith('protokoll_edit_transcript', expect.objectContaining({
+                title: 'New Title',
+            }));
+        });
+
+        it('rolls back title when server update fails', async () => {
+            const callTool = vi.fn().mockRejectedValue(new Error('edit failed'));
+            const readTranscript = vi.fn();
+            (provider as any)._client = {
+                callTool,
+                readTranscript,
+            };
+
+            await (provider as any).handleEditTitle(
+                { ...baseTranscript },
+                baseTranscript.path,
+                'Failed Title',
+                transcriptUri
+            );
+
+            const rolledBack = (provider as any)._currentTranscripts.get(transcriptUri)?.transcript;
+            expect(rolledBack.title).toBe('Old Title');
+            expect(vscode.window.showErrorMessage).toHaveBeenCalled();
+        });
+
+        it('optimistically updates status before server confirmation', async () => {
+            let resolveEdit: (value: unknown) => void = () => undefined;
+            const callToolPromise = new Promise(resolve => {
+                resolveEdit = resolve;
+            });
+            const callTool = vi.fn().mockReturnValue(callToolPromise);
+            const readTranscript = vi.fn().mockResolvedValue({
+                title: 'Old Title',
+                metadata: {
+                    status: 'closed',
+                    entities: {},
+                },
+            });
+            (provider as any)._client = {
+                callTool,
+                readTranscript,
+            };
+            (vscode.window.showQuickPick as any).mockResolvedValue({ label: 'Closed', value: 'closed' });
+
+            const pending = (provider as any).handleChangeStatus(
+                { ...baseTranscript },
+                baseTranscript.path,
+                transcriptUri
+            );
+
+            await Promise.resolve();
+
+            const optimistic = (provider as any)._currentTranscripts.get(transcriptUri)?.transcript;
+            expect(optimistic.status).toBe('closed');
+
+            resolveEdit({ success: true });
+            await pending;
+
+            expect(callTool).toHaveBeenCalledWith('protokoll_edit_transcript', expect.objectContaining({
+                status: 'closed',
+            }));
+        });
+
+        it('rolls back status when server update fails', async () => {
+            const callTool = vi.fn().mockRejectedValue(new Error('status failed'));
+            const readTranscript = vi.fn();
+            (provider as any)._client = {
+                callTool,
+                readTranscript,
+            };
+            (vscode.window.showQuickPick as any).mockResolvedValue({ label: 'Closed', value: 'closed' });
+
+            await (provider as any).handleChangeStatus(
+                { ...baseTranscript },
+                baseTranscript.path,
+                transcriptUri
+            );
+
+            const rolledBack = (provider as any)._currentTranscripts.get(transcriptUri)?.transcript;
+            expect(rolledBack.status).toBe('enhanced');
+            expect(vscode.window.showErrorMessage).toHaveBeenCalled();
         });
     });
 });

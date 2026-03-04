@@ -802,10 +802,11 @@ export class DashboardViewProvider {
       'in_progress': '#fd7e14',
       'closed': '#6f42c1',
       'archived': '#343a40',
+      'deleted': '#dc3545',
       'unknown': '#6c757d'
     };
 
-    const ALL_STATUSES = ['uploaded', 'transcribing', 'error', 'initial', 'enhanced', 'reviewed', 'in_progress', 'closed', 'archived', 'unknown'];
+    const ALL_STATUSES = ['uploaded', 'transcribing', 'error', 'initial', 'enhanced', 'reviewed', 'in_progress', 'closed', 'archived', 'deleted', 'unknown'];
 
     function renderStats(data) {
       const root = document.getElementById('stats-section');

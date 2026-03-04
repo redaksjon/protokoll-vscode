@@ -13,7 +13,7 @@ interface YearMonth {
 }
 
 const DEFAULT_STATUS_FILTERS = ['initial', 'enhanced', 'reviewed', 'in_progress', 'closed'];
-const VALID_STATUS_FILTERS = new Set(['initial', 'enhanced', 'reviewed', 'in_progress', 'closed', 'archived']);
+const VALID_STATUS_FILTERS = new Set(['initial', 'enhanced', 'reviewed', 'in_progress', 'closed', 'archived', 'deleted']);
 
 export class TranscriptsViewProvider implements vscode.TreeDataProvider<TranscriptItem> {
   private _onDidChangeTreeData: vscode.EventEmitter<TranscriptItem | undefined | null | void> = 
@@ -25,7 +25,7 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   private transcripts: Transcript[] = [];
   private hasMorePages = false;
   private selectedProjectFilter: string | null = null; // Project ID to filter by
-  private selectedStatusFilters: Set<string> = new Set(DEFAULT_STATUS_FILTERS); // Statuses to show (archived excluded by default)
+  private selectedStatusFilters: Set<string> = new Set(DEFAULT_STATUS_FILTERS); // Statuses to show (archived/deleted excluded by default)
   private sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc' = 'date-desc'; // Default: date descending
   private treeView: vscode.TreeView<TranscriptItem> | null = null;
 
@@ -838,7 +838,7 @@ export class TranscriptItem extends vscode.TreeItem {
         this.iconPath = new vscode.ThemeIcon('note');
       } else {
         // Show color-coded circles based on status — mirrors STATUS_COLORS in dashboardView.ts:
-        // initial=gray, enhanced=blue, reviewed=green, in_progress/open=orange, closed=purple, archived=gray
+        // initial=gray, enhanced=blue, reviewed=green, in_progress/open=orange, closed=purple, archived=gray, deleted=red
         if (status === 'initial') {
           this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
         } else if (status === 'enhanced') {
@@ -851,6 +851,8 @@ export class TranscriptItem extends vscode.TreeItem {
           this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.purple'));
         } else if (status === 'archived') {
           this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
+        } else if (status === 'deleted') {
+          this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.red'));
         } else {
           // Fallback for unknown/legacy status values
           this.iconPath = new vscode.ThemeIcon('circle-filled', new vscode.ThemeColor('charts.gray'));
@@ -870,6 +872,7 @@ export class TranscriptItem extends vscode.TreeItem {
         'in_progress': 'In Progress',
         closed: 'Closed',
         archived: 'Archived',
+        deleted: 'Deleted',
       }[status] || status;
       
       const openTasks = transcript?.tasks?.filter(t => t.status === 'open').length || 0;

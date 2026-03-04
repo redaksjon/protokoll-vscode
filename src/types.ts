@@ -5,7 +5,7 @@
 /**
  * Transcript lifecycle status
  */
-export type TranscriptStatus = 'initial' | 'enhanced' | 'reviewed' | 'in_progress' | 'closed' | 'archived';
+export type TranscriptStatus = 'initial' | 'enhanced' | 'reviewed' | 'in_progress' | 'closed' | 'archived' | 'deleted';
 
 /**
  * Status transition record
@@ -26,6 +26,13 @@ export interface Task {
   created: string;
   changed?: string;
   completed?: string;
+}
+
+export interface TranscriptComment {
+  id: string;
+  text: string;
+  createdAt: string;
+  updatedAt?: string;
 }
 
 export type TranscriptContentType = 'audio_transcript' | 'manual_note';
@@ -107,6 +114,7 @@ export interface TranscriptContent {
       destination?: string;
       confidence?: string;
     };
+    comments?: TranscriptComment[];
   };
   content: string;
   rawTranscript?: {

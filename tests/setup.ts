@@ -98,6 +98,17 @@ const mockVscode = {
   ThemeColor: class {
     constructor(public id: string) {}
   },
+  Disposable: class {
+    private readonly _dispose: () => void;
+
+    constructor(dispose: () => void) {
+      this._dispose = dispose;
+    }
+
+    dispose() {
+      this._dispose();
+    }
+  },
   Uri: {
     parse: vi.fn((uri: string) => ({ fsPath: uri, toString: () => uri })),
     file: vi.fn((path: string) => ({ fsPath: path, toString: () => path })),

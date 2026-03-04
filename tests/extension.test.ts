@@ -372,6 +372,24 @@ describe('extension', () => {
             }
         });
 
+        it('should include Deleted option in filterByStatus quick pick', async () => {
+            const handler = registeredCommands.get('protokoll.filterByStatus');
+            expect(handler).toBeDefined();
+
+            let capturedItems: Array<{ label: string }> = [];
+            (vscode.window.showQuickPick as any).mockImplementation(async (items: Array<{ label: string }>) => {
+                capturedItems = items;
+                return undefined;
+            });
+
+            if (handler) {
+                await handler();
+            }
+
+            const labels = capturedItems.map(item => item.label);
+            expect(labels.some(label => label.includes('Deleted'))).toBe(true);
+        });
+
         it('should handle filterByProject command with no projects', async () => {
             const handler = registeredCommands.get('protokoll.filterByProject');
 
@@ -530,6 +548,33 @@ describe('extension', () => {
                 await handler(transcriptItem);
                 expect(vscode.window.showQuickPick).toHaveBeenCalled();
             }
+        });
+
+        it('should include Deleted option in changeTranscriptStatus quick pick', async () => {
+            const handler = registeredCommands.get('protokoll.changeTranscriptStatus');
+            expect(handler).toBeDefined();
+
+            const transcriptItem = {
+                transcript: {
+                    uri: 'protokoll://transcript/test.md',
+                    path: '/path/to/test.md',
+                    filename: 'test.md',
+                    date: '2026-01-31',
+                },
+            };
+
+            let capturedItems: Array<{ label: string }> = [];
+            (vscode.window.showQuickPick as any).mockImplementation(async (items: Array<{ label: string }>) => {
+                capturedItems = items;
+                return undefined;
+            });
+
+            if (handler) {
+                await handler(transcriptItem);
+            }
+
+            const labels = capturedItems.map(item => item.label);
+            expect(labels.some(label => label.includes('Deleted'))).toBe(true);
         });
 
         it('should handle copyTranscript command', async () => {

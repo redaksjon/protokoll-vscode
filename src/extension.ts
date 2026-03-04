@@ -34,6 +34,7 @@ let companiesViewProvider: CompaniesViewProvider | null = null;
 let dashboardViewProvider: DashboardViewProvider | null = null;
 let serverConnections: ServerConnectionEntry[] = [];
 let activeServerId: string | null = null;
+const TRANSCRIPTS_REFRESH_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 const SINGLE_CONNECTION_ID = 'default-server';
 
@@ -638,12 +639,66 @@ export async function activate(context: vscode.ExtensionContext) {
   // Set the tree view reference in the provider
   transcriptsViewProvider.setTreeView(transcriptsTreeView);
 
+  // Fallback polling for transcript list changes:
+  // If SSE/resource notifications are missed, periodically re-subscribe and refresh.
+  let transcriptsPollTimer: ReturnType<typeof setInterval> | undefined;
+  let transcriptsPollInFlight = false;
+  const runTranscriptsPollRefresh = async (reason: 'interval' | 'visible'): Promise<void> => {
+    if (transcriptsPollInFlight || !mcpClient || !transcriptsViewProvider) {
+      return;
+    }
+    // For interval polls, skip work when the transcript tree isn't visible.
+    if (reason === 'interval' && !transcriptsTreeView.visible) {
+      return;
+    }
+    transcriptsPollInFlight = true;
+    try {
+      try {
+        await mcpClient.subscribeToResource('protokoll://transcripts');
+      } catch (error) {
+        log('Protokoll: Transcript poll re-subscribe failed (continuing with refresh)', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      await transcriptsViewProvider.refresh();
+    } catch (error) {
+      log('Protokoll: Transcript poll refresh failed', {
+        error: error instanceof Error ? error.message : String(error),
+        reason,
+      });
+    } finally {
+      transcriptsPollInFlight = false;
+    }
+  };
+  const stopTranscriptsPoll = (): void => {
+    if (transcriptsPollTimer) {
+      clearInterval(transcriptsPollTimer);
+      transcriptsPollTimer = undefined;
+    }
+  };
+  const startTranscriptsPoll = (): void => {
+    stopTranscriptsPoll();
+    transcriptsPollTimer = setInterval(() => {
+      void runTranscriptsPollRefresh('interval');
+    }, TRANSCRIPTS_REFRESH_POLL_INTERVAL_MS);
+  };
+  if (mcpClient) {
+    startTranscriptsPoll();
+  }
+  context.subscriptions.push(new vscode.Disposable(() => {
+    stopTranscriptsPoll();
+  }));
+
   // Refresh transcripts when view becomes visible
   // Note: We don't use hasRefreshedOnce anymore because it caused race conditions
   // where visibility fired before connection completed, blocking subsequent refreshes
   transcriptsTreeView.onDidChangeVisibility(async (e) => {
     log('Protokoll: onDidChangeVisibility fired', { visible: e.visible, hasClient: !!mcpClient, hasTranscripts: transcriptsViewProvider?.hasTranscripts() });
     if (e.visible && transcriptsViewProvider && mcpClient) {
+      // Always attempt re-subscribe when the view becomes visible.
+      // This makes event listening more resilient across reconnect/session recovery edges.
+      void runTranscriptsPollRefresh('visible');
+
       // Only refresh if we don't have data yet (avoids unnecessary API calls)
       if (!transcriptsViewProvider.hasTranscripts()) {
         log('Protokoll: Transcripts view became visible with no data, refreshing...');
@@ -878,6 +933,7 @@ export async function activate(context: vscode.ExtensionContext) {
       const isHealthy = await newClient.healthCheck();
       mcpClient = newClient;
       applyClientToProviders(newClient);
+      startTranscriptsPoll();
 
       if (isHealthy) {
         await newClient.initialize();
@@ -1449,6 +1505,7 @@ export async function activate(context: vscode.ExtensionContext) {
         { id: 'in_progress', label: 'In Progress', icon: '🔄' },
         { id: 'closed', label: 'Closed', icon: '✅' },
         { id: 'archived', label: 'Archived', icon: '📦' },
+        { id: 'deleted', label: 'Deleted', icon: '🗑️' },
       ];
 
       // Build quick pick items with checkboxes
@@ -1949,6 +2006,7 @@ export async function activate(context: vscode.ExtensionContext) {
       { id: 'in_progress', label: 'In Progress', icon: '🔄' },
       { id: 'closed', label: 'Closed', icon: '✅' },
       { id: 'archived', label: 'Archived', icon: '📦' },
+      { id: 'deleted', label: 'Deleted', icon: '🗑️' },
     ];
 
     const statusItems = statuses.map(s => ({
@@ -1966,6 +2024,18 @@ export async function activate(context: vscode.ExtensionContext) {
       return; // User cancelled
     }
 
+    const newStatus = selected.id as TranscriptStatus;
+    const rollbackStatusByUri = new Map<string, TranscriptStatus | undefined>();
+    if (provider) {
+      for (const item of items) {
+        if (!item.transcript) {
+          continue;
+        }
+        rollbackStatusByUri.set(item.transcript.uri, item.transcript.status);
+        provider.updateTranscriptInPlace(item.transcript.uri, { status: newStatus });
+      }
+    }
+
     const errors: string[] = [];
     const succeededUris: string[] = [];
     for (const item of items) {
@@ -1980,6 +2050,11 @@ export async function activate(context: vscode.ExtensionContext) {
         });
         succeededUris.push(item.transcript.uri);
       } catch (error) {
+        if (provider) {
+          provider.updateTranscriptInPlace(item.transcript.uri, {
+            status: rollbackStatusByUri.get(item.transcript.uri),
+          });
+        }
         const transcriptName = item.transcript.title || item.transcript.filename;
         errors.push(`${transcriptName}: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -1996,14 +2071,8 @@ export async function activate(context: vscode.ExtensionContext) {
     }
 
     if (provider && succeededUris.length > 0) {
-      const newStatus = selected.id as TranscriptStatus;
-      let allUpdated = true;
-      for (const uri of succeededUris) {
-        if (!provider.updateTranscriptInPlace(uri, { status: newStatus })) {
-          allUpdated = false;
-        }
-      }
-      if (!allUpdated) {
+      if (errors.length > 0) {
+        // Mixed success/failure: refresh once to guarantee consistency.
         await provider.refresh();
       }
     }
