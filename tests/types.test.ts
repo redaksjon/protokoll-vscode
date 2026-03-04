@@ -54,6 +54,18 @@ describe('types', () => {
             expect(transcript.entities?.people).toHaveLength(1);
             expect(transcript.entities?.projects).toHaveLength(1);
         });
+
+        it('should allow deleted as a transcript status', () => {
+            const transcript: Transcript = {
+                uri: 'redaksjon://transcript/deleted.md',
+                path: '/path/to/deleted.md',
+                filename: 'deleted.md',
+                date: '2026-01-31',
+                status: 'deleted',
+            };
+
+            expect(transcript.status).toBe('deleted');
+        });
     });
 
     describe('TranscriptsListResponse', () => {

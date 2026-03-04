@@ -66,8 +66,12 @@ describe('extension', () => {
         (vscode.window.showInputBox as any).mockResolvedValue(undefined);
         (vscode.window.showQuickPick as any).mockResolvedValue(undefined);
         (vscode.window.createTreeView as any).mockReturnValue({
+            selection: [],
+            visible: false,
             onDidChangeSelection: vi.fn(() => ({ dispose: vi.fn() })),
             onDidChangeVisibility: vi.fn(() => ({ dispose: vi.fn() })),
+            reveal: vi.fn(),
+            dispose: vi.fn(),
         });
     });
 
@@ -372,6 +376,24 @@ describe('extension', () => {
             }
         });
 
+        it('should include Deleted option in filterByStatus quick pick', async () => {
+            const handler = registeredCommands.get('protokoll.filterByStatus');
+            expect(handler).toBeDefined();
+
+            let capturedItems: Array<{ label: string }> = [];
+            (vscode.window.showQuickPick as any).mockImplementation(async (items: Array<{ label: string }>) => {
+                capturedItems = items;
+                return undefined;
+            });
+
+            if (handler) {
+                await handler();
+            }
+
+            const labels = capturedItems.map(item => item.label);
+            expect(labels.some(label => label.includes('Deleted'))).toBe(true);
+        });
+
         it('should handle filterByProject command with no projects', async () => {
             const handler = registeredCommands.get('protokoll.filterByProject');
 
@@ -532,6 +554,33 @@ describe('extension', () => {
             }
         });
 
+        it('should include Deleted option in changeTranscriptStatus quick pick', async () => {
+            const handler = registeredCommands.get('protokoll.changeTranscriptStatus');
+            expect(handler).toBeDefined();
+
+            const transcriptItem = {
+                transcript: {
+                    uri: 'protokoll://transcript/test.md',
+                    path: '/path/to/test.md',
+                    filename: 'test.md',
+                    date: '2026-01-31',
+                },
+            };
+
+            let capturedItems: Array<{ label: string }> = [];
+            (vscode.window.showQuickPick as any).mockImplementation(async (items: Array<{ label: string }>) => {
+                capturedItems = items;
+                return undefined;
+            });
+
+            if (handler) {
+                await handler(transcriptItem);
+            }
+
+            const labels = capturedItems.map(item => item.label);
+            expect(labels.some(label => label.includes('Deleted'))).toBe(true);
+        });
+
         it('should handle copyTranscript command', async () => {
             const handler = registeredCommands.get('protokoll.copyTranscript');
             expect(handler).toBeDefined();
@@ -578,6 +627,113 @@ describe('extension', () => {
                 const copied = (vscode.env.clipboard.writeText as any).mock.calls.length > 0;
                 const showedError = (vscode.window.showErrorMessage as any).mock.calls.length > 0;
                 expect(copied || showedError).toBe(true);
+            }
+        });
+
+        it('should copy original transcript with metadata template', async () => {
+            const handler = registeredCommands.get('protokoll.copyTranscriptOriginal');
+            expect(handler).toBeDefined();
+
+            const transcriptItem = {
+                type: 'transcript',
+                transcript: {
+                    uri: 'protokoll://transcript/original.md',
+                    path: '/path/to/original.md',
+                    filename: 'original.md',
+                    title: 'Original Title',
+                    date: '2026-03-04',
+                    status: 'enhanced',
+                },
+            };
+
+            vi.spyOn(McpClient.prototype, 'readTranscript').mockResolvedValue({
+                uri: 'protokoll://transcript/original.md',
+                path: '2026/3/original.md',
+                title: 'Original Title',
+                metadata: {
+                    date: '2026-03-04',
+                    time: '7:06 PM',
+                    tags: ['book', 'discussive'],
+                    status: 'enhanced',
+                },
+                content: 'ENHANCED CONTENT',
+                rawTranscript: {
+                    text: 'ORIGINAL CONTENT',
+                },
+            });
+
+            if (handler) {
+                await handler(transcriptItem);
+                expect(vscode.env.clipboard.writeText).toHaveBeenCalledTimes(1);
+                const copiedText = (vscode.env.clipboard.writeText as any).mock.calls.at(-1)?.[0] as string;
+                expect(copiedText).toContain('## Original Title');
+                expect(copiedText).toContain('**Date/Time:** 2026-03-04 7:06 PM');
+                expect(copiedText).toContain('**Tags:** book, discussive');
+                expect(copiedText).toContain('**Status:** enhanced');
+                expect(copiedText).toContain('ORIGINAL CONTENT');
+                expect(copiedText).not.toContain('ENHANCED CONTENT');
+            }
+        });
+
+        it('should copy enhanced transcripts for multi-selection', async () => {
+            const handler = registeredCommands.get('protokoll.copyTranscriptEnhanced');
+            expect(handler).toBeDefined();
+
+            const selectedItems = [
+                {
+                    type: 'transcript',
+                    transcript: {
+                        uri: 'protokoll://transcript/a.md',
+                        path: '/path/to/a.md',
+                        filename: 'a.md',
+                        title: 'Alpha',
+                        date: '2026-03-04',
+                    },
+                },
+                {
+                    type: 'transcript',
+                    transcript: {
+                        uri: 'protokoll://transcript/b.md',
+                        path: '/path/to/b.md',
+                        filename: 'b.md',
+                        title: 'Beta',
+                        date: '2026-03-03',
+                    },
+                },
+            ];
+
+            const transcriptsTree = (vscode.window.createTreeView as any).mock.results?.[0]?.value;
+            if (transcriptsTree) {
+                transcriptsTree.selection = selectedItems;
+            }
+
+            vi.spyOn(McpClient.prototype, 'readTranscript')
+                .mockResolvedValueOnce({
+                    uri: 'protokoll://transcript/a.md',
+                    path: '2026/3/a.md',
+                    title: 'Alpha',
+                    metadata: { date: '2026-03-04', tags: ['alpha'], status: 'enhanced' },
+                    content: 'ENHANCED A',
+                    rawTranscript: { text: 'ORIGINAL A' },
+                })
+                .mockResolvedValueOnce({
+                    uri: 'protokoll://transcript/b.md',
+                    path: '2026/3/b.md',
+                    title: 'Beta',
+                    metadata: { date: '2026-03-03', tags: ['beta'], status: 'reviewed' },
+                    content: 'ENHANCED B',
+                    rawTranscript: { text: 'ORIGINAL B' },
+                });
+
+            if (handler) {
+                await handler(selectedItems[0]);
+                expect(vscode.env.clipboard.writeText).toHaveBeenCalledTimes(1);
+                const copiedText = (vscode.env.clipboard.writeText as any).mock.calls.at(-1)?.[0] as string;
+                expect(copiedText).toContain('## Alpha');
+                expect(copiedText).toContain('## Beta');
+                expect(copiedText).toContain('ENHANCED A');
+                expect(copiedText).toContain('ENHANCED B');
+                expect(copiedText).toContain('\n\n---\n\n');
             }
         });
 
@@ -645,6 +801,44 @@ describe('extension', () => {
             if (handler) {
                 await handler(transcriptItem);
                 expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith('protokoll://transcript/test.md');
+            }
+        });
+
+        it('should copy transcript URLs for multi-selection', async () => {
+            const handler = registeredCommands.get('protokoll.copyTranscriptUrl');
+            expect(handler).toBeDefined();
+
+            const selectedItems = [
+                {
+                    type: 'transcript',
+                    transcript: {
+                        uri: 'protokoll://transcript/one.md',
+                        path: '/path/to/one.md',
+                        filename: 'one.md',
+                        date: '2026-03-04',
+                    },
+                },
+                {
+                    type: 'transcript',
+                    transcript: {
+                        uri: 'protokoll://transcript/two.md',
+                        path: '/path/to/two.md',
+                        filename: 'two.md',
+                        date: '2026-03-04',
+                    },
+                },
+            ];
+
+            const transcriptsTree = (vscode.window.createTreeView as any).mock.results?.[0]?.value;
+            if (transcriptsTree) {
+                transcriptsTree.selection = selectedItems;
+            }
+
+            if (handler) {
+                await handler(selectedItems[0]);
+                expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith(
+                    'protokoll://transcript/one.md\nprotokoll://transcript/two.md'
+                );
             }
         });
 

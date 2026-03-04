@@ -93,8 +93,22 @@ export class CompaniesViewProvider implements vscode.TreeDataProvider<CompanyIte
   private treeView: vscode.TreeView<CompanyItem> | null = null;
   private _isLoading = false;
   private _hasAttemptedLoad = false;
+  private lastErrorMessage: string | null = null;
+  private lastErrorAt: number = 0;
 
   constructor(private context: vscode.ExtensionContext) {}
+
+  private showErrorMessageOnce(message: string): void {
+    const now = Date.now();
+    const suppressWindowMs = 15000;
+    if (this.lastErrorMessage === message && (now - this.lastErrorAt) < suppressWindowMs) {
+      log('CompaniesViewProvider.showErrorMessageOnce: Suppressed duplicate error message', { message });
+      return;
+    }
+    this.lastErrorMessage = message;
+    this.lastErrorAt = now;
+    vscode.window.showErrorMessage(message);
+  }
 
   setTreeView(treeView: vscode.TreeView<CompanyItem>): void {
     this.treeView = treeView;
@@ -147,9 +161,8 @@ export class CompaniesViewProvider implements vscode.TreeDataProvider<CompanyIte
       await this.loadCompanies();
     } catch (error) {
       log('CompaniesViewProvider.refresh: ERROR', { error: error instanceof Error ? error.message : String(error) });
-      vscode.window.showErrorMessage(
-        `Failed to load companies: ${error instanceof Error ? error.message : String(error)}`
-      );
+      const message = `Failed to load companies: ${error instanceof Error ? error.message : String(error)}`;
+      this.showErrorMessageOnce(message);
     }
   }
 
@@ -169,9 +182,8 @@ export class CompaniesViewProvider implements vscode.TreeDataProvider<CompanyIte
       await this.loadCompanies(true);
     } catch (error) {
       log('CompaniesViewProvider.loadMore: ERROR', { error: error instanceof Error ? error.message : String(error) });
-      vscode.window.showErrorMessage(
-        `Failed to load more companies: ${error instanceof Error ? error.message : String(error)}`
-      );
+      const message = `Failed to load more companies: ${error instanceof Error ? error.message : String(error)}`;
+      this.showErrorMessageOnce(message);
     }
   }
 

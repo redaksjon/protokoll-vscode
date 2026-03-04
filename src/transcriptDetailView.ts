@@ -47,6 +47,13 @@ interface GeneratedSummary {
   generatedAt: string;
 }
 
+interface TranscriptComment {
+  id: string;
+  text: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
 interface TaskCandidate {
   id: string;
   taskText: string;
@@ -188,6 +195,146 @@ export class TranscriptDetailViewProvider {
 
   setChatProvider(chatProvider: ChatViewProvider): void {
     this._chatProvider = chatProvider;
+  }
+
+  private normalizeComment(raw: unknown): TranscriptComment | null {
+    if (!raw || typeof raw !== 'object') {
+      return null;
+    }
+
+    const candidate = raw as Record<string, unknown>;
+    const id = typeof candidate.id === 'string' ? candidate.id.trim() : '';
+    const text = typeof candidate.text === 'string' ? candidate.text.trim() : '';
+    const createdAt = typeof candidate.createdAt === 'string' ? candidate.createdAt : '';
+    const updatedAt = typeof candidate.updatedAt === 'string' ? candidate.updatedAt : undefined;
+
+    if (!id || !text || !createdAt) {
+      return null;
+    }
+
+    return { id, text, createdAt, updatedAt };
+  }
+
+  private getCommentsFromMetadata(content: TranscriptContent): TranscriptComment[] {
+    const comments = content.metadata?.comments ?? [];
+    return comments
+      .map((entry) => this.normalizeComment(entry))
+      .filter((entry): entry is TranscriptComment => !!entry)
+      .slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  private async saveCommentsForTranscript(
+    panel: vscode.WebviewPanel,
+    transcript: Transcript,
+    transcriptUri: string,
+    comments: TranscriptComment[],
+    statusMessage: string
+  ): Promise<void> {
+    if (!this._client) {
+      panel.webview.postMessage({ command: 'commentOperationFailed', message: 'MCP client not initialized.' });
+      return;
+    }
+
+    try {
+      const transcriptRef = this.getToolTranscriptPath(transcript.uri || transcript.path, transcriptUri);
+      const normalized = comments
+        .map((entry) => this.normalizeComment(entry))
+        .filter((entry): entry is TranscriptComment => !!entry)
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      await this._client.callTool('protokoll_edit_transcript', {
+        transcriptPath: transcriptRef,
+        comments: normalized,
+      });
+
+      panel.webview.postMessage({
+        command: 'commentsUpdated',
+        comments: normalized.slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+        statusMessage,
+      });
+      await this.refreshTranscript(transcriptUri);
+      await vscode.commands.executeCommand('protokoll.refreshTranscripts');
+    } catch (error) {
+      panel.webview.postMessage({
+        command: 'commentOperationFailed',
+        message: `Failed to persist comments: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }
+
+  private async handleAddComment(
+    panel: vscode.WebviewPanel,
+    transcript: Transcript,
+    transcriptUri: string,
+    existingComments: TranscriptComment[],
+    rawText: unknown
+  ): Promise<void> {
+    const text = typeof rawText === 'string' ? rawText.trim() : '';
+    if (!text) {
+      panel.webview.postMessage({ command: 'commentOperationFailed', message: 'Comment text cannot be empty.' });
+      return;
+    }
+    const now = new Date().toISOString();
+    const next = existingComments.concat([{
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      text,
+      createdAt: now,
+    }]);
+    await this.saveCommentsForTranscript(panel, transcript, transcriptUri, next, 'Comment added.');
+  }
+
+  private async handleEditComment(
+    panel: vscode.WebviewPanel,
+    transcript: Transcript,
+    transcriptUri: string,
+    existingComments: TranscriptComment[],
+    commentId: unknown,
+    rawText: unknown
+  ): Promise<void> {
+    const id = typeof commentId === 'string' ? commentId.trim() : '';
+    const text = typeof rawText === 'string' ? rawText.trim() : '';
+    if (!id) {
+      panel.webview.postMessage({ command: 'commentOperationFailed', message: 'Comment id is missing.' });
+      return;
+    }
+    if (!text) {
+      panel.webview.postMessage({ command: 'commentOperationFailed', message: 'Comment text cannot be empty.' });
+      return;
+    }
+
+    let updated = false;
+    const next = existingComments.map((comment) => {
+      if (comment.id !== id) {
+        return comment;
+      }
+      updated = true;
+      return { ...comment, text, updatedAt: new Date().toISOString() };
+    });
+    if (!updated) {
+      panel.webview.postMessage({ command: 'commentOperationFailed', message: 'Comment not found.' });
+      return;
+    }
+    await this.saveCommentsForTranscript(panel, transcript, transcriptUri, next, 'Comment updated.');
+  }
+
+  private async handleDeleteComment(
+    panel: vscode.WebviewPanel,
+    transcript: Transcript,
+    transcriptUri: string,
+    existingComments: TranscriptComment[],
+    commentId: unknown
+  ): Promise<void> {
+    const id = typeof commentId === 'string' ? commentId.trim() : '';
+    if (!id) {
+      panel.webview.postMessage({ command: 'commentOperationFailed', message: 'Comment id is missing.' });
+      return;
+    }
+    const next = existingComments.filter((comment) => comment.id !== id);
+    if (next.length === existingComments.length) {
+      panel.webview.postMessage({ command: 'commentOperationFailed', message: 'Comment not found.' });
+      return;
+    }
+    await this.saveCommentsForTranscript(panel, transcript, transcriptUri, next, 'Comment deleted.');
   }
 
   /**
@@ -603,6 +750,40 @@ export class TranscriptDetailViewProvider {
           case 'deleteSummary':
             await this.handleDeleteSummary(message.transcriptPath, activeTranscriptUri, message.summaryId);
             break;
+          case 'addComment': {
+            const existingComments = Array.isArray(message.comments)
+              ? message.comments
+                .map((entry: unknown) => this.normalizeComment(entry))
+                .filter((entry: TranscriptComment | null): entry is TranscriptComment => !!entry)
+              : [];
+            await this.handleAddComment(panel, currentTranscript.transcript, activeTranscriptUri, existingComments, message.text);
+            break;
+          }
+          case 'editComment': {
+            const existingComments = Array.isArray(message.comments)
+              ? message.comments
+                .map((entry: unknown) => this.normalizeComment(entry))
+                .filter((entry: TranscriptComment | null): entry is TranscriptComment => !!entry)
+              : [];
+            await this.handleEditComment(
+              panel,
+              currentTranscript.transcript,
+              activeTranscriptUri,
+              existingComments,
+              message.commentId,
+              message.text
+            );
+            break;
+          }
+          case 'deleteComment': {
+            const existingComments = Array.isArray(message.comments)
+              ? message.comments
+                .map((entry: unknown) => this.normalizeComment(entry))
+                .filter((entry: TranscriptComment | null): entry is TranscriptComment => !!entry)
+              : [];
+            await this.handleDeleteComment(panel, currentTranscript.transcript, activeTranscriptUri, existingComments, message.commentId);
+            break;
+          }
         }
       },
       null
@@ -1003,6 +1184,8 @@ export class TranscriptDetailViewProvider {
       return;
     }
 
+    let rollbackTranscript: Transcript | undefined;
+
     try {
       // List available projects
       // Only pass contextDirectory if server is in local mode
@@ -1115,6 +1298,29 @@ export class TranscriptDetailViewProvider {
       // Update transcript - convert absolute path to relative path
       const rawPath = transcript.uri || transcript.path;
       const transcriptPath = this.getToolTranscriptPath(rawPath, transcriptUri);
+      const previousTranscriptState = this._currentTranscripts.get(transcriptUri)?.transcript;
+      const optimisticProjects = [{ id: projectId, name: projectName }];
+      if (previousTranscriptState) {
+        rollbackTranscript = previousTranscriptState;
+        const optimisticTranscript: Transcript = {
+          ...previousTranscriptState,
+          entities: {
+            ...previousTranscriptState.entities,
+            projects: optimisticProjects,
+          },
+        };
+
+        this._currentTranscripts.set(transcriptUri, {
+          uri: transcriptUri,
+          transcript: optimisticTranscript,
+        });
+
+        // Update UI immediately to avoid waiting on server-side propagation.
+        await this._onTranscriptChanged?.(transcriptUri, {
+          entities: optimisticTranscript.entities,
+        });
+        await this.showTranscript(transcriptUri, optimisticTranscript);
+      }
       
       // Log for debugging
       console.log(`Protokoll: Updating transcript with path: ${transcriptPath}, projectId: ${projectId}`);
@@ -1152,63 +1358,88 @@ export class TranscriptDetailViewProvider {
         || (editResult?.originalPath && editResult?.outputPath && editResult.originalPath !== editResult.outputPath);
       if (movedTranscript) {
         await this._onTranscriptChanged?.();
+        return;
       }
 
-      // Re-read from server so we only render persisted metadata (no optimistic local-only state).
-      // This keeps detail + list views consistent and avoids showing project changes that did not persist.
-      let latestContent: TranscriptContent | null = null;
-      if (!movedTranscript) {
-        try {
-          latestContent = await this._client.readTranscript(transcriptUri);
-        } catch (readError) {
-          console.warn('Protokoll: Could not re-read transcript after project change, falling back to list refresh', readError);
-          await this._onTranscriptChanged?.();
-        }
-      }
-
-      // Update local transcript state from persisted server data.
-      const currentTranscript = this._currentTranscripts.get(transcriptUri);
-      if (currentTranscript) {
-        const persistedProjects = latestContent?.metadata.entities?.projects;
-        const nextProjects = persistedProjects && persistedProjects.length > 0
-          ? persistedProjects
-          : [{ id: projectId, name: projectName }];
-        const updatedTranscript: Transcript = {
-          ...currentTranscript.transcript,
-          title: latestContent?.title || currentTranscript.transcript.title,
-          status: latestContent?.metadata.status || currentTranscript.transcript.status,
-          entities: {
-            ...currentTranscript.transcript.entities,
-            ...(latestContent?.metadata.entities || {}),
-            projects: nextProjects,
-          },
-        };
-        
+      // Reconcile persisted server state in the background so UI stays responsive.
+      void this.reconcileProjectAssignment(transcriptUri, projectId, projectName);
+    } catch (error) {
+      // Roll back optimistic state when server-side edit fails.
+      if (rollbackTranscript) {
         this._currentTranscripts.set(transcriptUri, {
           uri: transcriptUri,
-          transcript: updatedTranscript,
+          transcript: rollbackTranscript,
         });
-        
-        // Update list view (prefer in-place; callback implementation falls back to full refresh).
-        const listUpdates: Partial<Transcript> = {
-          entities: updatedTranscript.entities,
-        };
-        if (updatedTranscript.title !== undefined) {
-          listUpdates.title = updatedTranscript.title;
-        }
-        if (updatedTranscript.status !== undefined) {
-          listUpdates.status = updatedTranscript.status;
-        }
-        await this._onTranscriptChanged?.(transcriptUri, listUpdates);
-
-        // Refresh detail view with persisted state
-        await this.showTranscript(transcriptUri, updatedTranscript);
+        await this._onTranscriptChanged?.(transcriptUri, {
+          entities: rollbackTranscript.entities,
+        });
+        await this.showTranscript(transcriptUri, rollbackTranscript);
       }
-    } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to change project: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+  }
+
+  private async reconcileProjectAssignment(transcriptUri: string, projectId: string, projectName: string): Promise<void> {
+    if (!this._client) {
+      return;
+    }
+
+    let latestContent: TranscriptContent | null = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        latestContent = await this._client.readTranscript(transcriptUri);
+        const persistedProjects = latestContent.metadata.entities?.projects ?? [];
+        const hasPersistedProject = persistedProjects.some(project =>
+          project.id === projectId || project.name === projectName
+        );
+        if (hasPersistedProject || attempt === 3) {
+          break;
+        }
+      } catch (readError) {
+        console.warn('Protokoll: Could not re-read transcript after project change', readError);
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
+    }
+
+    const currentTranscript = this._currentTranscripts.get(transcriptUri);
+    if (!currentTranscript) {
+      return;
+    }
+
+    const persistedProjects = latestContent?.metadata.entities?.projects;
+    const nextProjects = persistedProjects && persistedProjects.length > 0
+      ? persistedProjects
+      : [{ id: projectId, name: projectName }];
+    const updatedTranscript: Transcript = {
+      ...currentTranscript.transcript,
+      title: latestContent?.title || currentTranscript.transcript.title,
+      status: latestContent?.metadata.status || currentTranscript.transcript.status,
+      entities: {
+        ...currentTranscript.transcript.entities,
+        ...(latestContent?.metadata.entities || {}),
+        projects: nextProjects,
+      },
+    };
+
+    this._currentTranscripts.set(transcriptUri, {
+      uri: transcriptUri,
+      transcript: updatedTranscript,
+    });
+
+    const listUpdates: Partial<Transcript> = {
+      entities: updatedTranscript.entities,
+    };
+    if (updatedTranscript.title !== undefined) {
+      listUpdates.title = updatedTranscript.title;
+    }
+    if (updatedTranscript.status !== undefined) {
+      listUpdates.status = updatedTranscript.status;
+    }
+    await this._onTranscriptChanged?.(transcriptUri, listUpdates);
+    await this.showTranscript(transcriptUri, updatedTranscript);
   }
 
   private async handleChangeDate(transcript: Transcript, transcriptPath: string, transcriptUri: string): Promise<void> {
@@ -1392,7 +1623,7 @@ export class TranscriptDetailViewProvider {
       return;
     }
 
-    const statuses = ['initial', 'enhanced', 'reviewed', 'in_progress', 'closed', 'archived'];
+    const statuses = ['initial', 'enhanced', 'reviewed', 'in_progress', 'closed', 'archived', 'deleted'];
     const statusLabels: Record<string, string> = {
       initial: 'Initial',
       enhanced: 'Enhanced',
@@ -1400,6 +1631,7 @@ export class TranscriptDetailViewProvider {
       'in_progress': 'In Progress',
       closed: 'Closed',
       archived: 'Archived',
+      deleted: 'Deleted',
     };
 
     const selected = await vscode.window.showQuickPick(
@@ -1411,22 +1643,43 @@ export class TranscriptDetailViewProvider {
       return;
     }
 
+    let rollbackTranscript: Transcript | undefined;
+    const selectedStatus = selected.value as TranscriptStatus;
+
     try {
+      const currentTranscript = this._currentTranscripts.get(transcriptUri)?.transcript;
+      if (currentTranscript) {
+        rollbackTranscript = currentTranscript;
+        const optimisticTranscript: Transcript = {
+          ...currentTranscript,
+          status: selectedStatus,
+        };
+        this._currentTranscripts.set(transcriptUri, {
+          uri: transcriptUri,
+          transcript: optimisticTranscript,
+        });
+        await this._onTranscriptChanged?.(transcriptUri, { status: selectedStatus });
+        await this.showTranscript(transcriptUri, optimisticTranscript);
+      }
+
       await this._client.callTool('protokoll_edit_transcript', {
         transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
-        status: selected.value,
+        status: selectedStatus,
       });
 
       vscode.window.showInformationMessage(`Protokoll: Status changed to "${selected.label}"`);
 
-      // Refresh the transcript view
-      setTimeout(async () => {
-        await this.refreshTranscript(transcriptUri);
-      }, 500);
-
-      // Update the transcripts list — pass URI and new status for in-place update
-      await this._onTranscriptChanged?.(transcriptUri, { status: selected.value as TranscriptStatus });
+      // Reconcile persisted state without blocking user interaction.
+      void this.reconcileStatusChange(transcriptUri, selectedStatus);
     } catch (error) {
+      if (rollbackTranscript) {
+        this._currentTranscripts.set(transcriptUri, {
+          uri: transcriptUri,
+          transcript: rollbackTranscript,
+        });
+        await this._onTranscriptChanged?.(transcriptUri, { status: rollbackTranscript.status });
+        await this.showTranscript(transcriptUri, rollbackTranscript);
+      }
       vscode.window.showErrorMessage(
         `Failed to change status: ${error instanceof Error ? error.message : String(error)}`
       );
@@ -1666,10 +1919,28 @@ export class TranscriptDetailViewProvider {
       return;
     }
 
+    const trimmedTitle = newTitle.trim();
+    let rollbackTranscript: Transcript | undefined;
+
     try {
+      const currentTranscript = this._currentTranscripts.get(transcriptUri)?.transcript;
+      if (currentTranscript) {
+        rollbackTranscript = currentTranscript;
+        const optimisticTranscript: Transcript = {
+          ...currentTranscript,
+          title: trimmedTitle,
+        };
+        this._currentTranscripts.set(transcriptUri, {
+          uri: transcriptUri,
+          transcript: optimisticTranscript,
+        });
+        await this._onTranscriptChanged?.(transcriptUri, { title: trimmedTitle });
+        await this.showTranscript(transcriptUri, optimisticTranscript);
+      }
+
       const result = await this._client.callTool('protokoll_edit_transcript', {
         transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
-        title: newTitle.trim(),
+        title: trimmedTitle,
       }) as {
         success?: boolean;
         originalPath?: string;
@@ -1678,7 +1949,7 @@ export class TranscriptDetailViewProvider {
         message?: string;
       };
 
-      vscode.window.showInformationMessage(`Protokoll: Title updated to "${newTitle.trim()}"`);
+      vscode.window.showInformationMessage(`Protokoll: Title updated to "${trimmedTitle}"`);
 
       // Refresh the transcripts list view
       await vscode.commands.executeCommand('protokoll.refreshTranscripts');
@@ -1700,7 +1971,7 @@ export class TranscriptDetailViewProvider {
           // Update transcript with new title
           const updatedTranscript: Transcript = {
             ...currentTranscript.transcript,
-            title: newTitle.trim(),
+            title: trimmedTitle,
             path: result.outputPath,
             filename: result.outputPath.split('/').pop() || result.outputPath,
             uri: newTranscriptUri,
@@ -1725,7 +1996,7 @@ export class TranscriptDetailViewProvider {
           this._panels.set(newTranscriptUri, panel);
 
           // Update panel title
-          panel.title = newTitle.trim();
+          panel.title = trimmedTitle;
 
           // Subscribe to new URI
           try {
@@ -1737,6 +2008,7 @@ export class TranscriptDetailViewProvider {
 
           // Refresh the view with new URI and updated transcript
           await this.showTranscript(newTranscriptUri, updatedTranscript);
+          void this.reconcileTitleEdit(newTranscriptUri, trimmedTitle);
         } else {
           // Fallback: if we don't have current transcript data, refresh after delay
           console.warn(`Protokoll: [TRANSCRIPT VIEW] ⚠️ No current transcript data found, using fallback refresh`);
@@ -1747,28 +2019,110 @@ export class TranscriptDetailViewProvider {
           }, 1000);
         }
       } else {
-        // File wasn't renamed, just refresh with existing URI
-        setTimeout(async () => {
-          const currentTranscript = this._currentTranscripts.get(transcriptUri);
-          if (currentTranscript) {
-            // Update title in stored transcript
-            const updatedTranscript: Transcript = {
-              ...currentTranscript.transcript,
-              title: newTitle.trim(),
-            };
-            this._currentTranscripts.set(transcriptUri, {
-              uri: transcriptUri,
-              transcript: updatedTranscript,
-            });
-            await this.showTranscript(transcriptUri, updatedTranscript);
-          }
-        }, 500);
+        // Reconcile persisted state without blocking UI.
+        void this.reconcileTitleEdit(transcriptUri, trimmedTitle);
       }
     } catch (error) {
+      if (rollbackTranscript) {
+        this._currentTranscripts.set(transcriptUri, {
+          uri: transcriptUri,
+          transcript: rollbackTranscript,
+        });
+        await this._onTranscriptChanged?.(transcriptUri, { title: rollbackTranscript.title });
+        await this.showTranscript(transcriptUri, rollbackTranscript);
+      }
       vscode.window.showErrorMessage(
         `Failed to update title: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+  }
+
+  private async reconcileTitleEdit(transcriptUri: string, expectedTitle: string): Promise<void> {
+    if (!this._client) {
+      return;
+    }
+
+    let latestContent: TranscriptContent | null = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        latestContent = await this._client.readTranscript(transcriptUri);
+        if (latestContent.title === expectedTitle || attempt === 3) {
+          break;
+        }
+      } catch (readError) {
+        console.warn('Protokoll: Could not re-read transcript after title edit', readError);
+      }
+      await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
+    }
+
+    const currentTranscript = this._currentTranscripts.get(transcriptUri);
+    if (!currentTranscript) {
+      return;
+    }
+
+    const updatedTranscript: Transcript = {
+      ...currentTranscript.transcript,
+      title: latestContent?.title || expectedTitle,
+      status: latestContent?.metadata.status || currentTranscript.transcript.status,
+      entities: {
+        ...currentTranscript.transcript.entities,
+        ...(latestContent?.metadata.entities || {}),
+      },
+    };
+    this._currentTranscripts.set(transcriptUri, {
+      uri: transcriptUri,
+      transcript: updatedTranscript,
+    });
+    await this._onTranscriptChanged?.(transcriptUri, {
+      title: updatedTranscript.title,
+      status: updatedTranscript.status,
+      entities: updatedTranscript.entities,
+    });
+    await this.showTranscript(transcriptUri, updatedTranscript);
+  }
+
+  private async reconcileStatusChange(transcriptUri: string, expectedStatus: TranscriptStatus): Promise<void> {
+    if (!this._client) {
+      return;
+    }
+
+    let latestContent: TranscriptContent | null = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        latestContent = await this._client.readTranscript(transcriptUri);
+        if (latestContent.metadata.status === expectedStatus || attempt === 3) {
+          break;
+        }
+      } catch (readError) {
+        console.warn('Protokoll: Could not re-read transcript after status change', readError);
+      }
+      await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
+    }
+
+    const currentTranscript = this._currentTranscripts.get(transcriptUri);
+    if (!currentTranscript) {
+      return;
+    }
+
+    const updatedTranscript: Transcript = {
+      ...currentTranscript.transcript,
+      title: latestContent?.title || currentTranscript.transcript.title,
+      status: (latestContent?.metadata.status as TranscriptStatus) || expectedStatus,
+      entities: {
+        ...currentTranscript.transcript.entities,
+        ...(latestContent?.metadata.entities || {}),
+      },
+    };
+    this._currentTranscripts.set(transcriptUri, {
+      uri: transcriptUri,
+      transcript: updatedTranscript,
+    });
+    await this._onTranscriptChanged?.(transcriptUri, {
+      title: updatedTranscript.title,
+      status: updatedTranscript.status,
+      entities: updatedTranscript.entities,
+    });
+    await this.showTranscript(transcriptUri, updatedTranscript);
   }
 
   private async handleEditTranscript(
@@ -4843,16 +5197,17 @@ export class TranscriptDetailViewProvider {
     const isManualNote = transcript.contentType === 'manual_note' || (!content.rawTranscript && !transcript.hasRawTranscript);
     const hasManualEnhancedContent = !isManualNote
       ? true
-      : (['enhanced', 'reviewed', 'closed', 'archived'].includes(status) && transcriptText.trim().length > 0);
+      : (['enhanced', 'reviewed', 'closed', 'archived', 'deleted'].includes(status) && transcriptText.trim().length > 0);
     const showEnhancedTab = !isManualNote || hasManualEnhancedContent;
     const hasOriginalTab = !!content.rawTranscript || isManualNote;
     const summaryConfig = this.getSummaryConfig(transcript.uri) || this.getDefaultSummaryConfig();
     const summaries = this.normalizePersistedSummaries(content.summaries);
     const hasSummary = summaries.length > 0;
+    const comments = this.getCommentsFromMetadata(content);
     const preferredSummaryId = this.getActiveSummaryId(transcript.uri);
     const activeSummary = summaries.find(summary => summary.id === preferredSummaryId) || summaries[0];
     const summaryFeatureEnabled = vscode.workspace.getConfiguration('protokoll').get<boolean>('features.summaryEnabled', true);
-    const initialTab: 'enhanced' | 'raw' | 'summary' = hasSummary
+    const initialTab: 'enhanced' | 'raw' | 'summary' | 'comments' = hasSummary
       ? 'summary'
       : (showEnhancedTab ? (isManualNote ? 'raw' : 'enhanced') : 'raw');
     const originalEditorText = isManualNote
@@ -5214,6 +5569,88 @@ export class TranscriptDetailViewProvider {
         .tab-toolbar-right .edit-button {
             margin-left: 0;
         }
+        .comments-toolbar {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-bottom: 14px;
+        }
+        .comments-status {
+            display: none;
+            font-size: 0.85em;
+            color: var(--vscode-descriptionForeground);
+        }
+        .comments-status.error {
+            display: block;
+            color: var(--vscode-errorForeground);
+        }
+        .comments-status.success {
+            display: block;
+            color: var(--vscode-testing-iconPassed);
+        }
+        .comments-input {
+            width: 100%;
+            min-height: 90px;
+            resize: vertical;
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 4px;
+            background: var(--vscode-input-background);
+            color: var(--vscode-input-foreground);
+            padding: 10px;
+            box-sizing: border-box;
+            font-family: var(--vscode-editor-font-family);
+            font-size: var(--vscode-editor-font-size);
+            line-height: 1.5;
+        }
+        .comments-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-top: 8px;
+        }
+        .comment-card {
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 6px;
+            background: var(--vscode-editor-inactiveSelectionBackground);
+            padding: 10px 12px;
+        }
+        .comment-meta {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            color: var(--vscode-descriptionForeground);
+            font-size: 0.8em;
+            margin-bottom: 8px;
+        }
+        .comment-text {
+            white-space: pre-wrap;
+            word-break: break-word;
+            line-height: 1.5;
+        }
+        .comment-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .comment-edit-textarea {
+            width: 100%;
+            min-height: 90px;
+            resize: vertical;
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 4px;
+            background: var(--vscode-input-background);
+            color: var(--vscode-input-foreground);
+            padding: 10px;
+            box-sizing: border-box;
+            font-family: var(--vscode-editor-font-family);
+            font-size: var(--vscode-editor-font-size);
+            line-height: 1.5;
+        }
+        .comment-empty-state {
+            color: var(--vscode-descriptionForeground);
+            font-style: italic;
+            padding: 8px 0;
+        }
         .original-editor-actions {
             display: flex;
             align-items: center;
@@ -5557,6 +5994,7 @@ export class TranscriptDetailViewProvider {
         .status-badge.open { background-color: #fd7e14; color: white; }
         .status-badge.closed { background-color: #6f42c1; color: white; }
         .status-badge.archived { background-color: #343a40; color: white; }
+        .status-badge.deleted { background-color: #dc3545; color: white; }
         /* Tasks section styles */
         .tasks-section {
             background-color: var(--vscode-editor-inactiveSelectionBackground);
@@ -6105,6 +6543,7 @@ export class TranscriptDetailViewProvider {
             <button class="content-tab ${hasOriginalTab ? (initialTab === 'raw' ? 'active' : '') : 'disabled'}" id="raw-tab" onclick="switchTab('raw')" ${hasOriginalTab ? '' : 'disabled'}>Original</button>
             ${showEnhancedTab ? `<button class="content-tab ${initialTab === 'enhanced' ? 'active' : ''}" id="enhanced-tab" onclick="switchTab('enhanced')">Enhanced</button>` : ''}
             ${summaryFeatureEnabled ? `<button class="content-tab ${initialTab === 'summary' ? 'active' : ''}" id="summary-tab" onclick="switchTab('summary')">Summary (${summaries.length})</button>` : ''}
+            <button class="content-tab ${(initialTab as string) === 'comments' ? 'active' : ''}" id="comments-tab" onclick="switchTab('comments')">Comments (${comments.length})</button>
         </div>
         ${showEnhancedTab ? `
         <div class="tab-content ${initialTab === 'enhanced' ? 'active' : ''}" id="enhanced-content">
@@ -6227,6 +6666,18 @@ export class TranscriptDetailViewProvider {
             </div>
             `}
         </div>` : ''}
+        <div class="tab-content ${(initialTab as string) === 'comments' ? 'active' : ''}" id="comments-content">
+            <div class="comments-toolbar">
+                <div class="tab-toolbar">
+                    <div class="tab-toolbar-left">
+                        <button class="button" id="add-comment-btn" onclick="submitComment()">Add Comment</button>
+                    </div>
+                </div>
+                <textarea id="new-comment-input" class="comments-input" placeholder="Add background/context notes for this transcript..."></textarea>
+                <div id="comments-status" class="comments-status"></div>
+            </div>
+            <div class="comments-list" id="comments-list"></div>
+        </div>
     </div>
     ${this.renderEntityReferences(entityReferences)}
     <script>
@@ -6241,6 +6692,7 @@ export class TranscriptDetailViewProvider {
         const originalRawText = ${JSON.stringify(content.rawTranscript?.text ?? '')};
         const originalTranscriptText = ${JSON.stringify(transcriptText)};
         const summaryEntries = ${JSON.stringify(summaries.map(summary => ({ id: summary.id, content: summary.content || '' })))};
+        const initialComments = ${JSON.stringify(comments)};
         const originalEditorInitialText = ${JSON.stringify(originalEditorText)};
         const initialEntityReferences = ${JSON.stringify(entityReferences)};
         const entitySectionConfig = [
@@ -6257,9 +6709,208 @@ export class TranscriptDetailViewProvider {
             ? persistedViewState.activeTabName
             : '';
         let activeTabName = ${JSON.stringify(initialTab)};
+        let commentsState = normalizeComments(initialComments);
+        let editingCommentId = '';
         let originalDraft = originalEditorInitialText;
         let lastSavedOriginal = originalEditorInitialText;
         let hasUnsavedOriginalChanges = false;
+
+        function normalizeComments(raw) {
+            if (!Array.isArray(raw)) {
+                return [];
+            }
+            return raw
+                .filter(item => item && typeof item === 'object')
+                .map(item => ({
+                    id: String(item.id || '').trim(),
+                    text: String(item.text || ''),
+                    createdAt: String(item.createdAt || ''),
+                    updatedAt: item.updatedAt ? String(item.updatedAt) : ''
+                }))
+                .filter(item => item.id && item.text.trim() && item.createdAt)
+                .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+        }
+
+        function formatCommentTimestamp(isoDate) {
+            if (!isoDate) {
+                return '';
+            }
+            const parsed = new Date(isoDate);
+            if (Number.isNaN(parsed.getTime())) {
+                return isoDate;
+            }
+            return parsed.toLocaleString();
+        }
+
+        function showCommentsStatus(message, type) {
+            const statusEl = document.getElementById('comments-status');
+            if (!statusEl) {
+                return;
+            }
+            statusEl.textContent = message || '';
+            statusEl.className = 'comments-status ' + (type || '');
+            statusEl.style.display = message ? 'block' : 'none';
+        }
+
+        function updateCommentsTabLabel() {
+            const tab = document.getElementById('comments-tab');
+            if (!tab) {
+                return;
+            }
+            tab.textContent = 'Comments (' + commentsState.length + ')';
+        }
+
+        function renderCommentsList() {
+            const container = document.getElementById('comments-list');
+            if (!container) {
+                return;
+            }
+
+            if (!commentsState.length) {
+                container.innerHTML = '<div class="comment-empty-state">No comments yet.</div>';
+                updateCommentsTabLabel();
+                return;
+            }
+
+            const html = commentsState.map(comment => {
+                const isEditing = editingCommentId && editingCommentId === comment.id;
+                const text = escapeHtml(comment.text || '');
+                const createdLabel = escapeHtml(formatCommentTimestamp(comment.createdAt));
+                const updatedLabel = comment.updatedAt
+                    ? escapeHtml(formatCommentTimestamp(comment.updatedAt))
+                    : '';
+                const escapedId = escapeHtml(comment.id);
+
+                if (isEditing) {
+                    return '<div class="comment-card">' +
+                        '<div class="comment-meta"><span>Created ' + createdLabel + '</span>' +
+                        (updatedLabel ? '<span>Updated ' + updatedLabel + '</span>' : '<span></span>') +
+                        '</div>' +
+                        '<textarea class="comment-edit-textarea" id="edit-comment-' + escapedId + '">' + text + '</textarea>' +
+                        '<div class="comment-actions">' +
+                        '<button class="button" data-comment-action="save" data-comment-id="' + escapedId + '">Save</button>' +
+                        '<button class="button button-secondary" data-comment-action="cancel">Cancel</button>' +
+                        '</div>' +
+                        '</div>';
+                }
+
+                return '<div class="comment-card">' +
+                    '<div class="comment-meta"><span>Created ' + createdLabel + '</span>' +
+                    (updatedLabel ? '<span>Updated ' + updatedLabel + '</span>' : '<span></span>') +
+                    '</div>' +
+                    '<div class="comment-text">' + text + '</div>' +
+                    '<div class="comment-actions">' +
+                    '<button class="button button-secondary" data-comment-action="edit" data-comment-id="' + escapedId + '">Edit</button>' +
+                    '<button class="button button-secondary" data-comment-action="delete" data-comment-id="' + escapedId + '">Delete</button>' +
+                    '</div>' +
+                    '</div>';
+            }).join('');
+
+            container.innerHTML = html;
+            updateCommentsTabLabel();
+        }
+
+        function submitComment() {
+            const input = document.getElementById('new-comment-input');
+            const addBtn = document.getElementById('add-comment-btn');
+            if (!input || !addBtn) {
+                return;
+            }
+            const text = input.value.trim();
+            if (!text) {
+                showCommentsStatus('Comment text cannot be empty.', 'error');
+                return;
+            }
+            addBtn.disabled = true;
+            addBtn.textContent = 'Adding...';
+            showCommentsStatus('', '');
+            vscode.postMessage({
+                command: 'addComment',
+                transcriptUri: transcriptUri,
+                text: text,
+                comments: commentsState
+            });
+        }
+
+        function startEditComment(commentId) {
+            if (!commentId) {
+                return;
+            }
+            editingCommentId = commentId;
+            renderCommentsList();
+        }
+
+        function cancelEditComment() {
+            editingCommentId = '';
+            renderCommentsList();
+        }
+
+        function saveEditedComment(commentId) {
+            if (!commentId) {
+                return;
+            }
+            const input = document.getElementById('edit-comment-' + commentId);
+            if (!input) {
+                return;
+            }
+            const text = input.value.trim();
+            if (!text) {
+                showCommentsStatus('Comment text cannot be empty.', 'error');
+                return;
+            }
+            showCommentsStatus('', '');
+            vscode.postMessage({
+                command: 'editComment',
+                transcriptUri: transcriptUri,
+                commentId: commentId,
+                text: text,
+                comments: commentsState
+            });
+        }
+
+        function deleteComment(commentId) {
+            if (!commentId) {
+                return;
+            }
+            const confirmed = window.confirm('Delete this comment?');
+            if (!confirmed) {
+                return;
+            }
+            showCommentsStatus('', '');
+            vscode.postMessage({
+                command: 'deleteComment',
+                transcriptUri: transcriptUri,
+                commentId: commentId,
+                comments: commentsState
+            });
+        }
+
+        function setupCommentsEventHandlers() {
+            const container = document.getElementById('comments-list');
+            if (!container || container.dataset.bound === 'true') {
+                return;
+            }
+            container.dataset.bound = 'true';
+            container.addEventListener('click', (event) => {
+                const target = event.target && event.target.closest
+                    ? event.target.closest('[data-comment-action]')
+                    : null;
+                if (!target) {
+                    return;
+                }
+                const action = target.getAttribute('data-comment-action');
+                const commentId = target.getAttribute('data-comment-id') || '';
+                if (action === 'edit') {
+                    startEditComment(commentId);
+                } else if (action === 'delete') {
+                    deleteComment(commentId);
+                } else if (action === 'save') {
+                    saveEditedComment(commentId);
+                } else if (action === 'cancel') {
+                    cancelEditComment();
+                }
+            });
+        }
 
         function normalizeEntityReferences(raw) {
             const result = { projects: [], people: [], terms: [], companies: [] };
@@ -7393,6 +8044,27 @@ export class TranscriptDetailViewProvider {
                     showEntityReferenceStatus(message.message || 'Failed to save entity references.', 'error');
                 }
                 renderEntityReferencesContent();
+            } else if (message.command === 'commentsUpdated') {
+                commentsState = normalizeComments(message.comments || []);
+                editingCommentId = '';
+                const input = document.getElementById('new-comment-input');
+                const addBtn = document.getElementById('add-comment-btn');
+                if (input) {
+                    input.value = '';
+                }
+                if (addBtn) {
+                    addBtn.disabled = false;
+                    addBtn.textContent = 'Add Comment';
+                }
+                showCommentsStatus(message.statusMessage || 'Comment saved.', 'success');
+                renderCommentsList();
+            } else if (message.command === 'commentOperationFailed') {
+                const addBtn = document.getElementById('add-comment-btn');
+                if (addBtn) {
+                    addBtn.disabled = false;
+                    addBtn.textContent = 'Add Comment';
+                }
+                showCommentsStatus(message.message || 'Unable to update comments.', 'error');
             }
         });
 
@@ -7421,6 +8093,8 @@ export class TranscriptDetailViewProvider {
         document.addEventListener('DOMContentLoaded', () => {
             setupRefreshButton();
             setupOriginalEditor();
+            setupCommentsEventHandlers();
+            renderCommentsList();
             restoreActiveTabPreference();
             if (isManualNote && activeTabName === 'raw') {
                 const editor = document.getElementById('original-editor-input');
@@ -7903,6 +8577,7 @@ export class TranscriptDetailViewProvider {
       'in_progress': '🔄',
       closed: '✅',
       archived: '📦',
+      deleted: '🗑️',
     };
     return icons[status] || '❓';
   }
@@ -7915,6 +8590,7 @@ export class TranscriptDetailViewProvider {
       'in_progress': 'In Progress',
       closed: 'Closed',
       archived: 'Archived',
+      deleted: 'Deleted',
     };
     return labels[status] || status;
   }

@@ -61,6 +61,11 @@ describe('TranscriptsViewProvider', () => {
         it('should initialize provider', () => {
             expect(provider).toBeInstanceOf(TranscriptsViewProvider);
         });
+
+        it('should exclude deleted status from default filters', () => {
+            const filters = provider.getStatusFilters();
+            expect(filters.has('deleted')).toBe(false);
+        });
     });
 
     describe('setClient', () => {
@@ -179,6 +184,14 @@ describe('TranscriptsViewProvider', () => {
             const newProvider = new TranscriptsViewProvider(mockContext);
             const filters = newProvider.getStatusFilters();
             expect(filters).toEqual(new Set(['closed', 'archived']));
+        });
+
+        it('should load deleted status filter from workspace state on initialization', () => {
+            mockContext.workspaceState.update('protokoll.statusFilters', ['closed', 'deleted']);
+
+            const newProvider = new TranscriptsViewProvider(mockContext);
+            const filters = newProvider.getStatusFilters();
+            expect(filters).toEqual(new Set(['closed', 'deleted']));
         });
 
         it('should save sort order to workspace state', async () => {
@@ -698,5 +711,31 @@ describe('TranscriptItem', () => {
 
         expect(item.iconPath).toBeInstanceOf(vscode.ThemeIcon);
         expect((item.iconPath as vscode.ThemeIcon).id).toBe('circle-filled');
+    });
+
+    it('should render deleted transcripts with red status circle and deleted tooltip label', () => {
+        const transcript: Transcript = {
+            uri: 'protokoll://transcript/deleted.md',
+            path: '/path/to/deleted.md',
+            filename: 'deleted.md',
+            date: '2026-01-31',
+            title: 'Deleted Transcript',
+            contentType: 'audio_transcript',
+            status: 'deleted',
+        };
+
+        const item = new TranscriptItem(
+            'Deleted Transcript',
+            transcript.uri,
+            vscode.TreeItemCollapsibleState.None,
+            undefined,
+            transcript,
+            'transcript'
+        );
+
+        expect(item.iconPath).toBeInstanceOf(vscode.ThemeIcon);
+        expect((item.iconPath as vscode.ThemeIcon).id).toBe('circle-filled');
+        expect(((item.iconPath as vscode.ThemeIcon).color as vscode.ThemeColor).id).toBe('charts.red');
+        expect(String(item.tooltip)).toContain('Status: Deleted');
     });
 });

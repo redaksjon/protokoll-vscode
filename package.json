@@ -2,7 +2,7 @@
   "name": "protokoll-vscode",
   "displayName": "Protokoll",
   "description": "VS Code extension for viewing Protokoll transcripts and entities via HTTP MCP server",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/redaksjon/protokoll-vscode.git"
@@ -124,7 +124,17 @@
       },
       {
         "command": "protokoll.copyTranscript",
-        "title": "Copy",
+        "title": "Copy Enhanced (Legacy)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.copyTranscriptOriginal",
+        "title": "Copy Original",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.copyTranscriptEnhanced",
+        "title": "Copy Enhanced",
         "category": "Protokoll"
       },
       {
@@ -444,7 +454,12 @@
           "group": "1_open"
         },
         {
-          "command": "protokoll.copyTranscript",
+          "command": "protokoll.copyTranscriptOriginal",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "9_cutcopypaste"
+        },
+        {
+          "command": "protokoll.copyTranscriptEnhanced",
           "when": "view == protokollTranscripts && viewItem == transcript",
           "group": "9_cutcopypaste"
         },
@@ -532,6 +547,12 @@
           "description": "Default directory path for transcripts",
           "markdownDescription": "Default directory path for transcripts (optional, will prompt if not set)"
         },
+        "protokoll.proxyBypass": {
+          "type": "boolean",
+          "default": false,
+          "description": "Bypass system/corporate proxy when connecting to the Protokoll server. Enable this if your Protokoll server is accessible directly but blocked by a corporate proxy.",
+          "markdownDescription": "Bypass system/corporate proxy when connecting to the Protokoll server. Enable this when your Protokoll server is reachable directly but a corporate proxy interferes with the connection."
+        },
         "protokoll.dashboard.autoOpen": {
           "type": "boolean",
           "default": true,
@@ -589,6 +610,7 @@
     "vitest": "^2.0.0"
   },
   "dependencies": {
+    "https-proxy-agent": "^7.0.6",
     "js-yaml": "^4.1.1",
     "openai": "^6.22.0"
   }
