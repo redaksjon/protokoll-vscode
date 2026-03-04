@@ -2420,7 +2420,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // Refresh transcripts when configuration changes
   const configWatcher = vscode.workspace.onDidChangeConfiguration(async (e) => {
-    if (e.affectsConfiguration('protokoll.serverUrl') || e.affectsConfiguration('protokoll.apiKey')) {
+    if (e.affectsConfiguration('protokoll.serverUrl') || e.affectsConfiguration('protokoll.apiKey') || e.affectsConfiguration('protokoll.proxyBypass')) {
       if (ignoreNextServerUrlConfigChange) {
         ignoreNextServerUrlConfigChange = false;
         return;

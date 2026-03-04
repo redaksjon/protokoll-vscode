@@ -27,7 +27,7 @@ export class OpenAIClient {
     const proxyUrl = getProxyUrl();
     if (proxyUrl && !isProxyBypassed('https://api.openai.com')) {
       // Node.js 24+ ships undici which powers global fetch.
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
       const { ProxyAgent } = require('undici') as typeof import('undici');
       const dispatcher = new ProxyAgent({
         uri: proxyUrl,

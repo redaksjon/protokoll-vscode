@@ -12,6 +12,8 @@
 import * as vscode from 'vscode';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import type * as http from 'http';
+import { Agent as HttpAgent } from 'node:http';
+import { Agent as HttpsAgent } from 'node:https';
 import { URL } from 'url';
 
 export function getProxyUrl(): string | undefined {
@@ -83,4 +85,23 @@ export function getProxyAgent(targetUrl: string): http.Agent | undefined {
   return new HttpsProxyAgent(proxyUrl, {
     rejectUnauthorized: getStrictSSL(),
   });
+}
+
+/**
+ * Return the appropriate agent for the given target URL, considering
+ * both proxy and proxy-bypass settings.
+ *
+ * When `protokoll.proxyBypass` is true, returns an explicit direct agent
+ * that overrides VSCode's proxy injection. When false, delegates to the
+ * existing getProxyAgent() logic.
+ */
+export function resolveAgent(targetUrl: string): http.Agent | undefined {
+  const bypass = vscode.workspace.getConfiguration('protokoll').get<boolean>('proxyBypass', false);
+  if (bypass) {
+    const isHttps = targetUrl.startsWith('https:');
+    return isHttps
+      ? new HttpsAgent({ keepAlive: true })
+      : new HttpAgent({ keepAlive: true });
+  }
+  return getProxyAgent(targetUrl);
 }

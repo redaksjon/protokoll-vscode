@@ -532,6 +532,12 @@
           "description": "Default directory path for transcripts",
           "markdownDescription": "Default directory path for transcripts (optional, will prompt if not set)"
         },
+        "protokoll.proxyBypass": {
+          "type": "boolean",
+          "default": false,
+          "description": "Bypass system/corporate proxy when connecting to the Protokoll server. Enable this if your Protokoll server is accessible directly but blocked by a corporate proxy.",
+          "markdownDescription": "Bypass system/corporate proxy when connecting to the Protokoll server. Enable this when your Protokoll server is reachable directly but a corporate proxy interferes with the connection."
+        },
         "protokoll.dashboard.autoOpen": {
           "type": "boolean",
           "default": true,
