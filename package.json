@@ -124,7 +124,17 @@
       },
       {
         "command": "protokoll.copyTranscript",
-        "title": "Copy",
+        "title": "Copy Enhanced (Legacy)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.copyTranscriptOriginal",
+        "title": "Copy Original",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.copyTranscriptEnhanced",
+        "title": "Copy Enhanced",
         "category": "Protokoll"
       },
       {
@@ -444,7 +454,12 @@
           "group": "1_open"
         },
         {
-          "command": "protokoll.copyTranscript",
+          "command": "protokoll.copyTranscriptOriginal",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "9_cutcopypaste"
+        },
+        {
+          "command": "protokoll.copyTranscriptEnhanced",
           "when": "view == protokollTranscripts && viewItem == transcript",
           "group": "9_cutcopypaste"
         },

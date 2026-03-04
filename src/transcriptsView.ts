@@ -94,7 +94,11 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     if (!this.treeView) {
       return [];
     }
-    return this.treeView.selection.filter(item => item.type === 'transcript' && item.transcript);
+    const selection = (this.treeView as unknown as { selection?: TranscriptItem[] }).selection;
+    if (!Array.isArray(selection)) {
+      return [];
+    }
+    return selection.filter(item => item.type === 'transcript' && item.transcript);
   }
 
   setClient(client: McpClient): void {

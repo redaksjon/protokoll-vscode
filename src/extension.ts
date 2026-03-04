@@ -2078,28 +2078,108 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   }
 
+  const resolveCopyTargets = (item?: TranscriptItem): TranscriptItem[] => {
+    if (!transcriptsViewProvider) {
+      return item?.transcript ? [item] : [];
+    }
+    const selectedItems = transcriptsViewProvider.getSelectedItems();
+    return selectedItems.length > 0
+      ? selectedItems
+      : (item?.transcript ? [item] : []);
+  };
+
+  const buildTranscriptClipboardBlock = (
+    transcript: TranscriptContent,
+    variant: 'original' | 'enhanced',
+    fallbackStatus?: TranscriptStatus
+  ): string => {
+    const title = transcript.title?.trim() || transcript.path.split('/').pop() || 'Untitled Transcript';
+    const date = transcript.metadata?.date?.trim();
+    const time = transcript.metadata?.time?.trim();
+    const dateTime = [date, time].filter(Boolean).join(' ').trim() || transcript.path;
+    const tags = transcript.metadata?.tags && transcript.metadata.tags.length > 0
+      ? transcript.metadata.tags.join(', ')
+      : 'None';
+    const status = transcript.metadata?.status || fallbackStatus || 'unknown';
+    const content = variant === 'original'
+      ? (transcript.rawTranscript?.text?.trim() || transcript.content.trim())
+      : transcript.content.trim();
+
+    return [
+      `## ${title}`,
+      '',
+      `**Date/Time:** ${dateTime}`,
+      `**Tags:** ${tags}`,
+      `**Status:** ${status}`,
+      '',
+      content,
+    ].join('\n');
+  };
+
+  const copyTranscriptVariant = async (
+    item: TranscriptItem | undefined,
+    variant: 'original' | 'enhanced'
+  ): Promise<void> => {
+    if (!mcpClient) {
+      vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
+      return;
+    }
+
+    const targets = resolveCopyTargets(item);
+    if (targets.length === 0) {
+      vscode.window.showErrorMessage('No transcript selected.');
+      return;
+    }
+
+    try {
+      const blocks: string[] = [];
+      for (const target of targets) {
+        if (!target.transcript?.uri) {
+          continue;
+        }
+        const transcript = await mcpClient.readTranscript(target.transcript.uri);
+        blocks.push(buildTranscriptClipboardBlock(transcript, variant, target.transcript.status));
+      }
+
+      if (blocks.length === 0) {
+        vscode.window.showErrorMessage('No transcript content available to copy.');
+        return;
+      }
+
+      await vscode.env.clipboard.writeText(blocks.join('\n\n---\n\n'));
+      const label = variant === 'original' ? 'Original' : 'Enhanced';
+      vscode.window.showInformationMessage(
+        blocks.length === 1
+          ? `${label} transcript copied to clipboard`
+          : `${blocks.length} ${label.toLowerCase()} transcripts copied to clipboard`
+      );
+    } catch (error) {
+      const label = variant === 'original' ? 'original transcript' : 'enhanced transcript';
+      vscode.window.showErrorMessage(
+        `Failed to copy ${label}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  };
+
+  const copyTranscriptOriginalCommand = vscode.commands.registerCommand(
+    'protokoll.copyTranscriptOriginal',
+    async (item: TranscriptItem) => {
+      await copyTranscriptVariant(item, 'original');
+    }
+  );
+
+  const copyTranscriptEnhancedCommand = vscode.commands.registerCommand(
+    'protokoll.copyTranscriptEnhanced',
+    async (item: TranscriptItem) => {
+      await copyTranscriptVariant(item, 'enhanced');
+    }
+  );
+
+  // Backward-compatible command id; maps to enhanced copy behavior.
   const copyTranscriptCommand = vscode.commands.registerCommand(
     'protokoll.copyTranscript',
     async (item: TranscriptItem) => {
-      if (!mcpClient) {
-        vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
-        return;
-      }
-
-      if (!item || !item.transcript) {
-        vscode.window.showErrorMessage('No transcript selected.');
-        return;
-      }
-
-      try {
-        const content: TranscriptContent = await mcpClient.readTranscript(item.transcript.uri);
-        await vscode.env.clipboard.writeText(content.content);
-        vscode.window.showInformationMessage('Transcript text copied to clipboard');
-      } catch (error) {
-        vscode.window.showErrorMessage(
-          `Failed to copy transcript: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
+      await copyTranscriptVariant(item, 'enhanced');
     }
   );
 
@@ -2158,14 +2238,39 @@ export async function activate(context: vscode.ExtensionContext) {
   const copyTranscriptUrlCommand = vscode.commands.registerCommand(
     'protokoll.copyTranscriptUrl',
     async (item: TranscriptItem) => {
-      if (!item || !item.transcript) {
+      if (!transcriptsViewProvider) {
+        vscode.window.showErrorMessage('Transcripts view provider not initialized.');
+        return;
+      }
+
+      const selectedItems = transcriptsViewProvider.getSelectedItems();
+      const targetItems = selectedItems.length > 0
+        ? selectedItems
+        : (item?.transcript ? [item] : []);
+
+      if (targetItems.length === 0) {
         vscode.window.showErrorMessage('No transcript selected.');
         return;
       }
 
       try {
-        await vscode.env.clipboard.writeText(item.transcript.uri);
-        vscode.window.showInformationMessage('Transcript URL copied to clipboard');
+        const uniqueUrls = Array.from(new Set(
+          targetItems
+            .map(target => target.transcript?.uri)
+            .filter((uri): uri is string => !!uri && uri.trim().length > 0)
+        ));
+
+        if (uniqueUrls.length === 0) {
+          vscode.window.showErrorMessage('No transcript URL available.');
+          return;
+        }
+
+        await vscode.env.clipboard.writeText(uniqueUrls.join('\n'));
+        vscode.window.showInformationMessage(
+          uniqueUrls.length === 1
+            ? 'Transcript URL copied to clipboard'
+            : `${uniqueUrls.length} transcript URLs copied to clipboard`
+        );
       } catch (error) {
         vscode.window.showErrorMessage(
           `Failed to copy URL: ${error instanceof Error ? error.message : String(error)}`
@@ -2590,6 +2695,8 @@ export async function activate(context: vscode.ExtensionContext) {
     changeSelectedTranscriptsStatusCommand,
     identifyTasksInTranscriptCommand,
     copyTranscriptCommand,
+    copyTranscriptOriginalCommand,
+    copyTranscriptEnhancedCommand,
     openTranscriptToSideCommand,
     openTranscriptWithCommand,
     copyTranscriptUrlCommand,
