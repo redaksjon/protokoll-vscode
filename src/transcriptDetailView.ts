@@ -1644,20 +1644,18 @@ export class TranscriptDetailViewProvider {
     const selectedStatus = selected.value as TranscriptStatus;
 
     try {
-      const currentTranscript = this._currentTranscripts.get(transcriptUri)?.transcript;
-      if (currentTranscript) {
-        rollbackTranscript = currentTranscript;
-        const optimisticTranscript: Transcript = {
-          ...currentTranscript,
-          status: selectedStatus,
-        };
-        this._currentTranscripts.set(transcriptUri, {
-          uri: transcriptUri,
-          transcript: optimisticTranscript,
-        });
-        await this._onTranscriptChanged?.(transcriptUri, { status: selectedStatus });
-        await this.showTranscript(transcriptUri, optimisticTranscript);
-      }
+      const currentTranscript = this._currentTranscripts.get(transcriptUri)?.transcript ?? transcript;
+      rollbackTranscript = currentTranscript;
+      const optimisticTranscript: Transcript = {
+        ...currentTranscript,
+        status: selectedStatus,
+      };
+      this._currentTranscripts.set(transcriptUri, {
+        uri: transcriptUri,
+        transcript: optimisticTranscript,
+      });
+      await this._onTranscriptChanged?.(transcriptUri, { status: selectedStatus });
+      await this.showTranscript(transcriptUri, optimisticTranscript);
 
       await this._client.callTool('protokoll_edit_transcript', {
         transcriptPath: this.getToolTranscriptPath(transcriptPath, transcriptUri),
@@ -3878,6 +3876,10 @@ export class TranscriptDetailViewProvider {
     }
   }
 
+  private isLikelyUuid(value: string): boolean {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
+  }
+
   private async fetchProjectNameMap(): Promise<Map<string, string>> {
     const map = new Map<string, string>();
     if (!this._client) { return map; }
@@ -5145,7 +5147,12 @@ export class TranscriptDetailViewProvider {
 </html>`;
   }
 
-  public getWebviewContent(transcript: Transcript, content: TranscriptContent, lastFetched?: Date): string {
+  public getWebviewContent(
+    transcript: Transcript,
+    content: TranscriptContent,
+    lastFetched?: Date,
+    projectNameMap?: Map<string, string>
+  ): string {
     // Normalize content: handle legacy/raw format (uri, mimeType, text) vs structured (metadata, content)
     const metadata = content.metadata ?? {};
     const transcriptText = content.content ?? (content as { text?: string }).text ?? '*No content available*';
@@ -5189,7 +5196,10 @@ export class TranscriptDetailViewProvider {
 
     // Get project info from structured metadata
     const projectId = metadata.entities?.projects?.[0]?.id ?? metadata.projectId ?? transcript.entities?.projects?.[0]?.id ?? '';
-    const projectName = metadata.entities?.projects?.[0]?.name ?? metadata.project ?? transcript.entities?.projects?.[0]?.name ?? '';
+    const rawProjectName = metadata.entities?.projects?.[0]?.name ?? metadata.project ?? transcript.entities?.projects?.[0]?.name ?? '';
+    const mappedProjectName = projectId ? projectNameMap?.get(projectId) : undefined;
+    const projectName = mappedProjectName
+      ?? (rawProjectName && !this.isLikelyUuid(rawProjectName) ? rawProjectName : '');
     const transcriptPath = transcript.uri;
     const isManualNote = transcript.contentType === 'manual_note' || (!content.rawTranscript && !transcript.hasRawTranscript);
     const hasManualEnhancedContent = !isManualNote
