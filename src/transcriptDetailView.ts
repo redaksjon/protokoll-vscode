@@ -224,6 +224,14 @@ export class TranscriptDetailViewProvider {
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
+  private async getLatestComments(transcriptUri: string): Promise<TranscriptComment[]> {
+    if (!this._client) {
+      return [];
+    }
+    const latestContent = await this._client.readTranscript(transcriptUri);
+    return this.getCommentsFromMetadata(latestContent);
+  }
+
   private async saveCommentsForTranscript(
     panel: vscode.WebviewPanel,
     transcript: Transcript,
@@ -237,7 +245,7 @@ export class TranscriptDetailViewProvider {
     }
 
     try {
-      const transcriptRef = this.getToolTranscriptPath(transcript.uri || transcript.path, transcriptUri);
+      const transcriptRef = this.getToolTranscriptPath(transcriptUri || transcript.uri || transcript.path, transcriptUri);
       const normalized = comments
         .map((entry) => this.normalizeComment(entry))
         .filter((entry): entry is TranscriptComment => !!entry)
@@ -247,9 +255,10 @@ export class TranscriptDetailViewProvider {
         comments: normalized,
       });
 
+      const commentsForUi = normalized.slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       panel.webview.postMessage({
         command: 'commentsUpdated',
-        comments: normalized.slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+        comments: commentsForUi,
         statusMessage,
       });
       await this.refreshTranscript(transcriptUri);
@@ -751,20 +760,12 @@ export class TranscriptDetailViewProvider {
             await this.handleDeleteSummary(message.transcriptPath, activeTranscriptUri, message.summaryId);
             break;
           case 'addComment': {
-            const existingComments = Array.isArray(message.comments)
-              ? message.comments
-                .map((entry: unknown) => this.normalizeComment(entry))
-                .filter((entry: TranscriptComment | null): entry is TranscriptComment => !!entry)
-              : [];
+            const existingComments = await this.getLatestComments(activeTranscriptUri);
             await this.handleAddComment(panel, currentTranscript.transcript, activeTranscriptUri, existingComments, message.text);
             break;
           }
           case 'editComment': {
-            const existingComments = Array.isArray(message.comments)
-              ? message.comments
-                .map((entry: unknown) => this.normalizeComment(entry))
-                .filter((entry: TranscriptComment | null): entry is TranscriptComment => !!entry)
-              : [];
+            const existingComments = await this.getLatestComments(activeTranscriptUri);
             await this.handleEditComment(
               panel,
               currentTranscript.transcript,
@@ -776,11 +777,7 @@ export class TranscriptDetailViewProvider {
             break;
           }
           case 'deleteComment': {
-            const existingComments = Array.isArray(message.comments)
-              ? message.comments
-                .map((entry: unknown) => this.normalizeComment(entry))
-                .filter((entry: TranscriptComment | null): entry is TranscriptComment => !!entry)
-              : [];
+            const existingComments = await this.getLatestComments(activeTranscriptUri);
             await this.handleDeleteComment(panel, currentTranscript.transcript, activeTranscriptUri, existingComments, message.commentId);
             break;
           }
