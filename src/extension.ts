@@ -2557,8 +2557,11 @@ export async function activate(context: vscode.ExtensionContext) {
         return; // User pressed Escape — cancel the whole flow
       }
 
-      // 3. Optional project selection (create-or-select pattern)
-      let projectItems: vscode.QuickPickItem[] = [];
+      // 3. Resolve project assignment before upload.
+      // We always prefer a concrete project when at least one active project exists,
+      // which keeps scoped-key uploads and subsequent transcript reads consistent.
+      type UploadProjectOption = vscode.QuickPickItem & { id: string };
+      let activeProjects: Array<{ id: string; name: string }> = [];
       try {
         const shouldPass = await shouldPassContextDirectory(mcpClient);
         const contextDirectory = shouldPass ? getDefaultContextDirectory() : undefined;
@@ -2568,50 +2571,32 @@ export async function activate(context: vscode.ExtensionContext) {
         ) as { projects?: Array<{ id: string; name: string; active?: boolean }> };
 
         if (projectsResult.projects && projectsResult.projects.length > 0) {
-          const activeProjects = projectsResult.projects.filter((p) => p.active !== false);
-          projectItems = activeProjects.map((p) => ({
-            label: p.name,
-            description: p.id,
-          }));
+          activeProjects = projectsResult.projects
+            .filter((p) => p.active !== false)
+            .map((p) => ({ id: p.id, name: p.name }));
         }
       } catch {
-        // If project fetch fails, just show empty list with create option
-      }
-
-      const skipItem: vscode.QuickPickItem = {
-        label: '$(dash) Skip — no project',
-        description: 'Upload without assigning a project',
-      };
-      const createItem: vscode.QuickPickItem = {
-        label: '$(add) Create new project...',
-        description: 'Type a new project name',
-      };
-
-      const projectPick = await vscode.window.showQuickPick(
-        [skipItem, createItem, ...projectItems],
-        {
-          title: 'Assign to Project (optional)',
-          placeHolder: 'Select a project or skip',
-        }
-      );
-
-      if (projectPick === undefined) {
-        return; // User pressed Escape — cancel
+        // Project assignment is best-effort; upload can still proceed without it.
       }
 
       let project: string | undefined;
-      if (projectPick === skipItem) {
-        project = undefined;
-      } else if (projectPick === createItem) {
-        project = await vscode.window.showInputBox({
-          prompt: 'Enter new project name',
-          placeHolder: 'e.g., Q1 Customer Interviews',
+      if (activeProjects.length === 1) {
+        // Single-project access: remove unnecessary prompt and enforce the valid project id.
+        project = activeProjects[0].id;
+      } else if (activeProjects.length > 1) {
+        const projectPickItems: UploadProjectOption[] = activeProjects.map((p) => ({
+          label: p.name,
+          description: p.id,
+          id: p.id,
+        }));
+        const projectPick = await vscode.window.showQuickPick(projectPickItems, {
+          title: 'Select Project',
+          placeHolder: 'Choose a project for this transcript',
         });
-        if (project === undefined) {
-          return; // Cancelled
+        if (!projectPick) {
+          return; // User cancelled
         }
-      } else {
-        project = projectPick.label;
+        project = projectPick.id;
       }
 
       // 4. Perform upload with progress notification
@@ -2630,7 +2615,7 @@ export async function activate(context: vscode.ExtensionContext) {
               filePath,
               serverUrl,
               title: title && title.trim() ? title.trim() : undefined,
-              project: project && project.trim() ? project.trim() : undefined,
+              project,
               apiKey,
             });
 
