@@ -50,10 +50,41 @@ function getProtokollConfiguration(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration('protokoll', getConfigurationScopeUri());
 }
 
-function getConfiguredApiKey(): string | undefined {
-  const raw = getProtokollConfiguration().get<string>('apiKey', '');
+const API_KEY_SECRET_STORAGE_KEY = 'protokoll.apiKey';
+
+async function getConfiguredApiKey(context: vscode.ExtensionContext): Promise<string | undefined> {
+  const raw = await context.secrets.get(API_KEY_SECRET_STORAGE_KEY);
   const trimmed = raw?.trim();
   return trimmed ? trimmed : undefined;
+}
+
+async function clearLegacyApiKeyConfiguration(): Promise<void> {
+  const config = vscode.workspace.getConfiguration('protokoll');
+  await config.update('apiKey', undefined, vscode.ConfigurationTarget.Global);
+  await config.update('apiKey', undefined, vscode.ConfigurationTarget.Workspace);
+
+  const workspaceUri = vscode.workspace.workspaceFolders?.[0]?.uri;
+  if (workspaceUri) {
+    const workspaceConfig = vscode.workspace.getConfiguration('protokoll', workspaceUri);
+    await workspaceConfig.update('apiKey', undefined, vscode.ConfigurationTarget.WorkspaceFolder);
+  }
+}
+
+async function migrateLegacyApiKeySetting(context: vscode.ExtensionContext): Promise<void> {
+  const config = vscode.workspace.getConfiguration('protokoll');
+  const rawLegacyValue = config.get<string>('apiKey', '');
+  const legacyApiKey = rawLegacyValue?.trim();
+  if (!legacyApiKey) {
+    return;
+  }
+
+  const storedApiKey = await getConfiguredApiKey(context);
+  if (!storedApiKey) {
+    await context.secrets.store(API_KEY_SECRET_STORAGE_KEY, legacyApiKey);
+    vscode.window.showInformationMessage('Protokoll: Migrated API key to secure secret storage.');
+  }
+
+  await clearLegacyApiKeyConfiguration();
 }
 
 function normalizeServerUrl(url: string): string {
@@ -120,6 +151,7 @@ export async function activate(context: vscode.ExtensionContext) {
   log('Protokoll extension is now active');
   console.log('Protokoll: [ACTIVATION] Extension activate() called');
   applyProxyEnvironmentPolicy();
+  await migrateLegacyApiKeySetting(context);
   // Clear legacy multi-server state from earlier versions.
   await context.globalState.update('protokoll.serverConnections', undefined);
   await context.globalState.update('protokoll.activeServerId', undefined);
@@ -127,7 +159,7 @@ export async function activate(context: vscode.ExtensionContext) {
   // Initialize MCP client
   const config = getProtokollConfiguration();
   const rawServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3002');
-  const configuredApiKey = getConfiguredApiKey();
+  const configuredApiKey = await getConfiguredApiKey(context);
   const fallbackServerUrl = normalizeServerUrl(rawServerUrl);
   const hasConfiguredUrl = context.globalState.get<boolean>('protokoll.hasConfiguredUrl', false);
   const serverUrl = fallbackServerUrl;
@@ -928,7 +960,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     const previousClient = mcpClient;
     try {
-      const newClient = new McpClient(cleanUrl, { apiKey: getConfiguredApiKey() });
+      const newClient = new McpClient(cleanUrl, { apiKey: await getConfiguredApiKey(context) });
       clearServerModeCache();
       const isHealthy = await newClient.healthCheck();
       mcpClient = newClient;
@@ -994,6 +1026,42 @@ export async function activate(context: vscode.ExtensionContext) {
         syncConnectionStatusView();
         await connectToActiveServer(true, false);
       }
+    }
+  );
+
+  const configureApiKeyCommand = vscode.commands.registerCommand(
+    'protokoll.configureApiKey',
+    async () => {
+      const currentValue = await getConfiguredApiKey(context);
+      const input = await vscode.window.showInputBox({
+        prompt: 'Enter API key for secured Protokoll servers',
+        password: true,
+        ignoreFocusOut: true,
+        value: currentValue || '',
+        placeHolder: 'API key',
+      });
+
+      if (input === undefined) {
+        return;
+      }
+
+      const trimmedValue = input.trim();
+      if (trimmedValue.length === 0) {
+        await context.secrets.delete(API_KEY_SECRET_STORAGE_KEY);
+        vscode.window.showInformationMessage('Protokoll: API key cleared from secure secret storage.');
+        return;
+      }
+
+      await context.secrets.store(API_KEY_SECRET_STORAGE_KEY, trimmedValue);
+      vscode.window.showInformationMessage('Protokoll: API key saved to secure secret storage.');
+    }
+  );
+
+  const clearApiKeyCommand = vscode.commands.registerCommand(
+    'protokoll.clearApiKey',
+    async () => {
+      await context.secrets.delete(API_KEY_SECRET_STORAGE_KEY);
+      vscode.window.showInformationMessage('Protokoll: API key cleared from secure secret storage.');
     }
   );
 
@@ -2458,7 +2526,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // Refresh transcripts when configuration changes
   const configWatcher = vscode.workspace.onDidChangeConfiguration(async (e) => {
-    if (e.affectsConfiguration('protokoll.serverUrl') || e.affectsConfiguration('protokoll.apiKey') || e.affectsConfiguration('protokoll.proxyBypass')) {
+    if (e.affectsConfiguration('protokoll.serverUrl') || e.affectsConfiguration('protokoll.proxyBypass')) {
       applyProxyEnvironmentPolicy();
       const config = getProtokollConfiguration();
       const rawServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3002');
@@ -2470,6 +2538,13 @@ export async function activate(context: vscode.ExtensionContext) {
       syncConnectionStatusView();
       await connectToActiveServer(false, false);
     }
+  });
+
+  const secretWatcher = context.secrets.onDidChange(async (event) => {
+    if (event.key !== API_KEY_SECRET_STORAGE_KEY) {
+      return;
+    }
+    await connectToActiveServer(false, false);
   });
 
   // Auto-refresh transcripts on activation (only if server is connected)
@@ -2601,7 +2676,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
       // 4. Perform upload with progress notification
       const serverUrl = getProtokollConfiguration().get<string>('serverUrl', 'http://127.0.0.1:3002') || 'http://127.0.0.1:3002';
-      const apiKey = getConfiguredApiKey();
+      const apiKey = await getConfiguredApiKey(context);
 
       await vscode.window.withProgress(
         {
@@ -2645,6 +2720,8 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     showTranscriptsCommand,
     configureServerCommand,
+    configureApiKeyCommand,
+    clearApiKeyCommand,
     addServerConnectionCommand,
     switchServerConnectionCommand,
     openTranscriptCommand,
@@ -2695,6 +2772,7 @@ export async function activate(context: vscode.ExtensionContext) {
     uploadAudioCommand,
     backArrowHandler,
     configWatcher,
+    secretWatcher,
     transcriptsTreeView,
     peopleTreeView,
     termsTreeView,

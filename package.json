@@ -41,6 +41,16 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.configureApiKey",
+        "title": "Configure API Key (Secure)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.clearApiKey",
+        "title": "Clear API Key",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.addServerConnection",
         "title": "Add Server Connection",
         "icon": "$(add)",
@@ -534,12 +544,6 @@
           "default": "http://127.0.0.1:3002",
           "description": "URL of the Protokoll HTTP MCP server",
           "markdownDescription": "URL of the Protokoll HTTP MCP server (e.g., `http://127.0.0.1:3002`)"
-        },
-        "protokoll.apiKey": {
-          "type": "string",
-          "default": "",
-          "description": "Optional API key for secured Protokoll HTTP servers",
-          "markdownDescription": "Optional API key used for both `Authorization: Bearer` and `X-API-Key` headers on all HTTP MCP requests."
         },
         "protokoll.transcriptsDirectory": {
           "type": "string",
