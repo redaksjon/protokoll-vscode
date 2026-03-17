@@ -2801,11 +2801,35 @@ export async function activate(context: vscode.ExtensionContext) {
           content: transcriptContent.content,
           projectId: transcriptContent.metadata?.projectId,
           date: transferDate,
-        }) as { success?: boolean; message?: string };
+        }) as { success?: boolean; message?: string; filePath?: string };
 
         if (!createResult?.success) {
           vscode.window.showErrorMessage(`Failed to create transcript on target server: ${createResult?.message || 'Unknown error'}`);
           return;
+        }
+
+        const sourceIsManualNote =
+          sourceTranscript.contentType === 'manual_note' || sourceTranscript.hasRawTranscript === false;
+        const sourceStatus = sourceTranscript.status || transcriptContent.metadata?.status;
+
+        // Transfers currently create via protokoll_create_note. For audio transcripts, restore
+        // original/raw content on the target so list metadata preserves transcript semantics.
+        if (!sourceIsManualNote && createResult.filePath) {
+          const originalText = transcriptContent.rawTranscript?.text?.trim() || transcriptContent.content?.trim() || '';
+          if (originalText.length > 0) {
+            await targetClient.callTool('protokoll_update_transcript_content', {
+              transcriptPath: createResult.filePath,
+              content: originalText,
+              contentTarget: 'original',
+            });
+          }
+        }
+
+        if (sourceStatus && createResult.filePath) {
+          await targetClient.callTool('protokoll_edit_transcript', {
+            transcriptPath: createResult.filePath,
+            status: sourceStatus,
+          });
         }
 
         if (transferMode === 'move') {
