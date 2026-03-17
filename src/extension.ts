@@ -20,6 +20,9 @@ import { log, initLogger } from './logger';
 import { shouldPassContextDirectory, clearServerModeCache } from './serverMode';
 import { UploadService } from './uploadService';
 import { applyProxyEnvironmentPolicy } from './proxyUtils';
+import { ServerProfilesStore } from './multiServer/profilesStore';
+import type { ServerProfile } from './multiServer/types';
+import { getServerApiKeySecretStorageKey } from './multiServer/auth';
 
 let mcpClient: McpClient | null = null;
 let transcriptsViewProvider: TranscriptsViewProvider | null = null;
@@ -34,9 +37,46 @@ let companiesViewProvider: CompaniesViewProvider | null = null;
 let dashboardViewProvider: DashboardViewProvider | null = null;
 let serverConnections: ServerConnectionEntry[] = [];
 let activeServerId: string | null = null;
+const connectedServerClients: Map<string, McpClient> = new Map();
 const TRANSCRIPTS_REFRESH_POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const ENTITY_SYNC_LIMIT = 200;
+const ENTITY_SYNC_MUTE_MS = 8000;
 
-const SINGLE_CONNECTION_ID = 'default-server';
+type SyncEntityType = 'person' | 'term' | 'project' | 'company';
+
+interface EntitySyncConfig {
+  listTool: string;
+  listKey: string;
+  addTool: string;
+  editTool: string;
+}
+
+const ENTITY_SYNC_CONFIG: Record<SyncEntityType, EntitySyncConfig> = {
+  person: {
+    listTool: 'protokoll_list_people',
+    listKey: 'people',
+    addTool: 'protokoll_add_person',
+    editTool: 'protokoll_edit_person',
+  },
+  term: {
+    listTool: 'protokoll_list_terms',
+    listKey: 'terms',
+    addTool: 'protokoll_add_term',
+    editTool: 'protokoll_edit_term',
+  },
+  project: {
+    listTool: 'protokoll_list_projects',
+    listKey: 'projects',
+    addTool: 'protokoll_add_project',
+    editTool: 'protokoll_edit_project',
+  },
+  company: {
+    listTool: 'protokoll_list_companies',
+    listKey: 'companies',
+    addTool: 'protokoll_add_company',
+    editTool: 'protokoll_edit_company',
+  },
+};
 
 function getDefaultContextDirectory(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -50,10 +90,15 @@ function getProtokollConfiguration(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration('protokoll', getConfigurationScopeUri());
 }
 
-const API_KEY_SECRET_STORAGE_KEY = 'protokoll.apiKey';
+const LEGACY_API_KEY_SECRET_STORAGE_KEY = 'protokoll.apiKey';
+const DEFAULT_SERVER_PROFILE_ID = 'default-server';
 
-async function getConfiguredApiKey(context: vscode.ExtensionContext): Promise<string | undefined> {
-  const raw = await context.secrets.get(API_KEY_SECRET_STORAGE_KEY);
+function getApiKeySecretStorageKey(serverId: string): string {
+  return getServerApiKeySecretStorageKey(serverId);
+}
+
+async function getConfiguredApiKey(context: vscode.ExtensionContext, serverId: string): Promise<string | undefined> {
+  const raw = await context.secrets.get(getApiKeySecretStorageKey(serverId));
   const trimmed = raw?.trim();
   return trimmed ? trimmed : undefined;
 }
@@ -74,14 +119,17 @@ async function migrateLegacyApiKeySetting(context: vscode.ExtensionContext): Pro
   const config = vscode.workspace.getConfiguration('protokoll');
   const rawLegacyValue = config.get<string>('apiKey', '');
   const legacyApiKey = rawLegacyValue?.trim();
-  if (!legacyApiKey) {
+  const storedLegacySecret = (await context.secrets.get(LEGACY_API_KEY_SECRET_STORAGE_KEY))?.trim();
+  const sourceApiKey = legacyApiKey || storedLegacySecret;
+  if (!sourceApiKey) {
     return;
   }
 
-  const storedApiKey = await getConfiguredApiKey(context);
+  const storedApiKey = await getConfiguredApiKey(context, DEFAULT_SERVER_PROFILE_ID);
   if (!storedApiKey) {
-    await context.secrets.store(API_KEY_SECRET_STORAGE_KEY, legacyApiKey);
-    vscode.window.showInformationMessage('Protokoll: Migrated API key to secure secret storage.');
+    await context.secrets.store(getApiKeySecretStorageKey(DEFAULT_SERVER_PROFILE_ID), sourceApiKey);
+    await context.secrets.delete(LEGACY_API_KEY_SECRET_STORAGE_KEY);
+    vscode.window.showInformationMessage('Protokoll: Migrated API key to per-server secure secret storage.');
   }
 
   await clearLegacyApiKeyConfiguration();
@@ -141,6 +189,27 @@ function applyClientToProviders(client: McpClient): void {
   }
 }
 
+function syncTranscriptsProviderClients(): void {
+  if (!transcriptsViewProvider) {
+    return;
+  }
+  const entries = serverConnections
+    .filter((connection) => connection.isConnected === true)
+    .map((connection) => {
+      const client = connectedServerClients.get(connection.id);
+      if (!client) {
+        return null;
+      }
+      return {
+        id: connection.id,
+        name: connection.name,
+        client,
+      };
+    })
+    .filter((entry): entry is { id: string; name: string; client: McpClient } => entry !== null);
+  transcriptsViewProvider.setClients(entries);
+}
+
 // Create an output channel for debugging
 const outputChannel = vscode.window.createOutputChannel('Protokoll Debug');
 
@@ -159,18 +228,26 @@ export async function activate(context: vscode.ExtensionContext) {
   // Initialize MCP client
   const config = getProtokollConfiguration();
   const rawServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3002');
-  const configuredApiKey = await getConfiguredApiKey(context);
   const fallbackServerUrl = normalizeServerUrl(rawServerUrl);
   const hasConfiguredUrl = context.globalState.get<boolean>('protokoll.hasConfiguredUrl', false);
-  const serverUrl = fallbackServerUrl;
-  serverConnections = [{
-    id: SINGLE_CONNECTION_ID,
-    name: 'Server',
-    url: serverUrl,
+  const profilesStore = new ServerProfilesStore(context.globalState);
+  const { profiles, activeServerId: storedActiveServerId } = await profilesStore.loadProfiles(fallbackServerUrl);
+  const resolveDisplayName = (profile: ServerProfile, index: number): string => profile.name?.trim() || `Server ${index + 1}`;
+  serverConnections = profiles.map((profile, index) => ({
+    id: profile.id,
+    name: resolveDisplayName(profile, index),
+    url: profile.url,
     isConnected: false,
+    hasApiKey: false,
     sessionId: null,
-  }];
-  activeServerId = SINGLE_CONNECTION_ID;
+  }));
+  activeServerId = storedActiveServerId ?? serverConnections[0]?.id ?? null;
+  const activeConnection = serverConnections.find((connection) => connection.id === activeServerId) ?? serverConnections[0];
+  if (activeConnection && activeConnection.id !== activeServerId) {
+    activeServerId = activeConnection.id;
+    await profilesStore.saveActiveServerId(activeServerId);
+  }
+  const serverUrl = activeConnection?.url ?? fallbackServerUrl;
 
   // Check if server URL is configured or if we should prompt
   if (!serverUrl || serverUrl === '') {
@@ -189,9 +266,12 @@ export async function activate(context: vscode.ExtensionContext) {
   // Initialize client and check health
   let serverConnected = false;
   let shouldPromptForConfig = false;
+  const entityNotificationDisposers: Map<string, Array<() => void>> = new Map();
+  let registerEntitySyncHandlers: (serverId: string, client: McpClient) => void = () => {};
+  let maybeSyncAllEntitiesAcrossPeers: (reason: string) => Promise<void> = async () => {};
   
   try {
-    mcpClient = new McpClient(serverUrl, { apiKey: configuredApiKey });
+    mcpClient = new McpClient(serverUrl, { apiKey: await getConfiguredApiKey(context, activeServerId ?? DEFAULT_SERVER_PROFILE_ID) });
     clearServerModeCache(); // Clear cached server mode on new connection
 
     let notificationRefreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -265,17 +345,311 @@ export async function activate(context: vscode.ExtensionContext) {
         void runNotificationRefreshQueue();
       }, 250);
     };
+
+    const mutedEntityNotifications: Map<string, number> = new Map();
+    let entitySyncInFlight = false;
+
+    const parseEntityUri = (uri: string): { entityType: SyncEntityType; entityId: string } | null => {
+      const match = uri.match(/^protokoll:\/\/entity\/([^/]+)\/(.+)$/);
+      if (!match) {
+        return null;
+      }
+      const entityType = match[1] as SyncEntityType;
+      if (!Object.prototype.hasOwnProperty.call(ENTITY_SYNC_CONFIG, entityType)) {
+        return null;
+      }
+      return {
+        entityType,
+        entityId: decodeURIComponent(match[2]),
+      };
+    };
+
+    const normalizeEntityName = (entity: Record<string, unknown>): string | null => {
+      const value = typeof entity.name === 'string' ? entity.name.trim() : '';
+      return value.length > 0 ? value : null;
+    };
+
+    const normalizeEntityId = (entity: Record<string, unknown>): string | null => {
+      const value = typeof entity.id === 'string' ? entity.id.trim() : '';
+      return value.length > 0 ? value : null;
+    };
+
+    const buildEntityUri = (entityType: SyncEntityType, entityId: string): string =>
+      `protokoll://entity/${entityType}/${encodeURIComponent(entityId)}`;
+
+    const parseEntityPayload = (raw: string): Record<string, unknown> | null => {
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
+      } catch {
+        return null;
+      }
+      return null;
+    };
+
+    const buildAddArgs = (entityType: SyncEntityType, entity: Record<string, unknown>): Record<string, unknown> => {
+      const name = normalizeEntityName(entity);
+      const id = normalizeEntityId(entity);
+      if (!name) {
+        throw new Error('Entity is missing name');
+      }
+      if (!id) {
+        throw new Error('Entity is missing canonical id');
+      }
+      if (entityType === 'term') {
+        return { term: name, id };
+      }
+      if (entityType === 'project') {
+        return { name, id, useSmartAssist: false };
+      }
+      return { name, id };
+    };
+
+    const buildEditArgs = (
+      entityType: SyncEntityType,
+      targetId: string,
+      entity: Record<string, unknown>
+    ): Record<string, unknown> => {
+      const args: Record<string, unknown> = { id: targetId };
+      const maybeCopy = (key: string, destinationKey?: string) => {
+        if (entity[key] !== undefined) {
+          args[destinationKey ?? key] = entity[key];
+        }
+      };
+
+      maybeCopy('name');
+      if (entityType === 'person') {
+        maybeCopy('description', 'context');
+        maybeCopy('context');
+        maybeCopy('role');
+        maybeCopy('company');
+        maybeCopy('firstName');
+        maybeCopy('lastName');
+        maybeCopy('sounds_like', 'add_sounds_like');
+        return args;
+      }
+
+      maybeCopy('description');
+
+      if (entityType === 'term') {
+        maybeCopy('expansion');
+        maybeCopy('domain');
+        maybeCopy('sounds_like', 'add_sounds_like');
+      } else if (entityType === 'project') {
+        maybeCopy('destination');
+        maybeCopy('structure');
+        maybeCopy('contextType');
+        maybeCopy('triggerPhrases');
+        maybeCopy('active');
+      } else if (entityType === 'company') {
+        maybeCopy('fullName');
+        maybeCopy('industry');
+        maybeCopy('sounds_like', 'add_sounds_like');
+      }
+
+      return args;
+    };
+
+    const fetchEntityList = async (
+      client: McpClient,
+      entityType: SyncEntityType
+    ): Promise<Array<Record<string, unknown>>> => {
+      const config = ENTITY_SYNC_CONFIG[entityType];
+      const response = await client.callTool(config.listTool, { limit: ENTITY_SYNC_LIMIT, offset: 0 }) as Record<string, unknown>;
+      const list = response[config.listKey];
+      if (!Array.isArray(list)) {
+        return [];
+      }
+      return list.filter((item): item is Record<string, unknown> =>
+        !!item && typeof item === 'object' && !Array.isArray(item)
+      );
+    };
+
+    const upsertEntityOnTarget = async (
+      targetServerId: string,
+      targetClient: McpClient,
+      entityType: SyncEntityType,
+      sourceEntity: Record<string, unknown>
+    ): Promise<void> => {
+      const sourceName = normalizeEntityName(sourceEntity);
+      const sourceId = normalizeEntityId(sourceEntity);
+      if (!sourceName || !sourceId) {
+        return;
+      }
+      const targetEntities = await fetchEntityList(targetClient, entityType);
+      const existingById = targetEntities.find((entity) => normalizeEntityId(entity) === sourceId);
+      const existingByName = targetEntities.find((entity) => normalizeEntityName(entity)?.toLowerCase() === sourceName.toLowerCase());
+      const existing = existingById ?? existingByName;
+      const config = ENTITY_SYNC_CONFIG[entityType];
+
+      let targetId: string | null = null;
+      if (existing && typeof existing.id === 'string' && existing.id.trim().length > 0) {
+        targetId = existing.id;
+        if (targetId !== sourceId) {
+          log('Protokoll: Entity id mismatch detected across peers; preserving existing target id', {
+            targetServerId,
+            entityType,
+            sourceId,
+            targetId,
+            name: sourceName,
+          });
+        }
+      } else {
+        const created = await targetClient.callTool(config.addTool, buildAddArgs(entityType, sourceEntity)) as Record<string, unknown>;
+        const createdId = typeof created.id === 'string'
+          ? created.id
+          : (created.entity && typeof created.entity === 'object' && !Array.isArray(created.entity) && typeof (created.entity as Record<string, unknown>).id === 'string')
+            ? String((created.entity as Record<string, unknown>).id)
+            : null;
+        targetId = createdId;
+      }
+
+      if (!targetId) {
+        return;
+      }
+
+      const editArgs = buildEditArgs(entityType, targetId, sourceEntity);
+      if (Object.keys(editArgs).length > 1) {
+        try {
+          await targetClient.callTool(config.editTool, editArgs);
+        } catch (error) {
+          log('Protokoll: Entity sync edit failed; continuing with best effort', {
+            targetServerId,
+            entityType,
+            targetId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      const muteKeyByUri = `${targetServerId}:${buildEntityUri(entityType, targetId)}`;
+      const muteKeyByName = `${targetServerId}:${entityType}:${sourceName.toLowerCase()}`;
+      const muteUntil = Date.now() + ENTITY_SYNC_MUTE_MS;
+      mutedEntityNotifications.set(muteKeyByUri, muteUntil);
+      mutedEntityNotifications.set(muteKeyByName, muteUntil);
+    };
+
+    const withEntitySyncLock = async (task: () => Promise<void>): Promise<void> => {
+      if (entitySyncInFlight) {
+        return;
+      }
+      entitySyncInFlight = true;
+      try {
+        await task();
+      } finally {
+        entitySyncInFlight = false;
+      }
+    };
+
+    const propagateEntityToPeers = async (
+      sourceServerId: string,
+      entityType: SyncEntityType,
+      sourceEntity: Record<string, unknown>
+    ): Promise<void> => {
+      const targets = Array.from(connectedServerClients.entries()).filter(([serverId]) => serverId !== sourceServerId);
+      await Promise.all(targets.map(async ([targetServerId, targetClient]) => {
+        await upsertEntityOnTarget(targetServerId, targetClient, entityType, sourceEntity);
+      }));
+    };
+
+    maybeSyncAllEntitiesAcrossPeers = async (reason: string): Promise<void> => {
+      const connectedEntries = Array.from(connectedServerClients.entries());
+      if (connectedEntries.length < 2) {
+        return;
+      }
+      await withEntitySyncLock(async () => {
+        log('Protokoll: Running peer context sync', { reason, servers: connectedEntries.length });
+        for (const [sourceServerId, sourceClient] of connectedEntries) {
+          for (const entityType of Object.keys(ENTITY_SYNC_CONFIG) as SyncEntityType[]) {
+            const sourceEntities = await fetchEntityList(sourceClient, entityType);
+            for (const sourceEntity of sourceEntities) {
+              await propagateEntityToPeers(sourceServerId, entityType, sourceEntity);
+            }
+          }
+        }
+      });
+      scheduleNotificationRefresh({ entities: true });
+    };
+
+    registerEntitySyncHandlers = (serverId: string, client: McpClient): void => {
+      const existingDisposers = entityNotificationDisposers.get(serverId);
+      if (existingDisposers) {
+        for (const dispose of existingDisposers) {
+          dispose();
+        }
+      }
+
+      const disposers: Array<() => void> = [];
+      disposers.push(client.onNotification('notifications/resource_changed', async (data: unknown) => {
+        const params = data as { uri?: string };
+        const uri = params.uri;
+        if (!uri || !uri.startsWith('protokoll://entity/')) {
+          return;
+        }
+
+        const now = Date.now();
+        const muteKeyByUri = `${serverId}:${uri}`;
+        const mutedByUriUntil = mutedEntityNotifications.get(muteKeyByUri);
+        if (mutedByUriUntil && mutedByUriUntil > now) {
+          return;
+        }
+
+        const parsedUri = parseEntityUri(uri);
+        if (!parsedUri) {
+          return;
+        }
+
+        try {
+          const content = await client.readResource(uri);
+          const sourceEntity = parseEntityPayload(content.text);
+          if (!sourceEntity) {
+            return;
+          }
+
+          const sourceName = normalizeEntityName(sourceEntity);
+          if (sourceName) {
+            const muteKeyByName = `${serverId}:${parsedUri.entityType}:${sourceName.toLowerCase()}`;
+            const mutedByNameUntil = mutedEntityNotifications.get(muteKeyByName);
+            if (mutedByNameUntil && mutedByNameUntil > now) {
+              return;
+            }
+          }
+
+          await withEntitySyncLock(async () => {
+            await propagateEntityToPeers(serverId, parsedUri.entityType, sourceEntity);
+          });
+          scheduleNotificationRefresh({ entities: true });
+        } catch (error) {
+          log('Protokoll: Failed to propagate entity notification to peers', {
+            serverId,
+            uri,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }));
+
+      disposers.push(client.onSessionRecovered(async () => {
+        try {
+          await client.subscribeToResource('protokoll://transcripts');
+        } catch (error) {
+          log('Protokoll: Failed to re-subscribe transcripts on session recovery', {
+            serverId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }));
+
+      entityNotificationDisposers.set(serverId, disposers);
+    };
     
     // Check server health
     const isHealthy = await mcpClient.healthCheck();
     if (!isHealthy) {
-      serverConnections = [{
-        id: SINGLE_CONNECTION_ID,
-        name: 'Server',
-        url: serverUrl,
-        isConnected: false,
-        sessionId: null,
-      }];
+      if (activeServerId) {
+        updateConnection(activeServerId, { url: serverUrl, isConnected: false, sessionId: null });
+      }
       // If server is not healthy and user hasn't configured URL yet, we'll prompt them
       if (!hasConfiguredUrl) {
         shouldPromptForConfig = true;
@@ -290,13 +664,17 @@ export async function activate(context: vscode.ExtensionContext) {
       try {
         await mcpClient.initialize();
         serverConnected = true;
-        serverConnections = [{
-          id: SINGLE_CONNECTION_ID,
-          name: 'Server',
-          url: serverUrl,
-          isConnected: true,
-          sessionId: mcpClient?.getSessionId() ?? null,
-        }];
+        if (activeServerId && mcpClient) {
+          connectedServerClients.set(activeServerId, mcpClient);
+        }
+        if (activeServerId && mcpClient) {
+          updateConnection(activeServerId, {
+            url: serverUrl,
+            isConnected: true,
+            sessionId: mcpClient?.getSessionId() ?? null,
+          });
+          registerEntitySyncHandlers(activeServerId, mcpClient);
+        }
         vscode.window.showInformationMessage(`Protokoll: Connected to ${serverUrl}`);
         
         // Note: connectionStatusViewProvider is not yet initialized at this point
@@ -478,6 +856,7 @@ export async function activate(context: vscode.ExtensionContext) {
   transcriptsViewProvider = new TranscriptsViewProvider(context);
   if (mcpClient) {
     transcriptsViewProvider.setClient(mcpClient);
+    syncTranscriptsProviderClients();
     // Don't refresh here - wait for view to be revealed to avoid unnecessary API calls
     log('Protokoll: Transcripts view provider initialized with MCP client');
   } else {
@@ -528,6 +907,10 @@ export async function activate(context: vscode.ExtensionContext) {
     connectionStatusViewProvider.setConnectionStatus(serverConnected, mcpClient.getSessionId());
   } else {
     connectionStatusViewProvider.setServerUrl(serverUrl);
+  }
+  void refreshServerApiKeyState();
+  if (serverConnections.length > 1) {
+    void connectAdditionalServers();
   }
 
   // Create chatViewProvider BEFORE setting it on transcriptDetailViewProvider
@@ -933,45 +1316,166 @@ export async function activate(context: vscode.ExtensionContext) {
       return;
     }
     connectionStatusViewProvider.setConnections(serverConnections, activeServerId);
-    const active = serverConnections[0];
+    const active = serverConnections.find((connection) => connection.id === activeServerId) ?? serverConnections[0];
     if (active) {
       connectionStatusViewProvider.setServerUrl(active.url);
       connectionStatusViewProvider.setConnectionStatus(active.isConnected ?? false, active.sessionId ?? null);
     }
   };
 
-  const setSingleConnection = (url: string, isConnected: boolean, sessionId: string | null): void => {
-    serverConnections = [{
-      id: SINGLE_CONNECTION_ID,
-      name: 'Server',
-      url,
-      isConnected,
-      sessionId,
-    }];
-    activeServerId = SINGLE_CONNECTION_ID;
-  };
+  function updateConnection(serverId: string, updates: Partial<ServerConnectionEntry>): void {
+    serverConnections = serverConnections.map((connection) => connection.id === serverId
+      ? { ...connection, ...updates }
+      : connection);
+  }
+
+  function getConnectionById(serverId: string): ServerConnectionEntry | undefined {
+    return serverConnections.find((connection) => connection.id === serverId);
+  }
+
+  function getClientForServer(serverId: string | null | undefined): McpClient | null {
+    if (!serverId) {
+      return mcpClient;
+    }
+    const mapped = connectedServerClients.get(serverId);
+    if (mapped) {
+      return mapped;
+    }
+    if (activeServerId === serverId && mcpClient) {
+      return mcpClient;
+    }
+    return null;
+  }
+
+  async function activateServerContext(serverId: string): Promise<McpClient | null> {
+    const client = getClientForServer(serverId);
+    if (!client) {
+      return null;
+    }
+    activeServerId = serverId;
+    mcpClient = client;
+    applyClientToProviders(client);
+    await profilesStore.saveActiveServerId(serverId);
+    syncConnectionStatusView();
+    syncTranscriptsProviderClients();
+    return client;
+  }
+
+  async function getClientForTranscript(transcript: Transcript): Promise<McpClient | null> {
+    const transcriptServerId = transcript.serverId ?? activeServerId;
+    if (!transcriptServerId) {
+      return mcpClient;
+    }
+    return activateServerContext(transcriptServerId);
+  }
+
+  async function refreshServerApiKeyState(): Promise<void> {
+    await Promise.all(serverConnections.map(async (connection) => {
+      const hasApiKey = !!(await getConfiguredApiKey(context, connection.id));
+      updateConnection(connection.id, { hasApiKey });
+    }));
+    syncConnectionStatusView();
+  }
+
+  async function persistProfilesFromConnections(): Promise<void> {
+    const existingProfiles = profiles;
+    const profileMap = new Map(existingProfiles.map((profile) => [profile.id, profile]));
+    const updatedProfiles: ServerProfile[] = serverConnections.map((connection, index) => {
+      const existing = profileMap.get(connection.id);
+      const now = new Date().toISOString();
+      return {
+        id: connection.id,
+        name: connection.name || `Server ${index + 1}`,
+        url: normalizeServerUrl(connection.url),
+        enabled: existing?.enabled ?? true,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      };
+    });
+    await profilesStore.saveProfiles(updatedProfiles);
+  }
+
+  async function connectAdditionalServers(): Promise<void> {
+    const targets = serverConnections.filter((connection) => connection.id !== activeServerId);
+    const failedConnections: string[] = [];
+    await Promise.all(targets.map(async (connection) => {
+      try {
+        const client = new McpClient(connection.url, {
+          apiKey: await getConfiguredApiKey(context, connection.id),
+        });
+        const healthy = await client.healthCheck();
+        if (!healthy) {
+          updateConnection(connection.id, {
+            isConnected: false,
+            sessionId: null,
+            lastError: `Server at ${connection.url} is not responding`,
+          });
+          failedConnections.push(connection.name);
+          client.dispose();
+          return;
+        }
+        await client.initialize();
+        connectedServerClients.set(connection.id, client);
+        registerEntitySyncHandlers(connection.id, client);
+        updateConnection(connection.id, { isConnected: true, sessionId: client.getSessionId(), lastError: undefined });
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        log('Protokoll: Failed to connect additional server', {
+          serverId: connection.id,
+          error: errorMessage,
+        });
+        updateConnection(connection.id, { isConnected: false, sessionId: null, lastError: errorMessage });
+        failedConnections.push(connection.name);
+      }
+    }));
+    syncConnectionStatusView();
+    syncTranscriptsProviderClients();
+    await maybeSyncAllEntitiesAcrossPeers('connect-additional-servers');
+    if (failedConnections.length > 0) {
+      const action = await vscode.window.showWarningMessage(
+        `Protokoll: ${failedConnections.length} server connection${failedConnections.length === 1 ? '' : 's'} failed (${failedConnections.join(', ')}).`,
+        'Open Connection Status'
+      );
+      if (action === 'Open Connection Status') {
+        await vscode.commands.executeCommand('protokollConnectionStatus.focus');
+      }
+    }
+  }
 
   const connectToActiveServer = async (showSuccessMessage: boolean, updateConfig: boolean = true): Promise<void> => {
-    const cleanUrl = normalizeServerUrl(config.get<string>('serverUrl', 'http://127.0.0.1:3002') || 'http://127.0.0.1:3002');
+    const active = serverConnections.find((connection) => connection.id === activeServerId) ?? serverConnections[0];
+    if (!active) {
+      return;
+    }
+
+    const cleanUrl = normalizeServerUrl(active.url);
     if (updateConfig) {
       await config.update('serverUrl', cleanUrl, true);
     }
     await context.globalState.update('protokoll.hasConfiguredUrl', true);
 
     const previousClient = mcpClient;
+    const previousClientServerId = previousClient
+      ? Array.from(connectedServerClients.entries()).find(([, client]) => client === previousClient)?.[0] ?? null
+      : null;
     try {
-      const newClient = new McpClient(cleanUrl, { apiKey: await getConfiguredApiKey(context) });
+      const newClient = new McpClient(cleanUrl, { apiKey: await getConfiguredApiKey(context, active.id) });
       clearServerModeCache();
       const isHealthy = await newClient.healthCheck();
+      const replacedClient = connectedServerClients.get(active.id);
       mcpClient = newClient;
+      connectedServerClients.set(active.id, newClient);
       applyClientToProviders(newClient);
       startTranscriptsPoll();
 
       if (isHealthy) {
         await newClient.initialize();
+        registerEntitySyncHandlers(active.id, newClient);
         const sessionId = newClient.getSessionId();
-        setSingleConnection(cleanUrl, true, sessionId);
+        updateConnection(active.id, { isConnected: true, sessionId, url: cleanUrl, lastError: undefined });
         syncConnectionStatusView();
+        syncTranscriptsProviderClients();
+        await maybeSyncAllEntitiesAcrossPeers('connect-active-server');
         if (transcriptsViewProvider) {
           await transcriptsViewProvider.refresh();
         }
@@ -979,19 +1483,38 @@ export async function activate(context: vscode.ExtensionContext) {
           vscode.window.showInformationMessage(`Protokoll: Connected to ${cleanUrl}`);
         }
       } else {
-        setSingleConnection(cleanUrl, false, null);
+        updateConnection(active.id, {
+          isConnected: false,
+          sessionId: null,
+          url: cleanUrl,
+          lastError: `Server at ${cleanUrl} is not responding`,
+        });
         syncConnectionStatusView();
+        syncTranscriptsProviderClients();
         vscode.window.showWarningMessage(`Protokoll: Server at ${cleanUrl} is not responding`);
       }
 
-      if (previousClient && previousClient !== newClient) {
+      if (replacedClient && replacedClient !== newClient && replacedClient !== previousClient) {
+        replacedClient.dispose();
+      }
+      if (previousClient && previousClient !== newClient && previousClientServerId === active.id) {
         previousClient.dispose();
       }
     } catch (error) {
-      setSingleConnection(cleanUrl, false, null);
+      connectedServerClients.delete(active.id);
+      const notificationDisposers = entityNotificationDisposers.get(active.id);
+      if (notificationDisposers) {
+        for (const dispose of notificationDisposers) {
+          dispose();
+        }
+        entityNotificationDisposers.delete(active.id);
+      }
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      updateConnection(active.id, { isConnected: false, sessionId: null, url: cleanUrl, lastError: errorMessage });
       syncConnectionStatusView();
+      syncTranscriptsProviderClients();
       vscode.window.showErrorMessage(
-        `Protokoll: Failed to connect: ${error instanceof Error ? error.message : String(error)}`
+        `Protokoll: Failed to connect: ${errorMessage}`
       );
     }
   };
@@ -999,8 +1522,8 @@ export async function activate(context: vscode.ExtensionContext) {
   const configureServerCommand = vscode.commands.registerCommand(
     'protokoll.configureServer',
     async () => {
-      const config = getProtokollConfiguration();
-      const currentUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3002');
+      const active = serverConnections.find((connection) => connection.id === activeServerId) ?? serverConnections[0];
+      const currentUrl = active?.url || config.get<string>('serverUrl', 'http://127.0.0.1:3002');
       
       const input = await vscode.window.showInputBox({
         prompt: 'Enter the Protokoll HTTP MCP server URL',
@@ -1022,19 +1545,51 @@ export async function activate(context: vscode.ExtensionContext) {
       if (input) {
         const cleanUrl = normalizeServerUrl(input);
         await config.update('serverUrl', cleanUrl, true);
-        setSingleConnection(cleanUrl, false, null);
+        if (active) {
+          updateConnection(active.id, { url: cleanUrl, isConnected: false, sessionId: null });
+          await profilesStore.saveActiveServerId(active.id);
+        }
+        await persistProfilesFromConnections();
         syncConnectionStatusView();
         await connectToActiveServer(true, false);
       }
     }
   );
 
+  const resolveServerProfileId = async (serverId?: string): Promise<string | null> => {
+    if (serverId && getConnectionById(serverId)) {
+      return serverId;
+    }
+    if (serverConnections.length === 0) {
+      return activeServerId ?? DEFAULT_SERVER_PROFILE_ID;
+    }
+    if (serverConnections.length === 1) {
+      return serverConnections[0].id;
+    }
+    const selected = await vscode.window.showQuickPick(
+      serverConnections.map((connection) => ({
+        label: connection.name,
+        description: connection.url,
+        detail: connection.hasApiKey ? 'Token configured' : 'No token configured',
+        id: connection.id,
+      })),
+      { placeHolder: 'Select server profile' }
+    );
+    return selected?.id ?? null;
+  };
+
   const configureApiKeyCommand = vscode.commands.registerCommand(
     'protokoll.configureApiKey',
-    async () => {
-      const currentValue = await getConfiguredApiKey(context);
+    async (serverId?: string) => {
+      const profileId = await resolveServerProfileId(serverId);
+      if (!profileId) {
+        return;
+      }
+
+      const connection = getConnectionById(profileId);
+      const currentValue = await getConfiguredApiKey(context, profileId);
       const input = await vscode.window.showInputBox({
-        prompt: 'Enter API key for secured Protokoll servers',
+        prompt: `Enter API key for ${connection?.name || 'selected server'}`,
         password: true,
         ignoreFocusOut: true,
         value: currentValue || '',
@@ -1046,38 +1601,344 @@ export async function activate(context: vscode.ExtensionContext) {
       }
 
       const trimmedValue = input.trim();
+      const secretKey = getApiKeySecretStorageKey(profileId);
       if (trimmedValue.length === 0) {
-        await context.secrets.delete(API_KEY_SECRET_STORAGE_KEY);
-        vscode.window.showInformationMessage('Protokoll: API key cleared from secure secret storage.');
+        await context.secrets.delete(secretKey);
+        updateConnection(profileId, { hasApiKey: false });
+        syncConnectionStatusView();
+        vscode.window.showInformationMessage(`Protokoll: API key cleared for ${connection?.name || profileId}.`);
         return;
       }
 
-      await context.secrets.store(API_KEY_SECRET_STORAGE_KEY, trimmedValue);
-      vscode.window.showInformationMessage('Protokoll: API key saved to secure secret storage.');
+      await context.secrets.store(secretKey, trimmedValue);
+      updateConnection(profileId, { hasApiKey: true });
+      syncConnectionStatusView();
+      vscode.window.showInformationMessage(`Protokoll: API key saved for ${connection?.name || profileId}.`);
     }
   );
 
   const clearApiKeyCommand = vscode.commands.registerCommand(
     'protokoll.clearApiKey',
-    async () => {
-      await context.secrets.delete(API_KEY_SECRET_STORAGE_KEY);
-      vscode.window.showInformationMessage('Protokoll: API key cleared from secure secret storage.');
+    async (serverId?: string) => {
+      const profileId = await resolveServerProfileId(serverId);
+      if (!profileId) {
+        return;
+      }
+      const connection = getConnectionById(profileId);
+      await context.secrets.delete(getApiKeySecretStorageKey(profileId));
+      updateConnection(profileId, { hasApiKey: false });
+      syncConnectionStatusView();
+      vscode.window.showInformationMessage(`Protokoll: API key cleared for ${connection?.name || profileId}.`);
     }
   );
 
   const addServerConnectionCommand = vscode.commands.registerCommand(
     'protokoll.addServerConnection',
     async () => {
-      // Single-connection model: this command now routes to "configure server".
-      await vscode.commands.executeCommand('protokoll.configureServer');
+      const name = await vscode.window.showInputBox({
+        prompt: 'Enter a name for the server profile',
+        placeHolder: 'Work Server',
+        validateInput: (value) => !value || !value.trim() ? 'Profile name cannot be empty' : null,
+      });
+      if (!name) {
+        return;
+      }
+
+      const url = await vscode.window.showInputBox({
+        prompt: 'Enter the Protokoll HTTP MCP server URL',
+        placeHolder: 'http://127.0.0.1:3002',
+        validateInput: (value) => {
+          if (!value || value.trim() === '') {
+            return 'Server URL cannot be empty';
+          }
+          try {
+            new URL(value);
+            return null;
+          } catch {
+            return 'Invalid URL format';
+          }
+        },
+      });
+      if (!url) {
+        return;
+      }
+
+      const id = `server-${Date.now().toString(36)}`;
+      const cleanUrl = normalizeServerUrl(url);
+      serverConnections.push({
+        id,
+        name: name.trim(),
+        url: cleanUrl,
+        isConnected: false,
+        hasApiKey: false,
+        sessionId: null,
+      });
+      activeServerId = id;
+      await profilesStore.saveActiveServerId(id);
+      await persistProfilesFromConnections();
+      syncConnectionStatusView();
+      await connectToActiveServer(true, true);
     }
   );
 
   const switchServerConnectionCommand = vscode.commands.registerCommand(
     'protokoll.switchServerConnection',
+    async (targetServerId?: string) => {
+      if (serverConnections.length === 0) {
+        vscode.window.showWarningMessage('Protokoll: No server profiles found. Add or configure a server connection first.');
+        return;
+      }
+      let nextServerId = targetServerId;
+      if (!nextServerId) {
+        const selected = await vscode.window.showQuickPick(
+          serverConnections.map((connection) => ({
+            label: connection.name,
+            description: connection.url,
+            id: connection.id,
+          })),
+          { placeHolder: 'Select active server connection' }
+        );
+        nextServerId = selected?.id;
+      }
+      if (!nextServerId) {
+        return;
+      }
+      activeServerId = nextServerId;
+      await profilesStore.saveActiveServerId(nextServerId);
+      syncConnectionStatusView();
+      const existingClient = getClientForServer(nextServerId);
+      const connection = getConnectionById(nextServerId);
+      if (existingClient && connection?.isConnected) {
+        mcpClient = existingClient;
+        applyClientToProviders(existingClient);
+        syncTranscriptsProviderClients();
+        if (transcriptsViewProvider) {
+          await transcriptsViewProvider.refresh();
+        }
+      } else {
+        await connectToActiveServer(true, false);
+      }
+    }
+  );
+
+  const removeServerConnectionCommand = vscode.commands.registerCommand(
+    'protokoll.removeServerConnection',
+    async (serverId?: string) => {
+      if (serverConnections.length <= 1) {
+        vscode.window.showWarningMessage('Protokoll: At least one server profile must remain.');
+        return;
+      }
+
+      let target = serverId ? getConnectionById(serverId) : undefined;
+      if (!target) {
+        const selected = await vscode.window.showQuickPick(
+          serverConnections.map((connection) => ({
+            label: connection.name,
+            description: connection.url,
+            id: connection.id,
+          })),
+          { placeHolder: 'Select server profile to remove' }
+        );
+        if (!selected) {
+          return;
+        }
+        target = getConnectionById(selected.id);
+      }
+      if (!target) {
+        return;
+      }
+
+      const choice = await vscode.window.showWarningMessage(
+        `Delete server profile "${target.name}"? This cannot be undone.`,
+        { modal: true },
+        'Delete Profile',
+        'Delete Profile + Token',
+        'Cancel'
+      );
+      if (!choice || choice === 'Cancel') {
+        return;
+      }
+
+      serverConnections = serverConnections.filter((connection) => connection.id !== target.id);
+      const removedClient = connectedServerClients.get(target.id);
+      if (removedClient) {
+        removedClient.dispose();
+        connectedServerClients.delete(target.id);
+      }
+      const notificationDisposers = entityNotificationDisposers.get(target.id);
+      if (notificationDisposers) {
+        for (const dispose of notificationDisposers) {
+          dispose();
+        }
+        entityNotificationDisposers.delete(target.id);
+      }
+
+      if (choice === 'Delete Profile + Token') {
+        await context.secrets.delete(getApiKeySecretStorageKey(target.id));
+      }
+
+      if (activeServerId === target.id) {
+        activeServerId = serverConnections[0]?.id ?? null;
+        await profilesStore.saveActiveServerId(activeServerId);
+        if (activeServerId) {
+          await connectToActiveServer(false, false);
+        }
+      }
+
+      await persistProfilesFromConnections();
+      syncConnectionStatusView();
+      syncTranscriptsProviderClients();
+      vscode.window.showInformationMessage(`Protokoll: Removed server profile "${target.name}".`);
+    }
+  );
+
+  const openServerManagerCommand = vscode.commands.registerCommand(
+    'protokoll.openServerManager',
     async () => {
-      // Single-connection model: reconnect the configured server.
-      await connectToActiveServer(true, false);
+      const items: Array<vscode.QuickPickItem & { id: string }> = [
+        {
+          label: '$(add) Add server profile',
+          description: 'Create a new server profile',
+          id: '__add__',
+        },
+        ...serverConnections.map((connection) => {
+          const badges = [
+            connection.id === activeServerId ? 'active' : undefined,
+            connection.isConnected ? 'connected' : 'disconnected',
+            connection.hasApiKey ? 'token set' : 'no token',
+          ].filter((value): value is string => !!value);
+          return {
+            label: connection.name,
+            description: connection.url,
+            detail: badges.join(' - '),
+            id: connection.id,
+          };
+        }),
+      ];
+
+      const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Manage server profiles and API tokens',
+        title: 'Protokoll Server Manager',
+      });
+      if (!selected) {
+        return;
+      }
+
+      if (selected.id === '__add__') {
+        await vscode.commands.executeCommand('protokoll.addServerConnection');
+        return;
+      }
+
+      const connection = getConnectionById(selected.id);
+      if (!connection) {
+        return;
+      }
+
+      const actions: string[] = [
+        'Switch Active Server',
+        'Configure API Token',
+        'Edit Server URL',
+        'Show Details',
+      ];
+      if (connection.hasApiKey) {
+        actions.push('Clear API Token');
+      }
+      if (serverConnections.length > 1) {
+        actions.push('Remove Server');
+      }
+
+      const action = await vscode.window.showQuickPick(actions, {
+        placeHolder: `Manage "${connection.name}"`,
+      });
+      if (!action) {
+        return;
+      }
+
+      if (action === 'Switch Active Server') {
+        await vscode.commands.executeCommand('protokoll.switchServerConnection', connection.id);
+      } else if (action === 'Configure API Token') {
+        await vscode.commands.executeCommand('protokoll.configureApiKey', connection.id);
+      } else if (action === 'Clear API Token') {
+        await vscode.commands.executeCommand('protokoll.clearApiKey', connection.id);
+      } else if (action === 'Edit Server URL') {
+        await vscode.commands.executeCommand('protokoll.switchServerConnection', connection.id);
+        await vscode.commands.executeCommand('protokoll.configureServer');
+      } else if (action === 'Remove Server') {
+        await vscode.commands.executeCommand('protokoll.removeServerConnection', connection.id);
+      } else if (action === 'Show Details') {
+        await vscode.commands.executeCommand('protokoll.showServerConnectionDetails', connection.id);
+      }
+    }
+  );
+
+  const showServerConnectionDetailsCommand = vscode.commands.registerCommand(
+    'protokoll.showServerConnectionDetails',
+    async (serverId?: string) => {
+      if (serverConnections.length === 0) {
+        vscode.window.showWarningMessage('Protokoll: No server profiles found. Add or configure a server connection first.');
+        return;
+      }
+
+      let resolvedServerId = serverId;
+      if (!resolvedServerId) {
+        if (serverConnections.length === 1) {
+          resolvedServerId = serverConnections[0].id;
+        } else {
+          const selected = await vscode.window.showQuickPick(
+            serverConnections.map((entry) => ({
+              label: entry.name,
+              description: entry.url,
+              detail: entry.isConnected ? 'Connected' : (entry.lastError || 'Disconnected'),
+              id: entry.id,
+            })),
+            { placeHolder: 'Select server profile to view details' }
+          );
+          resolvedServerId = selected?.id;
+        }
+      }
+
+      if (!resolvedServerId) {
+        // User cancelled quick pick
+        return;
+      }
+      const connection = getConnectionById(resolvedServerId);
+      if (!connection) {
+        vscode.window.showWarningMessage('Protokoll: Selected server profile was not found.');
+        return;
+      }
+      const lines = [
+        `Server: ${connection.name}`,
+        `URL: ${connection.url}`,
+        `Status: ${connection.isConnected ? 'Connected' : 'Disconnected'}`,
+      ];
+      if (connection.sessionId) {
+        lines.push(`Session ID: ${connection.sessionId}`);
+      }
+      if (connection.lastError) {
+        lines.push(`Last Error: ${connection.lastError}`);
+      }
+      lines.push(`API Token: ${connection.hasApiKey ? 'Configured (secret storage)' : 'Not configured'}`);
+      const message = lines.join('\n');
+      const actions: string[] = ['Switch to this Server', 'Configure Token'];
+      if (connection.hasApiKey) {
+        actions.push('Clear Token');
+      }
+      if (connection.lastError) {
+        actions.push('Reconnect');
+      }
+      const action = await vscode.window.showInformationMessage(message, ...actions);
+      if (action === 'Switch to this Server') {
+        await vscode.commands.executeCommand('protokoll.switchServerConnection', connection.id);
+      }
+      if (action === 'Configure Token') {
+        await vscode.commands.executeCommand('protokoll.configureApiKey', connection.id);
+      }
+      if (action === 'Clear Token') {
+        await vscode.commands.executeCommand('protokoll.clearApiKey', connection.id);
+      }
+      if (action === 'Reconnect') {
+        await vscode.commands.executeCommand('protokoll.switchServerConnection', connection.id);
+      }
     }
   );
 
@@ -1087,6 +1948,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (!transcriptDetailViewProvider) {
         return;
       }
+      await getClientForTranscript(transcript);
       await transcriptDetailViewProvider.showTranscript(uri, transcript);
     }
   );
@@ -1097,6 +1959,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (!transcriptDetailViewProvider) {
         return;
       }
+      await getClientForTranscript(transcript);
       await transcriptDetailViewProvider.showTranscript(uri, transcript, vscode.ViewColumn.Beside, true);
     }
   );
@@ -1108,6 +1971,28 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
       await transcriptsViewProvider.refresh();
+    }
+  );
+
+  const syncContextAcrossServersCommand = vscode.commands.registerCommand(
+    'protokoll.syncContextAcrossServers',
+    async () => {
+      const connectedCount = serverConnections.filter((connection) => connection.isConnected).length;
+      if (connectedCount < 2) {
+        vscode.window.showWarningMessage('Protokoll: Connect at least two servers to sync context entities.');
+        return;
+      }
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Protokoll: Syncing context entities across servers...',
+          cancellable: false,
+        },
+        async () => {
+          await maybeSyncAllEntitiesAcrossPeers('manual-command');
+        }
+      );
+      vscode.window.showInformationMessage('Protokoll: Context entity sync complete.');
     }
   );
 
@@ -1542,6 +2427,44 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  const filterByServerCommand = vscode.commands.registerCommand(
+    'protokoll.filterByServer',
+    async () => {
+      if (!transcriptsViewProvider) {
+        vscode.window.showErrorMessage('Transcripts view provider not initialized.');
+        return;
+      }
+
+      const availableServers = transcriptsViewProvider.getAvailableServers();
+      if (availableServers.length === 0) {
+        vscode.window.showWarningMessage('No connected servers available.');
+        return;
+      }
+
+      const currentFilters = transcriptsViewProvider.getServerFilters();
+      const items: Array<vscode.QuickPickItem & { id: string }> = availableServers.map((server) => ({
+        label: server.name,
+        description: server.id,
+        picked: currentFilters.has(server.id),
+        id: server.id,
+      }));
+
+      const selected = await vscode.window.showQuickPick(items, {
+        canPickMany: true,
+        placeHolder: 'Select servers to show (none selected = all servers)',
+        title: 'Filter transcripts by server',
+      });
+
+      if (selected !== undefined) {
+        transcriptsViewProvider.setServerFilters(new Set(selected.map((item) => item.id)));
+        const message = selected.length === 0
+          ? 'Showing transcripts from all servers'
+          : `Showing transcripts from ${selected.length} server${selected.length === 1 ? '' : 's'}`;
+        vscode.window.showInformationMessage(`Protokoll: ${message}`);
+      }
+    }
+  );
+
   const applyProjectFilterCommand = vscode.commands.registerCommand(
     'protokoll.applyProjectFilter',
     (projectId: string | null) => {
@@ -1694,13 +2617,13 @@ export async function activate(context: vscode.ExtensionContext) {
   const renameTranscriptCommand = vscode.commands.registerCommand(
     'protokoll.renameTranscript',
     async (item: TranscriptItem) => {
-      if (!mcpClient) {
-        vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
-        return;
-      }
-
       if (!item || !item.transcript) {
         vscode.window.showErrorMessage('No transcript selected for renaming.');
+        return;
+      }
+      const transcriptClient = await getClientForTranscript(item.transcript);
+      if (!transcriptClient) {
+        vscode.window.showErrorMessage('Transcript server is not connected.');
         return;
       }
 
@@ -1725,7 +2648,7 @@ export async function activate(context: vscode.ExtensionContext) {
         const transcriptRef = resolveTranscriptToolRef(item.transcript);
         
         // Call the edit transcript tool
-        await mcpClient.callTool('protokoll_edit_transcript', {
+        await transcriptClient.callTool('protokoll_edit_transcript', {
           transcriptPath: transcriptRef,
           title: newTitle.trim(),
         });
@@ -1744,6 +2667,167 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  const transferTranscriptCommand = vscode.commands.registerCommand(
+    'protokoll.transferTranscript',
+    async (item?: TranscriptItem) => {
+      if (!transcriptsViewProvider) {
+        vscode.window.showErrorMessage('Transcripts view provider not initialized.');
+        return;
+      }
+
+      const selectedItems = transcriptsViewProvider.getSelectedItems();
+      const targetItems = selectedItems.length > 0
+        ? selectedItems
+        : (item?.transcript ? [item] : []);
+
+      if (targetItems.length === 0) {
+        vscode.window.showErrorMessage('No transcript selected.');
+        return;
+      }
+
+      if (targetItems.length > 1) {
+        vscode.window.showWarningMessage('Please transfer one transcript at a time in this version.');
+        return;
+      }
+
+      const sourceTranscript = targetItems[0].transcript;
+      if (!sourceTranscript) {
+        return;
+      }
+      const sourceServerId = sourceTranscript.serverId ?? activeServerId;
+      if (!sourceServerId) {
+        vscode.window.showErrorMessage('Unable to determine source server for selected transcript.');
+        return;
+      }
+      const sourceClient = connectedServerClients.get(sourceServerId) ?? (activeServerId === sourceServerId ? mcpClient : null);
+      if (!sourceClient) {
+        vscode.window.showErrorMessage('Source server is not connected.');
+        return;
+      }
+
+      const targetServers = serverConnections.filter((connection) => connection.id !== sourceServerId && connection.isConnected);
+      if (targetServers.length === 0) {
+        vscode.window.showWarningMessage('No connected target servers available.');
+        return;
+      }
+
+      const selectedTarget = await vscode.window.showQuickPick(
+        targetServers.map((connection) => ({
+          label: connection.name,
+          description: connection.url,
+          id: connection.id,
+        })),
+        { placeHolder: 'Select target server for transfer' }
+      );
+      if (!selectedTarget) {
+        return;
+      }
+
+      const targetClient = connectedServerClients.get(selectedTarget.id);
+      if (!targetClient) {
+        vscode.window.showErrorMessage('Target server is not connected.');
+        return;
+      }
+
+      const transferModePick = await vscode.window.showQuickPick(
+        [
+          { label: 'Move', description: 'Copy then delete from source', mode: 'move' as const },
+          { label: 'Copy', description: 'Keep source transcript', mode: 'copy' as const },
+        ],
+        {
+          placeHolder: 'Select transfer mode',
+          title: 'Transfer Transcript',
+          ignoreFocusOut: true,
+        }
+      );
+      const transferMode = transferModePick?.mode ?? 'move';
+
+      try {
+        const transcriptContent = await sourceClient.readTranscript(sourceTranscript.uri);
+        const currentTitle = transcriptContent.title?.trim() || sourceTranscript.title || sourceTranscript.filename;
+        const resolveTransferDate = (...candidates: Array<string | undefined>): string | undefined => {
+          for (const candidate of candidates) {
+            if (!candidate || candidate.trim().length === 0) {
+              continue;
+            }
+            const trimmed = candidate.trim();
+            const isoDateMatch = trimmed.match(/^(\d{4}-\d{2}-\d{2})/);
+            if (isoDateMatch) {
+              return isoDateMatch[1];
+            }
+
+            const parsed = new Date(trimmed);
+            if (!isNaN(parsed.getTime())) {
+              const year = parsed.getFullYear();
+              const month = String(parsed.getMonth() + 1).padStart(2, '0');
+              const day = String(parsed.getDate()).padStart(2, '0');
+              return `${year}-${month}-${day}`;
+            }
+          }
+          return undefined;
+        };
+        const transferDate = resolveTransferDate(
+          transcriptContent.metadata?.date,
+          sourceTranscript.date,
+          sourceTranscript.createdAt
+        );
+
+        let targetTitle = currentTitle;
+        const targetList = await targetClient.listTranscripts({ limit: 200, offset: 0 });
+        const duplicate = targetList.transcripts.find((transcript) => (transcript.title || transcript.filename) === currentTitle);
+        if (duplicate) {
+          const duplicateChoice = await vscode.window.showQuickPick(
+            [
+              { label: 'Overwrite', action: 'overwrite' as const },
+              { label: 'Rename', action: 'rename' as const },
+              { label: 'Skip', action: 'skip' as const },
+            ],
+            { placeHolder: `Duplicate "${currentTitle}" found on target server.` }
+          );
+          if (!duplicateChoice || duplicateChoice.action === 'skip') {
+            vscode.window.showInformationMessage('Protokoll: Transfer skipped.');
+            return;
+          }
+          if (duplicateChoice.action === 'rename') {
+            targetTitle = `${currentTitle} (copied)`;
+          }
+          if (duplicateChoice.action === 'overwrite') {
+            targetTitle = currentTitle;
+          }
+        }
+
+        const createResult = await targetClient.callTool('protokoll_create_note', {
+          title: targetTitle,
+          content: transcriptContent.content,
+          projectId: transcriptContent.metadata?.projectId,
+          date: transferDate,
+        }) as { success?: boolean; message?: string };
+
+        if (!createResult?.success) {
+          vscode.window.showErrorMessage(`Failed to create transcript on target server: ${createResult?.message || 'Unknown error'}`);
+          return;
+        }
+
+        if (transferMode === 'move') {
+          const transcriptRef = resolveTranscriptToolRef(sourceTranscript);
+          await sourceClient.callTool('protokoll_edit_transcript', {
+            transcriptPath: transcriptRef,
+            status: 'deleted',
+          });
+        }
+
+        vscode.window.showInformationMessage(
+          `Protokoll: Transcript ${transferMode === 'move' ? 'moved' : 'copied'} to ${selectedTarget.label}.`
+        );
+        await transcriptsViewProvider.refresh();
+      } catch (error) {
+        vscode.window.showErrorMessage(
+          `Transfer failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+  );
+
   const moveToProjectCommand = vscode.commands.registerCommand(
     'protokoll.moveToProject',
     async (item: TranscriptItem) => {
@@ -1757,7 +2841,7 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      await moveTranscriptsToProject([item], mcpClient, transcriptsViewProvider);
+      await moveTranscriptsToProject([item], transcriptsViewProvider);
     }
   );
 
@@ -1780,17 +2864,47 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      await moveTranscriptsToProject(selectedItems, mcpClient, transcriptsViewProvider);
+      await moveTranscriptsToProject(selectedItems, transcriptsViewProvider);
     }
   );
 
   // Helper function to move transcripts to a project
   async function moveTranscriptsToProject(
     items: TranscriptItem[],
-    client: McpClient,
     provider: TranscriptsViewProvider | null
   ): Promise<void> {
     try {
+      const transcripts = items
+        .map((item) => item.transcript)
+        .filter((transcript): transcript is Transcript => !!transcript);
+      if (transcripts.length === 0) {
+        vscode.window.showWarningMessage('No transcripts selected.');
+        return;
+      }
+
+      const serverIds = new Set(
+        transcripts
+          .map((transcript) => transcript.serverId ?? activeServerId)
+          .filter((serverId): serverId is string => !!serverId && serverId.trim().length > 0)
+      );
+
+      if (serverIds.size > 1) {
+        vscode.window.showWarningMessage(
+          'Selected transcripts come from multiple servers. Please select transcripts from one server when moving to a project.'
+        );
+        return;
+      }
+
+      const targetServerId = Array.from(serverIds)[0] ?? activeServerId;
+      const client = getClientForServer(targetServerId);
+      if (!client) {
+        const targetName = targetServerId
+          ? (getConnectionById(targetServerId)?.name ?? targetServerId)
+          : 'selected server';
+        vscode.window.showErrorMessage(`Protokoll: Source server "${targetName}" is not connected.`);
+        return;
+      }
+
       // List available projects
       // Only pass contextDirectory if server is in local mode
       const shouldPass = await shouldPassContextDirectory(client);
@@ -1830,20 +2944,46 @@ export async function activate(context: vscode.ExtensionContext) {
         return; // User cancelled
       }
 
+      const resolveLocalProjectReference = async (): Promise<string> => {
+        try {
+          const refreshed = await client.callTool(
+            'protokoll_list_projects',
+            contextDirectory ? { contextDirectory } : {}
+          ) as {
+            projects?: Array<{ id: string; name: string; active?: boolean }>;
+          };
+          const refreshedProjects = (refreshed.projects || []).filter((p) => p.active !== false);
+          const byId = refreshedProjects.find((p) => p.id === selected.id);
+          if (byId) {
+            return byId.id;
+          }
+          const selectedName = selected.label.trim().toLowerCase();
+          const byName = refreshedProjects.find((p) => p.name.trim().toLowerCase() === selectedName);
+          if (byName) {
+            return byName.id;
+          }
+        } catch (error) {
+          log('Protokoll: Failed to refresh project list before move, falling back to selected project name', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        // In multi-server environments IDs may differ; server-side matching supports names.
+        return selected.label;
+      };
+
+      const projectReference = await resolveLocalProjectReference();
+
       // Move all selected transcripts
       const errors: string[] = [];
-      for (const item of items) {
-        if (!item.transcript) {
-          continue;
-        }
+      for (const transcript of transcripts) {
         try {
-          const transcriptRef = resolveTranscriptToolRef(item.transcript);
+          const transcriptRef = resolveTranscriptToolRef(transcript);
           await client.callTool('protokoll_edit_transcript', {
             transcriptPath: transcriptRef,
-            projectId: selected.id,
+            projectId: projectReference,
           });
         } catch (error) {
-          const transcriptName = item.transcript.title || item.transcript.filename;
+          const transcriptName = transcript.title || transcript.filename;
           errors.push(`${transcriptName}: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
@@ -2188,11 +3328,6 @@ export async function activate(context: vscode.ExtensionContext) {
     item: TranscriptItem | undefined,
     variant: 'original' | 'enhanced'
   ): Promise<void> => {
-    if (!mcpClient) {
-      vscode.window.showErrorMessage('MCP client not initialized. Please configure the server URL first.');
-      return;
-    }
-
     const targets = resolveCopyTargets(item);
     if (targets.length === 0) {
       vscode.window.showErrorMessage('No transcript selected.');
@@ -2205,7 +3340,11 @@ export async function activate(context: vscode.ExtensionContext) {
         if (!target.transcript?.uri) {
           continue;
         }
-        const transcript = await mcpClient.readTranscript(target.transcript.uri);
+        const targetClient = await getClientForTranscript(target.transcript);
+        if (!targetClient) {
+          continue;
+        }
+        const transcript = await targetClient.readTranscript(target.transcript.uri);
         blocks.push(buildTranscriptClipboardBlock(transcript, variant, target.transcript.status));
       }
 
@@ -2263,6 +3402,7 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
+      await getClientForTranscript(item.transcript);
       // Open transcript in the side column
       await transcriptDetailViewProvider.showTranscript(item.transcript.uri, item.transcript, vscode.ViewColumn.Beside);
     }
@@ -2534,14 +3674,18 @@ export async function activate(context: vscode.ExtensionContext) {
       if (!serverUrl) {
         return;
       }
-      setSingleConnection(serverUrl, false, null);
+      const active = serverConnections.find((connection) => connection.id === activeServerId) ?? serverConnections[0];
+      if (active) {
+        updateConnection(active.id, { url: serverUrl, isConnected: false, sessionId: null });
+        await persistProfilesFromConnections();
+      }
       syncConnectionStatusView();
       await connectToActiveServer(false, false);
     }
   });
 
   const secretWatcher = context.secrets.onDidChange(async (event) => {
-    if (event.key !== API_KEY_SECRET_STORAGE_KEY) {
+    if (!event.key.startsWith('protokoll.apiKey.server.')) {
       return;
     }
     await connectToActiveServer(false, false);
@@ -2603,6 +3747,78 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
 
+      // Resolve upload target server first so project listing and upload destination
+      // are both scoped to the same server.
+      let targetConnection = serverConnections.find((connection) => connection.id === activeServerId) ?? serverConnections[0];
+      if (!targetConnection) {
+        vscode.window.showErrorMessage('Protokoll: No server profiles configured.');
+        return;
+      }
+
+      if (serverConnections.length > 1) {
+        const selectedServer = await vscode.window.showQuickPick(
+          serverConnections.map((connection) => ({
+            label: connection.name,
+            description: connection.url,
+            detail: [
+              connection.id === activeServerId ? 'Active' : undefined,
+              connection.isConnected ? 'Connected' : 'Not connected',
+            ].filter((value): value is string => !!value).join(' - '),
+            id: connection.id,
+          })),
+          {
+            title: 'Select Upload Server',
+            placeHolder: 'Choose which server should receive this audio upload',
+          }
+        );
+        if (!selectedServer) {
+          return;
+        }
+        const resolved = getConnectionById(selectedServer.id);
+        if (!resolved) {
+          vscode.window.showErrorMessage('Protokoll: Selected server profile was not found.');
+          return;
+        }
+        targetConnection = resolved;
+      }
+
+      let uploadClient = getClientForServer(targetConnection.id);
+      if (!uploadClient) {
+        try {
+          const apiKey = await getConfiguredApiKey(context, targetConnection.id);
+          const tempClient = new McpClient(targetConnection.url, { apiKey });
+          const healthy = await tempClient.healthCheck();
+          if (!healthy) {
+            vscode.window.showWarningMessage(`Protokoll: Server at ${targetConnection.url} is not responding`);
+            tempClient.dispose();
+            return;
+          }
+          await tempClient.initialize();
+          connectedServerClients.set(targetConnection.id, tempClient);
+          registerEntitySyncHandlers(targetConnection.id, tempClient);
+          updateConnection(targetConnection.id, {
+            isConnected: true,
+            sessionId: tempClient.getSessionId(),
+            lastError: undefined,
+          });
+          syncConnectionStatusView();
+          syncTranscriptsProviderClients();
+          await maybeSyncAllEntitiesAcrossPeers('upload-server-connect');
+          uploadClient = tempClient;
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          updateConnection(targetConnection.id, {
+            isConnected: false,
+            sessionId: null,
+            lastError: errorMessage,
+          });
+          syncConnectionStatusView();
+          syncTranscriptsProviderClients();
+          vscode.window.showErrorMessage(`Protokoll: Failed to connect to ${targetConnection.name}: ${errorMessage}`);
+          return;
+        }
+      }
+
       // 1. Open file picker for audio files
       const fileUris = await vscode.window.showOpenDialog({
         canSelectFiles: true,
@@ -2638,9 +3854,9 @@ export async function activate(context: vscode.ExtensionContext) {
       type UploadProjectOption = vscode.QuickPickItem & { id: string };
       let activeProjects: Array<{ id: string; name: string }> = [];
       try {
-        const shouldPass = await shouldPassContextDirectory(mcpClient);
+        const shouldPass = await shouldPassContextDirectory(uploadClient);
         const contextDirectory = shouldPass ? getDefaultContextDirectory() : undefined;
-        const projectsResult = await mcpClient.callTool(
+        const projectsResult = await uploadClient.callTool(
           'protokoll_list_projects',
           contextDirectory ? { contextDirectory } : {}
         ) as { projects?: Array<{ id: string; name: string; active?: boolean }> };
@@ -2675,8 +3891,8 @@ export async function activate(context: vscode.ExtensionContext) {
       }
 
       // 4. Perform upload with progress notification
-      const serverUrl = getProtokollConfiguration().get<string>('serverUrl', 'http://127.0.0.1:3002') || 'http://127.0.0.1:3002';
-      const apiKey = await getConfiguredApiKey(context);
+      const serverUrl = targetConnection.url;
+      const apiKey = await getConfiguredApiKey(context, targetConnection.id);
 
       await vscode.window.withProgress(
         {
@@ -2724,9 +3940,13 @@ export async function activate(context: vscode.ExtensionContext) {
     clearApiKeyCommand,
     addServerConnectionCommand,
     switchServerConnectionCommand,
+    removeServerConnectionCommand,
+    openServerManagerCommand,
+    showServerConnectionDetailsCommand,
     openTranscriptCommand,
     openTranscriptInNewTabCommand,
     refreshTranscriptsCommand,
+    syncContextAcrossServersCommand,
     loadMoreTranscriptsCommand,
     refreshPeopleCommand,
     searchPeopleCommand,
@@ -2746,11 +3966,13 @@ export async function activate(context: vscode.ExtensionContext) {
     addCompanyCommand,
     openEntityCommand,
     filterByProjectCommand,
+    filterByServerCommand,
     applyProjectFilterCommand,
     filterByStatusCommand,
     sortTranscriptsCommand,
     startNewSessionCommand,
     renameTranscriptCommand,
+    transferTranscriptCommand,
     moveToProjectCommand,
     moveSelectedToProjectCommand,
     changeTranscriptStatusCommand,
@@ -2785,6 +4007,10 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
+  for (const client of connectedServerClients.values()) {
+    client.dispose();
+  }
+  connectedServerClients.clear();
   if (mcpClient) {
     mcpClient.dispose();
   }

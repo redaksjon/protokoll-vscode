@@ -197,6 +197,14 @@ export class TranscriptDetailViewProvider {
     this._chatProvider = chatProvider;
   }
 
+  private formatTranscriptPanelTitle(transcript: Transcript): string {
+    const baseTitle = transcript.title || transcript.filename;
+    if (transcript.serverName && transcript.serverName.trim().length > 0) {
+      return `${baseTitle} [${transcript.serverName}]`;
+    }
+    return baseTitle;
+  }
+
   private normalizeComment(raw: unknown): TranscriptComment | null {
     if (!raw || typeof raw !== 'object') {
       return null;
@@ -456,7 +464,7 @@ export class TranscriptDetailViewProvider {
               this._panels.set(matchingTranscript.uri, panel);
               
               // Update panel title
-              panel.title = matchingTranscript.title || matchingTranscript.filename;
+              panel.title = this.formatTranscriptPanelTitle(matchingTranscript);
               
               // Unsubscribe from old URI and subscribe to new URI
               try {
@@ -543,7 +551,7 @@ export class TranscriptDetailViewProvider {
     if (panel && !openInNewTab) {
       try {
         // Try to access the panel - this will throw if disposed
-        panel.title = transcript.title || transcript.filename;
+        panel.title = this.formatTranscriptPanelTitle(transcript);
         panel.reveal(targetColumn);
         // Refresh the content in case it changed
         try {
@@ -568,7 +576,7 @@ export class TranscriptDetailViewProvider {
     // Create a new panel (either because one doesn't exist or openInNewTab is true)
     panel = vscode.window.createWebviewPanel(
       TranscriptDetailViewProvider.viewType,
-      transcript.title || transcript.filename,
+      this.formatTranscriptPanelTitle(transcript),
       targetColumn,
       {
         enableScripts: true,
@@ -1991,7 +1999,7 @@ export class TranscriptDetailViewProvider {
           this._panels.set(newTranscriptUri, panel);
 
           // Update panel title
-          panel.title = trimmedTitle;
+          panel.title = this.formatTranscriptPanelTitle(updatedTranscript);
 
           // Subscribe to new URI
           try {

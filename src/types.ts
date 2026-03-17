@@ -38,6 +38,8 @@ export interface TranscriptComment {
 export type TranscriptContentType = 'audio_transcript' | 'manual_note';
 
 export interface Transcript {
+  serverId?: string;
+  serverName?: string;
   uri: string;
   path: string;
   filename: string;

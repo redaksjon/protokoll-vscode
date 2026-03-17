@@ -51,6 +51,12 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.openServerManager",
+        "title": "Manage Servers and Tokens",
+        "icon": "$(settings-gear)",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.addServerConnection",
         "title": "Add Server Connection",
         "icon": "$(add)",
@@ -63,9 +69,26 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.showServerConnectionDetails",
+        "title": "Show Server Connection Details",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.removeServerConnection",
+        "title": "Remove Server Connection",
+        "icon": "$(trash)",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.refreshTranscripts",
         "title": "Refresh",
         "icon": "$(refresh)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.syncContextAcrossServers",
+        "title": "Sync Context Across Servers",
+        "icon": "$(sync)",
         "category": "Protokoll"
       },
       {
@@ -77,6 +100,12 @@
         "command": "protokoll.filterByProject",
         "title": "Filter by Project",
         "icon": "$(filter)",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.filterByServer",
+        "title": "Filter by Server",
+        "icon": "$(server-process)",
         "category": "Protokoll"
       },
       {
@@ -100,6 +129,11 @@
       {
         "command": "protokoll.renameTranscript",
         "title": "Rename",
+        "category": "Protokoll"
+      },
+      {
+        "command": "protokoll.transferTranscript",
+        "title": "Transfer to Another Server",
         "category": "Protokoll"
       },
       {
@@ -352,6 +386,11 @@
           "group": "navigation"
         },
         {
+          "command": "protokoll.filterByServer",
+          "when": "view == protokollTranscripts",
+          "group": "navigation"
+        },
+        {
           "command": "protokoll.filterByStatus",
           "when": "view == protokollTranscripts",
           "group": "navigation"
@@ -437,6 +476,11 @@
           "group": "navigation"
         },
         {
+          "command": "protokoll.openServerManager",
+          "when": "view == protokollConnectionStatus",
+          "group": "navigation"
+        },
+        {
           "command": "protokoll.addServerConnection",
           "when": "view == protokollConnectionStatus",
           "group": "navigation"
@@ -480,6 +524,11 @@
         },
         {
           "command": "protokoll.renameTranscript",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "z_commands"
+        },
+        {
+          "command": "protokoll.transferTranscript",
           "when": "view == protokollTranscripts && viewItem == transcript",
           "group": "z_commands"
         },
@@ -542,8 +591,55 @@
         "protokoll.serverUrl": {
           "type": "string",
           "default": "http://127.0.0.1:3002",
-          "description": "URL of the Protokoll HTTP MCP server",
-          "markdownDescription": "URL of the Protokoll HTTP MCP server (e.g., `http://127.0.0.1:3002`)"
+          "description": "Active server URL (legacy/single-server fallback).",
+          "markdownDescription": "Active Protokoll HTTP MCP server URL (legacy/single-server fallback). For multi-server setups, use `protokoll.serverProfiles` and [Manage Servers and Tokens](command:protokoll.openServerManager)."
+        },
+        "protokoll.serverProfiles": {
+          "type": "array",
+          "default": [],
+          "description": "List of Protokoll server profiles.",
+          "markdownDescription": "List of Protokoll server profiles. Use Settings UI to add items with the `+` button. Configure per-server API tokens in [Manage Servers and Tokens](command:protokoll.openServerManager).",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "url"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable unique ID for the server profile."
+              },
+              "name": {
+                "type": "string",
+                "description": "Display name for this server profile."
+              },
+              "url": {
+                "type": "string",
+                "description": "HTTP MCP base URL."
+              },
+              "enabled": {
+                "type": "boolean",
+                "default": true,
+                "description": "Whether this profile is enabled."
+              },
+              "createdAt": {
+                "type": "string",
+                "description": "ISO timestamp when the profile was created."
+              },
+              "updatedAt": {
+                "type": "string",
+                "description": "ISO timestamp when the profile was updated."
+              }
+            }
+          }
+        },
+        "protokoll.activeServerId": {
+          "type": "string",
+          "default": "",
+          "description": "ID of the active server profile.",
+          "markdownDescription": "ID of the active server profile in `protokoll.serverProfiles`. You can change this via [Manage Servers and Tokens](command:protokoll.openServerManager)."
         },
         "protokoll.transcriptsDirectory": {
           "type": "string",
