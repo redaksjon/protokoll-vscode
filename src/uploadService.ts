@@ -12,6 +12,7 @@ import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { URL } from 'url';
 import { resolveAgent } from './proxyUtils';
+import { appendScopedApiKeyHeaders } from './multiServer/auth';
 
 const AUDIO_MIME_TYPES: Record<string, string> = {
   mp3: 'audio/mpeg',
@@ -137,18 +138,12 @@ export class UploadService {
           port: url.port || (url.protocol === 'https:' ? 443 : 80),
           path: url.pathname,
           method: 'POST',
-          headers: {
+          headers: appendScopedApiKeyHeaders({
             // eslint-disable-next-line @typescript-eslint/naming-convention
             'Content-Type': `multipart/form-data; boundary=${boundary}`,
             // eslint-disable-next-line @typescript-eslint/naming-convention
             'Content-Length': body.length,
-            ...(options.apiKey && options.apiKey.trim().length > 0
-              ? {
-                  Authorization: `Bearer ${options.apiKey.trim()}`,
-                  'X-API-Key': options.apiKey.trim(),
-                }
-              : {}),
-          },
+          }, options.apiKey, url.toString(), options.serverUrl),
           timeout: 60_000, // 60-second timeout — large files can be slow
           ...(agent ? { agent } : {}),
         };

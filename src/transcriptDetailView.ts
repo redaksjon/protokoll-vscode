@@ -197,6 +197,14 @@ export class TranscriptDetailViewProvider {
     this._chatProvider = chatProvider;
   }
 
+  private formatTranscriptPanelTitle(transcript: Transcript): string {
+    const baseTitle = transcript.title || transcript.filename;
+    if (transcript.serverName && transcript.serverName.trim().length > 0) {
+      return `${baseTitle} [${transcript.serverName}]`;
+    }
+    return baseTitle;
+  }
+
   private normalizeComment(raw: unknown): TranscriptComment | null {
     if (!raw || typeof raw !== 'object') {
       return null;
@@ -456,7 +464,7 @@ export class TranscriptDetailViewProvider {
               this._panels.set(matchingTranscript.uri, panel);
               
               // Update panel title
-              panel.title = matchingTranscript.title || matchingTranscript.filename;
+              panel.title = this.formatTranscriptPanelTitle(matchingTranscript);
               
               // Unsubscribe from old URI and subscribe to new URI
               try {
@@ -543,7 +551,7 @@ export class TranscriptDetailViewProvider {
     if (panel && !openInNewTab) {
       try {
         // Try to access the panel - this will throw if disposed
-        panel.title = transcript.title || transcript.filename;
+        panel.title = this.formatTranscriptPanelTitle(transcript);
         panel.reveal(targetColumn);
         // Refresh the content in case it changed
         try {
@@ -568,7 +576,7 @@ export class TranscriptDetailViewProvider {
     // Create a new panel (either because one doesn't exist or openInNewTab is true)
     panel = vscode.window.createWebviewPanel(
       TranscriptDetailViewProvider.viewType,
-      transcript.title || transcript.filename,
+      this.formatTranscriptPanelTitle(transcript),
       targetColumn,
       {
         enableScripts: true,
@@ -1991,7 +1999,7 @@ export class TranscriptDetailViewProvider {
           this._panels.set(newTranscriptUri, panel);
 
           // Update panel title
-          panel.title = trimmedTitle;
+          panel.title = this.formatTranscriptPanelTitle(updatedTranscript);
 
           // Subscribe to new URI
           try {
@@ -3868,12 +3876,71 @@ export class TranscriptDetailViewProvider {
   }
 
   private formatDate(dateString: string): string {
-    try {
-      const date = new Date(dateString);
-      return date.toLocaleString();
-    } catch {
-      return dateString;
+    const parsed = this.parseClientLocalDate(dateString);
+    if (!parsed) {
+      return 'Invalid Date';
     }
+
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dateString.trim())) {
+      return parsed.toLocaleDateString();
+    }
+
+    return parsed.toLocaleString();
+  }
+
+  private formatTranscriptDateTime(dateString: string, timeString?: string): string {
+    const parsed = this.parseClientLocalDate(dateString, timeString);
+    if (!parsed) {
+      return timeString ? `${dateString} ${timeString}` : dateString;
+    }
+
+    if (timeString) {
+      return parsed.toLocaleString();
+    }
+
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dateString.trim())) {
+      return parsed.toLocaleDateString();
+    }
+
+    return parsed.toLocaleString();
+  }
+
+  private parseClientLocalDate(dateString: string, timeString?: string): Date | null {
+    const trimmedDate = dateString.trim();
+    const dateOnlyMatch = trimmedDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+
+    // Treat date-only values as local calendar dates so day grouping/display
+    // stays consistent with the user's timezone.
+    if (dateOnlyMatch) {
+      const year = Number(dateOnlyMatch[1]);
+      const month = Number(dateOnlyMatch[2]);
+      const day = Number(dateOnlyMatch[3]);
+
+      let hours = 0;
+      let minutes = 0;
+      let seconds = 0;
+      if (timeString) {
+        const timeMatch = timeString.trim().match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+        if (timeMatch) {
+          hours = Number(timeMatch[1]);
+          minutes = Number(timeMatch[2]);
+          seconds = Number(timeMatch[3] ?? 0);
+        }
+      }
+
+      const localDate = new Date(year, month - 1, day, hours, minutes, seconds);
+      if (!isNaN(localDate.getTime())) {
+        return localDate;
+      }
+      return null;
+    }
+
+    const parsed = new Date(trimmedDate);
+    if (!isNaN(parsed.getTime())) {
+      return parsed;
+    }
+
+    return null;
   }
 
   private isLikelyUuid(value: string): boolean {
@@ -5055,7 +5122,21 @@ export class TranscriptDetailViewProvider {
                 '<thead><tr><th>Title</th><th>Date</th><th>Project</th></tr></thead>' +
                 '<tbody>' +
                 transcripts.map(t => {
-                    const date = t.date ? new Date(t.date).toLocaleDateString() : '';
+                    let date = '';
+                    if (t.date) {
+                        const dateOnlyMatch = t.date.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);
+                        if (dateOnlyMatch) {
+                            const localDate = new Date(
+                                Number(dateOnlyMatch[1]),
+                                Number(dateOnlyMatch[2]) - 1,
+                                Number(dateOnlyMatch[3])
+                            );
+                            date = localDate.toLocaleDateString();
+                        } else {
+                            const parsedDate = new Date(t.date);
+                            date = Number.isNaN(parsedDate.getTime()) ? String(t.date) : parsedDate.toLocaleDateString();
+                        }
+                    }
                     const project = t.project ? escapeHtml(t.project) : '';
                     return \`
                         <tr class="related-transcript-row" data-path="\${t.path}">
@@ -5181,9 +5262,9 @@ export class TranscriptDetailViewProvider {
         };
 
     // Format date/time - use structured metadata from server
-    const date = metadata.date ?? transcript.date ?? 'Unknown date';
+    const date = metadata.date ?? transcript.date ?? '';
     const time = metadata.time ?? transcript.time ?? '';
-    const dateTime = time ? `${date} ${time}` : date;
+    const dateTime = date ? this.formatTranscriptDateTime(date, time) : 'Unknown date';
 
     // Get createdAt and updatedAt from transcript object (not in content.metadata)
     const createdAt = transcript.createdAt;
@@ -6217,6 +6298,17 @@ export class TranscriptDetailViewProvider {
         }
         .button-secondary:hover {
             background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .original-enhance-row .button,
+        .original-enhance-row .enhance-button {
+            padding: 8px 16px;
+            line-height: 1.2;
+            min-height: 36px;
+            box-sizing: border-box;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            margin-left: 0;
         }
         .summary-list {
             display: flex;

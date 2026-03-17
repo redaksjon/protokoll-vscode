@@ -14,6 +14,7 @@ import type {
   McpResourcesListResponse,
 } from './types';
 import { resolveAgent } from './proxyUtils';
+import { appendScopedApiKeyHeaders } from './multiServer/auth';
 
 export class McpClient {
   private static readonly REQUEST_TIMEOUT_MS = 15000;
@@ -25,10 +26,12 @@ export class McpClient {
   private recoveringSession: boolean = false; // Flag to prevent infinite recovery loops
   private onSessionRecoveredCallbacks: Array<() => void | Promise<void>> = []; // Callbacks to run after session recovery
   private apiKey?: string;
+  private readonly profileUrl: string;
 
   constructor(serverUrl: string, options?: { apiKey?: string }) {
     // Remove trailing slash to ensure consistent URL handling
     this.serverUrl = serverUrl.replace(/\/+$/, '');
+    this.profileUrl = this.serverUrl;
     this.apiKey = options?.apiKey && options.apiKey.trim().length > 0 ? options.apiKey.trim() : undefined;
   }
 
@@ -36,15 +39,8 @@ export class McpClient {
     this.apiKey = apiKey && apiKey.trim().length > 0 ? apiKey.trim() : undefined;
   }
 
-  private appendAuthHeaders(headers: Record<string, string>): Record<string, string> {
-    if (!this.apiKey) {
-      return headers;
-    }
-    return {
-      ...headers,
-      Authorization: `Bearer ${this.apiKey}`,
-      'X-API-Key': this.apiKey,
-    };
+  private appendAuthHeaders(headers: Record<string, string | number>, requestUrl: string): Record<string, string | number> {
+    return appendScopedApiKeyHeaders(headers, this.apiKey, requestUrl, this.profileUrl);
   }
 
   /**
@@ -183,14 +179,14 @@ export class McpClient {
       };
 
       const url = new URL(`${this.serverUrl}/mcp`);
-      let headers: Record<string, string> = {
+      let headers: Record<string, string | number> = {
         'Content-Type': 'application/json',
         'Accept': 'application/json, text/event-stream',
       };
       if (this.sessionId) {
         headers['Mcp-Session-Id'] = this.sessionId;
       }
-      headers = this.appendAuthHeaders(headers);
+      headers = this.appendAuthHeaders(headers, url.toString());
       const agent = resolveAgent(url.toString());
       const options: http.RequestOptions | https.RequestOptions = {
         hostname: url.hostname,
@@ -544,7 +540,7 @@ export class McpClient {
         port: url.port || (url.protocol === 'https:' ? 443 : 80),
         path: url.pathname,
         method: 'GET',
-        headers: this.appendAuthHeaders({}),
+        headers: this.appendAuthHeaders({}, url.toString()),
         timeout: 5000,
         ...(agent ? { agent } : {}),
       };
@@ -767,7 +763,7 @@ export class McpClient {
           'Accept': 'text/event-stream',
           'Cache-Control': 'no-cache', // eslint-disable-line @typescript-eslint/naming-convention
           'Mcp-Session-Id': this.sessionId,
-        }),
+        }, url.toString()),
         timeout: 0, // Disable timeout for SSE connections
         ...(agent ? { agent } : {}),
       };

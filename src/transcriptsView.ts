@@ -12,6 +12,12 @@ interface YearMonth {
   month: string;
 }
 
+interface ServerClientEntry {
+  id: string;
+  name: string;
+  client: McpClient;
+}
+
 const DEFAULT_STATUS_FILTERS = ['initial', 'enhanced', 'reviewed', 'in_progress', 'closed'];
 const VALID_STATUS_FILTERS = new Set(['initial', 'enhanced', 'reviewed', 'in_progress', 'closed', 'archived', 'deleted']);
 
@@ -22,9 +28,11 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     this._onDidChangeTreeData.event;
 
   private client: McpClient | null = null;
+  private clients: ServerClientEntry[] = [];
   private transcripts: Transcript[] = [];
   private hasMorePages = false;
   private selectedProjectFilter: string | null = null; // Project ID to filter by
+  private selectedServerFilters: Set<string> = new Set(); // Empty set means "all servers"
   private selectedStatusFilters: Set<string> = new Set(DEFAULT_STATUS_FILTERS); // Statuses to show (archived/deleted excluded by default)
   private sortOrder: 'date-desc' | 'date-asc' | 'title-asc' | 'title-desc' = 'date-desc'; // Default: date descending
   private treeView: vscode.TreeView<TranscriptItem> | null = null;
@@ -41,6 +49,11 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     // Load project filter (workspace-specific)
     const savedProjectFilter = this.context.workspaceState.get<string | null>('protokoll.projectFilter');
     this.selectedProjectFilter = savedProjectFilter ?? null;
+
+    const savedServerFilters = this.context.workspaceState.get<string[]>('protokoll.serverFilters');
+    if (savedServerFilters && savedServerFilters.length > 0) {
+      this.selectedServerFilters = new Set(savedServerFilters.filter((serverId) => serverId.trim().length > 0));
+    }
     
     // Load status filters (workspace-specific)
     const savedStatusFilters = this.context.workspaceState.get<string[]>('protokoll.statusFilters');
@@ -76,11 +89,13 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
    */
   private async saveWorkspaceSettings(): Promise<void> {
     await this.context.workspaceState.update('protokoll.projectFilter', this.selectedProjectFilter);
+    await this.context.workspaceState.update('protokoll.serverFilters', Array.from(this.selectedServerFilters));
     await this.context.workspaceState.update('protokoll.statusFilters', Array.from(this.selectedStatusFilters));
     await this.context.workspaceState.update('protokoll.sortOrder', this.sortOrder);
     
     log('TranscriptsViewProvider: Saved workspace settings', {
       projectFilter: this.selectedProjectFilter,
+      serverFilters: Array.from(this.selectedServerFilters),
       statusFilters: Array.from(this.selectedStatusFilters),
       sortOrder: this.sortOrder
     });
@@ -115,6 +130,33 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
       log('TranscriptsViewProvider.setClient: Client set while view visible, firing change event');
       this._onDidChangeTreeData.fire();
     }
+  }
+
+  setClients(clients: ServerClientEntry[]): void {
+    this.clients = clients;
+    this.client = clients[0]?.client ?? null;
+    this._hasAttemptedLoad = false;
+    this._onDidChangeTreeData.fire();
+  }
+
+  setServerFilters(serverIds: Set<string>): void {
+    this.selectedServerFilters = new Set(Array.from(serverIds).filter((serverId) => serverId.trim().length > 0));
+    this.saveWorkspaceSettings().catch((err) => {
+      log('Failed to save server filters to workspace state', err);
+    });
+    this.refresh({ resetPagination: true }).catch((err) => {
+      vscode.window.showErrorMessage(
+        `Failed to refresh transcripts: ${err instanceof Error ? err.message : String(err)}`
+      );
+    });
+  }
+
+  getServerFilters(): Set<string> {
+    return this.selectedServerFilters;
+  }
+
+  getAvailableServers(): Array<{ id: string; name: string }> {
+    return this.clients.map((entry) => ({ id: entry.id, name: entry.name }));
   }
 
   /**
@@ -201,50 +243,77 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
       limit
     });
     
-    if (!this.client) {
+    const hasSingleClient = !!this.client;
+    const hasMultiClients = this.clients.length > 0;
+    if (!hasSingleClient && !hasMultiClients) {
       log('TranscriptsViewProvider.refresh: No client, returning early');
       return;
     }
 
     try {
-      log('TranscriptsViewProvider.refresh: Calling listTranscripts', { projectFilter: this.selectedProjectFilter });
-      
-      let response: TranscriptsListResponse = await this.client.listTranscripts({
-        limit,
-        offset: 0,
-        projectId: this.selectedProjectFilter || undefined,
+      log('TranscriptsViewProvider.refresh: Calling listTranscripts', {
+        projectFilter: this.selectedProjectFilter,
+        serverFilters: Array.from(this.selectedServerFilters),
       });
 
-      // Auto-recover from stale project filter states that hide everything.
-      if (response.transcripts.length === 0 && this.selectedProjectFilter) {
-        log('TranscriptsViewProvider.refresh: Project filter returned no transcripts, retrying without filter', {
-          projectFilter: this.selectedProjectFilter,
-        });
-        response = await this.client.listTranscripts({
+      if (this.clients.length > 0) {
+        const targetClients = this.selectedServerFilters.size > 0
+          ? this.clients.filter((entry) => this.selectedServerFilters.has(entry.id))
+          : this.clients;
+
+        const responses = await Promise.all(targetClients.map(async (entry) => {
+          const response = await entry.client.listTranscripts({
+            limit,
+            offset: 0,
+            projectId: this.selectedProjectFilter || undefined,
+          });
+          return {
+            entry,
+            response,
+          };
+        }));
+
+        const merged: Transcript[] = [];
+        let hasMore = false;
+        for (const result of responses) {
+          hasMore = hasMore || (result.response.pagination?.hasMore ?? false);
+          merged.push(...result.response.transcripts.map((transcript) => ({
+            ...transcript,
+            serverId: result.entry.id,
+            serverName: result.entry.name,
+          })));
+        }
+        this.transcripts = merged;
+        this.hasMorePages = hasMore;
+      } else {
+        let response: TranscriptsListResponse = await this.client!.listTranscripts({
           limit,
           offset: 0,
+          projectId: this.selectedProjectFilter || undefined,
         });
-        if (response.transcripts.length > 0) {
-          const oldFilter = this.selectedProjectFilter;
-          this.selectedProjectFilter = null;
-          await this.saveWorkspaceSettings();
-          vscode.window.showInformationMessage(
-            `Protokoll: Cleared project filter "${oldFilter}" because it returned no transcripts.`
-          );
-        }
-      }
 
-      log('TranscriptsViewProvider.refresh: Got response', { 
-        transcriptsCount: response.transcripts.length,
-        hasMore: response.pagination?.hasMore,
-        sampleTranscript: response.transcripts[0] ? {
-          title: response.transcripts[0].title,
-          hasEntities: !!response.transcripts[0].entities,
-          entities: response.transcripts[0].entities
-        } : null
-      });
-      this.transcripts = response.transcripts;
-      this.hasMorePages = response.pagination?.hasMore ?? false;
+        // Auto-recover from stale project filter states that hide everything.
+        if (response.transcripts.length === 0 && this.selectedProjectFilter) {
+          log('TranscriptsViewProvider.refresh: Project filter returned no transcripts, retrying without filter', {
+            projectFilter: this.selectedProjectFilter,
+          });
+          response = await this.client!.listTranscripts({
+            limit,
+            offset: 0,
+          });
+          if (response.transcripts.length > 0) {
+            const oldFilter = this.selectedProjectFilter;
+            this.selectedProjectFilter = null;
+            await this.saveWorkspaceSettings();
+            vscode.window.showInformationMessage(
+              `Protokoll: Cleared project filter "${oldFilter}" because it returned no transcripts.`
+            );
+          }
+        }
+
+        this.transcripts = response.transcripts;
+        this.hasMorePages = response.pagination?.hasMore ?? false;
+      }
       this._onDidChangeTreeData.fire();
       log('TranscriptsViewProvider.refresh: Fired tree data change event');
     } catch (error) {
@@ -284,6 +353,12 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
    * Appends to the existing list using the same filters.
    */
   async loadMore(): Promise<void> {
+    // For merged multi-server mode, use refresh because independent pagination per server
+    // isn't coordinated yet.
+    if (this.clients.length > 0) {
+      await this.refresh();
+      return;
+    }
     if (!this.client || !this.hasMorePages) {
       return;
     }
@@ -332,7 +407,7 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
       hasElement: !!element, 
       elementType: element?.type,
       transcriptsCount: this.transcripts.length,
-      hasClient: !!this.client,
+      hasClient: !!this.client || this.clients.length > 0,
       isLoading: this._isLoading,
       hasAttemptedLoad: this._hasAttemptedLoad
     });
@@ -341,7 +416,7 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     // The _hasAttemptedLoad flag prevents an infinite loop when the server returns 0 transcripts:
     // refresh() fires _onDidChangeTreeData which re-triggers getChildren(), and without this
     // guard we'd loop forever when transcripts.length stays 0.
-    if (!element && this.transcripts.length === 0 && this.client && !this._isLoading && !this._hasAttemptedLoad) {
+    if (!element && this.transcripts.length === 0 && (!!this.client || this.clients.length > 0) && !this._isLoading && !this._hasAttemptedLoad) {
       this._isLoading = true;
       this._hasAttemptedLoad = true;
       log('TranscriptsViewProvider.getChildren: Starting auto-load');
@@ -446,7 +521,10 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
         const truncatedTitle = title.length > 80 ? title.substring(0, 77) + '...' : title;
         
         // Use description field to show project
-        const description = projectNames || 'No project';
+        const serverLabel = t.serverName || t.serverId || 'Server';
+        const description = projectNames
+          ? `${serverLabel} - ${projectNames}`
+          : serverLabel;
         
         const item = new TranscriptItem(
           truncatedTitle,
@@ -579,8 +657,8 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
       // Format 2: Try to parse as Date object
       try {
-        const dateObj = new Date(transcript.date);
-        if (!isNaN(dateObj.getTime())) {
+        const dateObj = this.parseTranscriptDate(transcript.date, transcript.time);
+        if (dateObj && !isNaN(dateObj.getTime())) {
           return {
             year: String(dateObj.getFullYear()),
             month: String(dateObj.getMonth() + 1), // getMonth() is 0-based
@@ -638,8 +716,8 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
       // Format 2: Try to parse as Date object
       try {
-        const dateObj = new Date(transcript.date);
-        if (!isNaN(dateObj.getTime())) {
+        const dateObj = this.parseTranscriptDate(transcript.date, transcript.time);
+        if (dateObj && !isNaN(dateObj.getTime())) {
           return dateObj.getDate();
         }
       } catch {
@@ -699,9 +777,9 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   private getTranscriptDate(transcript: Transcript): Date {
     // Try to get date from various fields
     if (transcript.date) {
-      const date = new Date(transcript.date);
-      if (!isNaN(date.getTime())) {
-        return date;
+      const parsedDate = this.parseTranscriptDate(transcript.date, transcript.time);
+      if (parsedDate) {
+        return parsedDate;
       }
     }
     
@@ -714,6 +792,42 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     
     // Fallback to epoch
     return new Date(0);
+  }
+
+  private parseTranscriptDate(dateValue: string, timeValue?: string): Date | null {
+    const trimmedDate = dateValue.trim();
+    const dateOnlyMatch = trimmedDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+
+    // Treat date-only values as local calendar days, not UTC midnights.
+    if (dateOnlyMatch) {
+      const year = Number(dateOnlyMatch[1]);
+      const month = Number(dateOnlyMatch[2]);
+      const day = Number(dateOnlyMatch[3]);
+
+      let hours = 0;
+      let minutes = 0;
+      let seconds = 0;
+      if (timeValue) {
+        const timeMatch = timeValue.trim().match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+        if (timeMatch) {
+          hours = Number(timeMatch[1]);
+          minutes = Number(timeMatch[2]);
+          seconds = Number(timeMatch[3] ?? 0);
+        }
+      }
+
+      const localDate = new Date(year, month - 1, day, hours, minutes, seconds);
+      if (!isNaN(localDate.getTime())) {
+        return localDate;
+      }
+      return null;
+    }
+
+    const parsed = new Date(trimmedDate);
+    if (!isNaN(parsed.getTime())) {
+      return parsed;
+    }
+    return null;
   }
 
   private formatDateForTable(transcript: Transcript): string {

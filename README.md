@@ -61,12 +61,20 @@ code --install-extension protokoll-vscode-0.1.1-dev.0.vsix
 - Use the command palette (`Cmd+Shift+P` / `Ctrl+Shift+P`) and run **Protokoll: Configure Server URL**
 - Or update the setting `protokoll.serverUrl` in your VS Code settings
 
+### Multi-Server Profiles
+
+- Add server profiles with **Protokoll: Add Server Connection**
+- Switch active server with **Protokoll: Switch Server Connection**
+- Remove server profiles with **Protokoll: Remove Server Connection** (explicit confirmation required)
+- View per-server diagnostics via **Protokoll: Show Server Connection Details**
+- Filter merged transcript lists by server using **Protokoll: Filter by Server** (remembered per workspace)
+
 ## Configuration
 
 The extension supports the following settings:
 
 - `protokoll.serverUrl`: URL of the Protokoll HTTP MCP server (default: `http://127.0.0.1:3002`)
-- `protokoll.apiKey`: Optional API key for secured servers (sent as `Authorization: Bearer` and `X-API-Key`)
+- API keys are stored in VS Code Secret Storage; use **Protokoll: Configure API Key (Secure)** to set one and **Protokoll: Clear API Key** to remove it
 - `protokoll.transcriptsDirectory`: Default directory path for transcripts (optional)
 
 ## Development
