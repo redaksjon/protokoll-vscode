@@ -657,8 +657,8 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
       // Format 2: Try to parse as Date object
       try {
-        const dateObj = new Date(transcript.date);
-        if (!isNaN(dateObj.getTime())) {
+        const dateObj = this.parseTranscriptDate(transcript.date, transcript.time);
+        if (dateObj && !isNaN(dateObj.getTime())) {
           return {
             year: String(dateObj.getFullYear()),
             month: String(dateObj.getMonth() + 1), // getMonth() is 0-based
@@ -716,8 +716,8 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
 
       // Format 2: Try to parse as Date object
       try {
-        const dateObj = new Date(transcript.date);
-        if (!isNaN(dateObj.getTime())) {
+        const dateObj = this.parseTranscriptDate(transcript.date, transcript.time);
+        if (dateObj && !isNaN(dateObj.getTime())) {
           return dateObj.getDate();
         }
       } catch {
@@ -777,9 +777,9 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
   private getTranscriptDate(transcript: Transcript): Date {
     // Try to get date from various fields
     if (transcript.date) {
-      const date = new Date(transcript.date);
-      if (!isNaN(date.getTime())) {
-        return date;
+      const parsedDate = this.parseTranscriptDate(transcript.date, transcript.time);
+      if (parsedDate) {
+        return parsedDate;
       }
     }
     
@@ -792,6 +792,42 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     
     // Fallback to epoch
     return new Date(0);
+  }
+
+  private parseTranscriptDate(dateValue: string, timeValue?: string): Date | null {
+    const trimmedDate = dateValue.trim();
+    const dateOnlyMatch = trimmedDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+
+    // Treat date-only values as local calendar days, not UTC midnights.
+    if (dateOnlyMatch) {
+      const year = Number(dateOnlyMatch[1]);
+      const month = Number(dateOnlyMatch[2]);
+      const day = Number(dateOnlyMatch[3]);
+
+      let hours = 0;
+      let minutes = 0;
+      let seconds = 0;
+      if (timeValue) {
+        const timeMatch = timeValue.trim().match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+        if (timeMatch) {
+          hours = Number(timeMatch[1]);
+          minutes = Number(timeMatch[2]);
+          seconds = Number(timeMatch[3] ?? 0);
+        }
+      }
+
+      const localDate = new Date(year, month - 1, day, hours, minutes, seconds);
+      if (!isNaN(localDate.getTime())) {
+        return localDate;
+      }
+      return null;
+    }
+
+    const parsed = new Date(trimmedDate);
+    if (!isNaN(parsed.getTime())) {
+      return parsed;
+    }
+    return null;
   }
 
   private formatDateForTable(transcript: Transcript): string {
