@@ -376,6 +376,11 @@
     "menus": {
       "view/title": [
         {
+          "command": "protokoll.openDashboard",
+          "when": "view == protokollTranscripts",
+          "group": "navigation"
+        },
+        {
           "command": "protokoll.refreshTranscripts",
           "when": "view == protokollTranscripts",
           "group": "navigation"
