@@ -13,7 +13,6 @@ processed/
 outdiff
 outlog
 pnpm-workspace.yaml
-package-lock.json
 tsconfig.tsbuildinfo
 tsconfig (1).tsbuildinfo
 *~

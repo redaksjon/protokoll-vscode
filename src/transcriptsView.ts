@@ -12,7 +12,7 @@ interface YearMonth {
   month: string;
 }
 
-interface ServerClientEntry {
+export interface ServerClientEntry {
   id: string;
   name: string;
   client: McpClient;

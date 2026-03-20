@@ -183,17 +183,18 @@ function applyClientToProviders(client: McpClient): void {
   }
   if (dashboardViewProvider) {
     dashboardViewProvider.setClient(client);
+    const active = activeServerId
+      ? serverConnections.find((c) => c.id === activeServerId)
+      : serverConnections[0];
+    dashboardViewProvider.setPrimaryServerLabel(active?.name ?? '');
   }
   if (connectionStatusViewProvider) {
     connectionStatusViewProvider.setClient(client);
   }
 }
 
-function syncTranscriptsProviderClients(): void {
-  if (!transcriptsViewProvider) {
-    return;
-  }
-  const entries = serverConnections
+function buildConnectedServerClientEntries(): Array<{ id: string; name: string; client: McpClient }> {
+  return serverConnections
     .filter((connection) => connection.isConnected === true)
     .map((connection) => {
       const client = connectedServerClients.get(connection.id);
@@ -207,7 +208,16 @@ function syncTranscriptsProviderClients(): void {
       };
     })
     .filter((entry): entry is { id: string; name: string; client: McpClient } => entry !== null);
+}
+
+function syncTranscriptsProviderClients(): void {
+  if (!transcriptsViewProvider) {
+    return;
+  }
+  const entries = buildConnectedServerClientEntries();
   transcriptsViewProvider.setClients(entries);
+  dashboardViewProvider?.setServerClients(entries);
+  dashboardViewProvider?.scheduleDataRefreshDebouncedIfVisible();
 }
 
 // Create an output channel for debugging
@@ -931,9 +941,18 @@ export async function activate(context: vscode.ExtensionContext) {
   const uploadService = new UploadService();
   dashboardViewProvider = new DashboardViewProvider(context.extensionUri);
   dashboardViewProvider.setUploadService(uploadService);
+  dashboardViewProvider.setTranscriptsProvider(transcriptsViewProvider);
   if (mcpClient) {
     dashboardViewProvider.setClient(mcpClient);
+    const activeForLabel = activeServerId
+      ? serverConnections.find((c) => c.id === activeServerId)
+      : serverConnections[0];
+    dashboardViewProvider.setPrimaryServerLabel(activeForLabel?.name ?? '');
     log('Protokoll: Dashboard view provider initialized with MCP client');
+
+    // Wire merged servers before the first refresh so stats match the Transcripts tree.
+    // (Avoids a second full refresh from syncTranscriptsProviderClients right after show().)
+    dashboardViewProvider.setServerClients(buildConnectedServerClientEntries());
 
     // Auto-open dashboard on startup (if not disabled)
     const autoOpen = vscode.workspace.getConfiguration('protokoll').get<boolean>('dashboard.autoOpen', true);
@@ -2461,6 +2480,7 @@ export async function activate(context: vscode.ExtensionContext) {
           ? 'Showing transcripts from all servers'
           : `Showing transcripts from ${selected.length} server${selected.length === 1 ? '' : 's'}`;
         vscode.window.showInformationMessage(`Protokoll: ${message}`);
+        void dashboardViewProvider?.refreshData();
       }
     }
   );
