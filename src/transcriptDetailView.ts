@@ -2401,6 +2401,14 @@ export class TranscriptDetailViewProvider {
             case 'loadRelatedTranscripts':
               await this.handleLoadRelatedTranscripts(panel, message.entityType, message.entityId);
               break;
+            case 'loadProjectPlans':
+              await this.handleLoadProjectPlans(
+                panel,
+                typeof message.projectId === 'string' ? message.projectId : entityId,
+                typeof message.page === 'number' && message.page >= 1 ? message.page : 1,
+                typeof message.pageSize === 'number' && message.pageSize >= 1 ? message.pageSize : 25
+              );
+              break;
             case 'openTranscript':
               await this.handleOpenTranscriptFromEntity(message.path);
               break;
@@ -2615,6 +2623,50 @@ export class TranscriptDetailViewProvider {
     }
   }
 
+  private async handleLoadProjectPlans(
+    panel: vscode.WebviewPanel,
+    projectId: string,
+    page: number,
+    pageSize: number
+  ): Promise<void> {
+    if (!this._client) {
+      return;
+    }
+    const limit = Math.min(100, Math.max(1, pageSize));
+    const offset = (Math.max(1, page) - 1) * limit;
+    try {
+      const response = (await this._client.callTool('protokoll_list_project_plans', {
+        projectId,
+        limit,
+        offset,
+      })) as {
+        total?: number;
+        limit?: number;
+        offset?: number;
+        count?: number;
+        plans?: Array<{ id: string; title: string; stage: string; createdAt: string | null }>;
+      };
+      panel.webview.postMessage({
+        command: 'projectPlansPage',
+        total: response.total ?? 0,
+        limit: response.limit ?? limit,
+        offset: response.offset ?? offset,
+        count: response.count ?? (response.plans?.length ?? 0),
+        plans: response.plans ?? [],
+        page,
+        pageSize: limit,
+      });
+    } catch (error) {
+      console.error('Protokoll Entity: Failed to load project plans', error);
+      panel.webview.postMessage({
+        command: 'projectPlansError',
+        message: error instanceof Error ? error.message : String(error),
+        page,
+        pageSize: limit,
+      });
+    }
+  }
+
   /**
    * Open a transcript from entity view
    */
@@ -2772,6 +2824,15 @@ export class TranscriptDetailViewProvider {
       }
       if (fields.remove_sounds_like !== undefined) {
         args.remove_sounds_like = fields.remove_sounds_like;
+      }
+
+      if (entityType === 'project') {
+        if (fields.add_urls !== undefined) {
+          args.add_urls = fields.add_urls;
+        }
+        if (fields.remove_urls !== undefined) {
+          args.remove_urls = fields.remove_urls;
+        }
       }
 
       await this._client.callTool(toolName, args);
@@ -3965,6 +4026,15 @@ export class TranscriptDetailViewProvider {
     return map;
   }
 
+  /** Inner HTML for one project link label (http/https only become anchors). */
+  private projectUrlLabelInnerHtml(url: string): string {
+    const t = url.trim();
+    if (/^https?:\/\//i.test(t)) {
+      return `<a href="${this.escapeHtml(t)}" target="_blank" rel="noopener noreferrer">${this.escapeHtml(t)}</a>`;
+    }
+    return this.escapeHtml(t);
+  }
+
   private getEntityContent(entityType: string, entityId: string, content: string, entityData?: {
     name?: string;
     id?: string;
@@ -3988,9 +4058,20 @@ export class TranscriptDetailViewProvider {
     // Extract description - person entities use "context" field, others use "description"
     const description = entityData.description || data.context as string || '';
     const topics = entityData.topics || [];
+    const relatedPlansTotal =
+      typeof data.related_plans_total === 'number' && Number.isFinite(data.related_plans_total)
+        ? data.related_plans_total
+        : null;
 
     // Extract entity-specific fields
     const soundsLike: string[] = Array.isArray(data.sounds_like) ? data.sounds_like as string[] : [];
+    const projectUrls: string[] =
+      entityType === 'project' && Array.isArray(data.urls)
+        ? (data.urls as unknown[])
+            .filter((u): u is string => typeof u === 'string')
+            .map((u) => u.trim())
+            .filter((u) => u.length > 0)
+        : [];
     const role = (data.role as string) || '';
     const company = (data.company as string) || '';
 
@@ -4068,6 +4149,42 @@ export class TranscriptDetailViewProvider {
         </div>
       `);
     }
+
+    const descriptionSectionHtml = `
+    <div class="description" id="description-section">
+        <h2>Description</h2>
+        <div class="entity-content" id="description-display">
+            ${description ? this.markdownToHtml(description) : '<span class="empty-state">No description</span>'}
+        </div>
+        <textarea class="edit-description-area hidden" id="edit-description-input">${this.escapeHtml(description)}</textarea>
+    </div>`;
+
+    const projectUrlsSectionHtml =
+      entityType === 'project'
+        ? `
+    <div class="urls-section" id="project-urls-section">
+        <h2>Links</h2>
+        <div class="urls-tags" id="project-urls-tags">
+            ${
+              projectUrls.length > 0
+                ? projectUrls
+                    .map(
+                      (u) => `
+            <span class="project-url-tag" data-value="${this.escapeHtml(u)}">
+                <span class="project-url-tag-label">${this.projectUrlLabelInnerHtml(u)}</span>
+                <button type="button" class="remove-url" title="Remove">&times;</button>
+            </span>`
+                    )
+                    .join('')
+                : '<span class="empty-urls" id="empty-project-urls">No links yet</span>'
+            }
+        </div>
+        <div class="urls-add">
+            <input type="text" class="urls-add-input" id="project-urls-add-input" placeholder="https://..." />
+            <button type="button" class="urls-add-btn" id="project-urls-add-btn">Add link</button>
+        </div>
+    </div>`
+        : '';
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -4319,6 +4436,73 @@ export class TranscriptDetailViewProvider {
             font-size: 0.9em;
             color: var(--vscode-descriptionForeground);
             white-space: nowrap;
+        }
+        .related-plans {
+            margin-top: 24px;
+            margin-bottom: 24px;
+        }
+        .related-plans h2 {
+            color: var(--vscode-textLink-foreground);
+            margin-top: 0;
+            margin-bottom: 12px;
+        }
+        .related-plans-table {
+            width: 100%;
+            border-collapse: collapse;
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .related-plans-table th {
+            text-align: left;
+            padding: 8px 12px;
+            font-weight: 600;
+            font-size: 0.85em;
+            color: var(--vscode-descriptionForeground);
+            background-color: var(--vscode-editor-inactiveSelectionBackground);
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        .related-plans-table td {
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+            vertical-align: top;
+        }
+        .related-plans-table tr:last-child td {
+            border-bottom: none;
+        }
+        .related-plans-table .plan-title {
+            font-weight: 500;
+            color: var(--vscode-foreground);
+        }
+        .related-plans-table .plan-id {
+            font-size: 0.8em;
+            color: var(--vscode-descriptionForeground);
+            font-family: var(--vscode-editor-font-family);
+            margin-top: 2px;
+        }
+        .related-plans-pagination {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-top: 12px;
+            flex-wrap: wrap;
+        }
+        .related-plans-pagination button {
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            padding: 4px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85em;
+        }
+        .related-plans-pagination button:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+        .related-plans-page-label {
+            font-size: 0.9em;
+            color: var(--vscode-descriptionForeground);
         }
         .loading {
             color: var(--vscode-descriptionForeground);
@@ -4620,6 +4804,98 @@ export class TranscriptDetailViewProvider {
         .add-project-btn:hover {
             background-color: var(--vscode-button-secondaryHoverBackground);
         }
+        .urls-section {
+            margin-bottom: 24px;
+        }
+        .urls-section h2 {
+            color: var(--vscode-textLink-foreground);
+            margin-top: 0;
+            margin-bottom: 12px;
+        }
+        .urls-tags {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .project-url-tag {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            background-color: var(--vscode-editor-inactiveSelectionBackground);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 4px;
+            padding: 8px 10px;
+            font-size: 0.95em;
+        }
+        .project-url-tag-label {
+            flex: 1;
+            min-width: 0;
+            word-break: break-all;
+        }
+        .project-url-tag-label a {
+            color: var(--vscode-textLink-foreground);
+        }
+        .project-url-tag .remove-url {
+            display: none;
+            cursor: pointer;
+            opacity: 0.7;
+            font-size: 1.1em;
+            line-height: 1;
+            padding: 0 4px;
+            border: none;
+            background: none;
+            color: inherit;
+            flex-shrink: 0;
+        }
+        .project-url-tag .remove-url:hover {
+            opacity: 1;
+        }
+        .editing .project-url-tag .remove-url {
+            display: inline-flex;
+        }
+        .urls-add {
+            display: none;
+            gap: 8px;
+            align-items: center;
+            margin-top: 8px;
+        }
+        .editing .urls-add {
+            display: flex;
+        }
+        .urls-add-input {
+            flex: 1;
+            min-width: 120px;
+            max-width: 480px;
+            background: var(--vscode-input-background);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 4px;
+            padding: 4px 8px;
+            color: var(--vscode-input-foreground);
+            font-family: var(--vscode-font-family);
+            font-size: var(--vscode-font-size);
+            outline: none;
+        }
+        .urls-add-input:focus {
+            border-color: var(--vscode-focusBorder);
+        }
+        .urls-add-btn {
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85em;
+        }
+        .urls-add-btn:hover {
+            background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .empty-urls {
+            color: var(--vscode-descriptionForeground);
+            font-style: italic;
+        }
     </style>
 </head>
 <body>
@@ -4661,6 +4937,32 @@ export class TranscriptDetailViewProvider {
             </div>
         </div>
         ` : ''}
+    </div>
+    ` : ''}
+    ${entityType === 'project' ? descriptionSectionHtml : ''}
+    ${projectUrlsSectionHtml}
+    ${entityType === 'project' ? `
+    <div class="related-plans" id="related-plans-section">
+        <h2 id="related-plans-heading">Related Plans${relatedPlansTotal !== null ? ` (${relatedPlansTotal})` : ''}</h2>
+        <div id="related-plans-content">
+            <div class="loading" id="related-plans-loading">Loading plans…</div>
+            <table class="related-plans-table hidden" id="related-plans-table">
+                <thead>
+                    <tr>
+                        <th>Title</th>
+                        <th>Stage</th>
+                        <th>Created</th>
+                    </tr>
+                </thead>
+                <tbody id="related-plans-tbody"></tbody>
+            </table>
+            <div class="empty-state hidden" id="related-plans-empty">No related plans.</div>
+            <div class="related-plans-pagination hidden" id="related-plans-pagination">
+                <button type="button" id="related-plans-prev">Previous</button>
+                <span class="related-plans-page-label" id="related-plans-page-label"></span>
+                <button type="button" id="related-plans-next">Next</button>
+            </div>
+        </div>
     </div>
     ` : ''}
     ${editableFields.length > 0 ? `
@@ -4707,13 +5009,7 @@ export class TranscriptDetailViewProvider {
         <button class="add-project-btn" id="add-project-btn">Associate Project...</button>
     </div>
     ` : ''}
-    <div class="description" id="description-section">
-        <h2>Description</h2>
-        <div class="entity-content" id="description-display">
-            ${description ? this.markdownToHtml(description) : '<span class="empty-state">No description</span>'}
-        </div>
-        <textarea class="edit-description-area hidden" id="edit-description-input">${this.escapeHtml(description)}</textarea>
-    </div>
+    ${entityType !== 'project' ? descriptionSectionHtml : ''}
     <div class="edit-actions hidden" id="edit-actions">
         <button class="save-button" id="save-edit-button">Save</button>
         <button class="cancel-button" id="cancel-edit-button">Cancel</button>
@@ -4851,6 +5147,89 @@ export class TranscriptDetailViewProvider {
         let soundsLikeAdded = [];
         let soundsLikeRemoved = [];
 
+        const isProject = entityType === 'project';
+        const originalProjectUrls = isProject ? ${JSON.stringify(projectUrls)} : [];
+        let urlsAdded = [];
+        let urlsRemoved = [];
+
+        function projectUrlLinkHtml(u) {
+            var t = (u || '').trim();
+            if (/^https?:\\/\\//i.test(t)) {
+                return '<a href="' + escapeHtml(t) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(t) + '</a>';
+            }
+            return escapeHtml(t);
+        }
+
+        function getWorkingProjectUrls() {
+            return originalProjectUrls.filter(function(u) { return urlsRemoved.indexOf(u) === -1; }).concat(urlsAdded);
+        }
+
+        function renderProjectUrlTags(urlList) {
+            var container = document.getElementById('project-urls-tags');
+            if (!container || !isProject) return;
+            if (!urlList || urlList.length === 0) {
+                container.innerHTML = '<span class="empty-urls" id="empty-project-urls">No links yet</span>';
+                return;
+            }
+            container.innerHTML = urlList.map(function(u) {
+                return '<span class="project-url-tag" data-value="' + escapeHtml(u) + '">' +
+                    '<span class="project-url-tag-label">' + projectUrlLinkHtml(u) + '</span>' +
+                    '<button type="button" class="remove-url" title="Remove">&times;</button>' +
+                    '</span>';
+            }).join('');
+        }
+
+        function addProjectUrlFromInput() {
+            if (!isProject) return;
+            var input = document.getElementById('project-urls-add-input');
+            if (!input) return;
+            var value = input.value.trim();
+            if (!value) return;
+            var working = getWorkingProjectUrls();
+            if (working.indexOf(value) !== -1) {
+                input.value = '';
+                return;
+            }
+            urlsAdded.push(value);
+            input.value = '';
+            renderProjectUrlTags(working.concat([value]));
+        }
+
+        function removeProjectUrlTag(value) {
+            if (!isEditing || !isProject) return;
+            var idxAdded = urlsAdded.indexOf(value);
+            if (idxAdded !== -1) {
+                urlsAdded.splice(idxAdded, 1);
+            } else {
+                urlsRemoved.push(value);
+            }
+            renderProjectUrlTags(getWorkingProjectUrls());
+        }
+
+        function setupProjectUrlsListeners() {
+            if (!isProject) return;
+            var addBtn = document.getElementById('project-urls-add-btn');
+            var addInput = document.getElementById('project-urls-add-input');
+            if (addBtn) {
+                addBtn.addEventListener('click', function() { addProjectUrlFromInput(); });
+            }
+            if (addInput) {
+                addInput.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter') { e.preventDefault(); addProjectUrlFromInput(); }
+                });
+            }
+            var urlTags = document.getElementById('project-urls-tags');
+            if (urlTags) {
+                urlTags.addEventListener('click', function(e) {
+                    var btn = e.target.closest('.remove-url');
+                    if (btn) {
+                        var tag = btn.closest('.project-url-tag');
+                        if (tag && tag.dataset.value) removeProjectUrlTag(tag.dataset.value);
+                    }
+                });
+            }
+        }
+
         function setupEditButton() {
             const editButton = document.getElementById('edit-button');
             if (editButton) {
@@ -4924,6 +5303,8 @@ export class TranscriptDetailViewProvider {
             // Reset sounds-like tracking
             soundsLikeAdded = [];
             soundsLikeRemoved = [];
+            urlsAdded = [];
+            urlsRemoved = [];
         }
 
         function cancelEdit() {
@@ -4958,6 +5339,9 @@ export class TranscriptDetailViewProvider {
             soundsLikeAdded = [];
             soundsLikeRemoved = [];
             renderSoundsLikeTags(currentSoundsLike);
+            urlsAdded = [];
+            urlsRemoved = [];
+            if (isProject) renderProjectUrlTags(originalProjectUrls);
         }
 
         function saveEdit() {
@@ -4997,6 +5381,11 @@ export class TranscriptDetailViewProvider {
             // Collect sounds_like changes
             if (soundsLikeAdded.length > 0) fields.add_sounds_like = soundsLikeAdded;
             if (soundsLikeRemoved.length > 0) fields.remove_sounds_like = soundsLikeRemoved;
+
+            if (isProject) {
+                if (urlsAdded.length > 0) fields.add_urls = urlsAdded;
+                if (urlsRemoved.length > 0) fields.remove_urls = urlsRemoved;
+            }
 
             if (Object.keys(fields).length === 0) {
                 cancelEdit();
@@ -5076,6 +5465,128 @@ export class TranscriptDetailViewProvider {
                 entityId: entityId
             });
         }
+
+        const PROJECT_PLANS_PAGE_SIZE = 25;
+
+        function requestProjectPlansPage(page) {
+            if (entityType !== 'project') {
+                return;
+            }
+            const loading = document.getElementById('related-plans-loading');
+            if (loading) {
+                loading.classList.remove('hidden');
+                loading.classList.add('loading');
+                loading.textContent = 'Loading plans…';
+            }
+            vscode.postMessage({
+                command: 'loadProjectPlans',
+                projectId: entityId,
+                page: page,
+                pageSize: PROJECT_PLANS_PAGE_SIZE
+            });
+        }
+
+        function formatPlanCreated(value) {
+            if (!value || typeof value !== 'string') {
+                return '—';
+            }
+            const d = Date.parse(value);
+            if (Number.isNaN(d)) {
+                return value;
+            }
+            return new Date(d).toLocaleString();
+        }
+
+        function renderProjectPlansPage(message) {
+            const loading = document.getElementById('related-plans-loading');
+            const table = document.getElementById('related-plans-table');
+            const tbody = document.getElementById('related-plans-tbody');
+            const empty = document.getElementById('related-plans-empty');
+            const pag = document.getElementById('related-plans-pagination');
+            const prev = document.getElementById('related-plans-prev');
+            const next = document.getElementById('related-plans-next');
+            const label = document.getElementById('related-plans-page-label');
+            const heading = document.getElementById('related-plans-heading');
+            if (loading) {
+                loading.classList.add('hidden');
+            }
+            const total = typeof message.total === 'number' ? message.total : 0;
+            if (heading) {
+                heading.textContent = total > 0 ? 'Related Plans (' + total + ')' : 'Related Plans';
+            }
+            if (!tbody || !table || !empty || !pag) {
+                return;
+            }
+            tbody.innerHTML = '';
+            const plans = message.plans || [];
+            if (plans.length === 0 && total === 0) {
+                empty.classList.remove('hidden');
+                table.classList.add('hidden');
+                pag.classList.add('hidden');
+                return;
+            }
+            empty.classList.add('hidden');
+            table.classList.remove('hidden');
+            for (let i = 0; i < plans.length; i++) {
+                const p = plans[i];
+                const tr = document.createElement('tr');
+                const tdTitle = document.createElement('td');
+                const titleDiv = document.createElement('div');
+                titleDiv.className = 'plan-title';
+                titleDiv.textContent = p.title || '';
+                tdTitle.appendChild(titleDiv);
+                if (p.id && p.id !== p.title) {
+                    const idDiv = document.createElement('div');
+                    idDiv.className = 'plan-id';
+                    idDiv.textContent = p.id;
+                    tdTitle.appendChild(idDiv);
+                }
+                const tdStage = document.createElement('td');
+                tdStage.textContent = p.stage && String(p.stage).trim().length > 0 ? p.stage : '—';
+                const tdCreated = document.createElement('td');
+                tdCreated.textContent = formatPlanCreated(p.createdAt);
+                tr.appendChild(tdTitle);
+                tr.appendChild(tdStage);
+                tr.appendChild(tdCreated);
+                tbody.appendChild(tr);
+            }
+            const page = typeof message.page === 'number' && message.page >= 1 ? message.page : 1;
+            const pageSize = typeof message.pageSize === 'number' && message.pageSize >= 1
+                ? message.pageSize
+                : PROJECT_PLANS_PAGE_SIZE;
+            const pageCount = Math.max(1, Math.ceil(total / pageSize));
+            if (total <= pageSize) {
+                pag.classList.add('hidden');
+            } else {
+                pag.classList.remove('hidden');
+                if (label) {
+                    label.textContent = 'Page ' + page + ' of ' + pageCount;
+                }
+                if (prev) {
+                    prev.disabled = page <= 1;
+                    prev.onclick = function() {
+                        if (page > 1) {
+                            requestProjectPlansPage(page - 1);
+                        }
+                    };
+                }
+                if (next) {
+                    next.disabled = page >= pageCount;
+                    next.onclick = function() {
+                        if (page < pageCount) {
+                            requestProjectPlansPage(page + 1);
+                        }
+                    };
+                }
+            }
+        }
+
+        function setupProjectPlansSection() {
+            if (entityType !== 'project') {
+                return;
+            }
+            requestProjectPlansPage(1);
+        }
         
         // Handle messages from extension (e.g., related transcripts data, edit results)
         window.addEventListener('message', event => {
@@ -5085,6 +5596,25 @@ export class TranscriptDetailViewProvider {
                     console.log('Protokoll Entity: Received related transcripts', message.transcripts);
                     renderRelatedTranscripts(message.transcripts);
                     break;
+                case 'projectPlansPage':
+                    renderProjectPlansPage(message);
+                    break;
+                case 'projectPlansError': {
+                    const loading = document.getElementById('related-plans-loading');
+                    if (loading) {
+                        loading.classList.remove('hidden');
+                        loading.classList.remove('loading');
+                        loading.textContent = 'Could not load plans. ' + (message.message || 'Unknown error');
+                    }
+                    break;
+                }
+                case 'refreshComplete': {
+                    const refreshButton = document.getElementById('refresh-button');
+                    if (refreshButton) {
+                        refreshButton.disabled = false;
+                    }
+                    break;
+                }
                 case 'editResult': {
                     const editStatus = document.getElementById('edit-status');
                     const saveButton = document.getElementById('save-edit-button');
@@ -5200,8 +5730,10 @@ export class TranscriptDetailViewProvider {
         setupInlineChatListeners();
         setupRefreshButton();
         setupEditButton();
+        setupProjectUrlsListeners();
         setupProjectAssociation();
         loadRelatedTranscripts();
+        setupProjectPlansSection();
         
         // Also run on DOMContentLoaded as backup
         if (document.readyState === 'loading') {
@@ -5209,20 +5741,10 @@ export class TranscriptDetailViewProvider {
                 setupInlineChatListeners();
                 setupRefreshButton();
                 setupEditButton();
+                setupProjectUrlsListeners();
                 setupProjectAssociation();
             });
         }
-        
-        // Handle refresh completion message from extension
-        window.addEventListener('message', event => {
-            const message = event.data;
-            if (message.command === 'refreshComplete') {
-                const refreshButton = document.getElementById('refresh-button');
-                if (refreshButton) {
-                    refreshButton.disabled = false;
-                }
-            }
-        });
     </script>
 </body>
 </html>`;
