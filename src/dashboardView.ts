@@ -16,6 +16,18 @@ import * as vscode from 'vscode';
 import { randomUUID } from 'crypto';
 import { McpClient } from './mcpClient';
 import { UploadService } from './uploadService';
+import type { TranscriptsViewProvider, ServerClientEntry } from './transcriptsView';
+import type { Transcript } from './types';
+
+/** Payload for the Transcripts stats table + scope copy (sent to the webview). */
+export interface DashboardStatsPayload {
+  totalCount: number;
+  projects: Array<{ id: string | null; name: string; total: number; statuses: Record<string, number> }>;
+  scopeTitle: string;
+  scopeDetail: string;
+  showServerFilterButton: boolean;
+  queueNote: string | null;
+}
 
 /** Shape of an inbound message from the webview */
 interface WebviewMessage {
@@ -42,11 +54,40 @@ export class DashboardViewProvider {
   private _debounceTimer: NodeJS.Timeout | undefined;
   /** Small TTL cache to avoid repeated expensive stats scans. */
   private _statsCache: {
+    cacheKey: string;
     fetchedAtMs: number;
-    data: { totalCount: number; projects: Array<{ id: string | null; name: string; total: number; statuses: Record<string, number> }> };
+    data: DashboardStatsPayload;
   } | null = null;
 
+  private _transcriptsProvider: TranscriptsViewProvider | null = null;
+  private _serverClients: ServerClientEntry[] = [];
+  /** Display name for the active MCP connection (single-server / queue context). */
+  private _primaryServerLabel = '';
+
   constructor(private readonly _extensionUri: vscode.Uri) {}
+
+  /** Same merged connections as the Transcripts tree; drives multi-server stats. */
+  setServerClients(entries: ServerClientEntry[]): void {
+    this._serverClients = entries;
+    this._statsCache = null;
+    /** Intentionally no refresh here — avoids doubling traffic with show()/sync (HTTP 429). */
+  }
+
+  /** After connection list changes; debounced refresh when the dashboard is already open. */
+  scheduleDataRefreshDebouncedIfVisible(): void {
+    if (this._panel?.visible) {
+      this._scheduleDebouncedRefresh();
+    }
+  }
+
+  setTranscriptsProvider(provider: TranscriptsViewProvider | null): void {
+    this._transcriptsProvider = provider;
+    this._statsCache = null;
+  }
+
+  setPrimaryServerLabel(name: string): void {
+    this._primaryServerLabel = name.trim();
+  }
 
   setClient(client: McpClient): void {
     // Tear down handlers from any previous client before switching
@@ -126,6 +167,10 @@ export class DashboardViewProvider {
     }
 
     // Push initial data immediately after the panel is ready, then start watchdog
+    if (this._debounceTimer) {
+      clearTimeout(this._debounceTimer);
+      this._debounceTimer = undefined;
+    }
     await this._refreshData();
     this._startWatchdog();
   }
@@ -207,7 +252,10 @@ export class DashboardViewProvider {
         this._fetchStats(),
       ]);
 
-      this.postMessage({ type: 'update-queue', data: queueData });
+      this.postMessage({
+        type: 'update-queue',
+        data: { ...queueData, queueNote: stats.queueNote },
+      });
       this.postMessage({ type: 'update-worker', data: workerStatus });
       this.postMessage({ type: 'update-stats', data: stats });
     } catch (err) {
@@ -270,93 +318,207 @@ export class DashboardViewProvider {
     }
   }
 
+  private _getServerFilterSet(): Set<string> {
+    return this._transcriptsProvider ? this._transcriptsProvider.getServerFilters() : new Set();
+  }
+
+  /** Connected servers included in stats after applying the sidebar/server filter. */
+  private _targetServerEntries(): ServerClientEntry[] {
+    if (this._serverClients.length === 0) {
+      return [];
+    }
+    const filter = this._getServerFilterSet();
+    if (filter.size === 0) {
+      return [...this._serverClients];
+    }
+    return this._serverClients.filter((e) => filter.has(e.id));
+  }
+
+  private _statsCacheKey(): string {
+    const conn = this._serverClients.map((c) => c.id).sort().join(',');
+    const filt = [...this._getServerFilterSet()].sort().join(',');
+    return `${conn}::${filt}`;
+  }
+
+  /**
+   * Load transcript rows for stats: merged across connected servers when configured,
+   * using the same server filter as the Transcripts tree.
+   */
+  private async _collectTranscriptsForStats(): Promise<Transcript[]> {
+    const pageLimit = 250;
+    const maxPages = 40;
+    const merged: Transcript[] = [];
+
+    if (this._serverClients.length > 0) {
+      for (const entry of this._targetServerEntries()) {
+        let offset = 0;
+        for (let page = 0; page < maxPages; page++) {
+          const pageResult = await entry.client.listTranscripts({ limit: pageLimit, offset });
+          const rows = pageResult.transcripts ?? [];
+          for (const t of rows) {
+            merged.push({
+              ...t,
+              serverId: entry.id,
+              serverName: entry.name,
+            });
+          }
+          if (!pageResult.pagination?.hasMore || rows.length === 0) {
+            break;
+          }
+          offset += pageLimit;
+        }
+      }
+      return merged;
+    }
+
+    if (!this._mcpClient) {
+      return [];
+    }
+
+    let offset = 0;
+    const fallbackLabel = this._primaryServerLabel.trim() || 'this server';
+    for (let page = 0; page < maxPages; page++) {
+      const pageResult = await this._mcpClient.listTranscripts({ limit: pageLimit, offset });
+      const rows = pageResult.transcripts ?? [];
+      for (const t of rows) {
+        merged.push({
+          ...t,
+          serverName: t.serverName?.trim() ? t.serverName : fallbackLabel,
+        });
+      }
+      if (!pageResult.pagination?.hasMore || rows.length === 0) {
+        break;
+      }
+      offset += pageLimit;
+    }
+    return merged;
+  }
+
+  private _aggregateTranscriptRows(
+    transcripts: Transcript[]
+  ): { totalCount: number; projects: DashboardStatsPayload['projects'] } {
+    const projectMap = new Map<string, { id: string | null; statuses: Record<string, number> }>();
+    let totalCount = 0;
+
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const nameCanonical = new Map<string, string>();
+
+    for (const t of transcripts) {
+      totalCount++;
+      const projectEntity = t.entities?.projects?.[0];
+      const rawName = projectEntity?.name;
+      const rawProjectName = rawName && !UUID_RE.test(rawName) ? rawName : 'Unassigned';
+      const lowerKey = rawProjectName.toLowerCase();
+      if (!nameCanonical.has(lowerKey)) {
+        nameCanonical.set(lowerKey, rawProjectName);
+      }
+      const projectName = nameCanonical.get(lowerKey)!;
+      const projectId = (projectName !== 'Unassigned' ? projectEntity?.id : null) ?? null;
+      if (!projectMap.has(projectName)) {
+        projectMap.set(projectName, { id: projectId, statuses: {} });
+      }
+      const entry = projectMap.get(projectName)!;
+      const rawStatus: string = t.status ?? 'unknown';
+      const status = rawStatus === 'open' ? 'in_progress' : rawStatus;
+      entry.statuses[status] = (entry.statuses[status] ?? 0) + 1;
+    }
+
+    const projects = Array.from(projectMap.entries())
+      .map(([name, { id, statuses }]) => ({
+        id,
+        name,
+        total: Object.values(statuses).reduce((a, b) => a + b, 0),
+        statuses,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    return { totalCount, projects };
+  }
+
   /**
    * Fetch transcript statistics: total count and per-project status breakdown.
    * Uses listTranscripts to build stats; groups by project (entities.projects),
    * counts by status. Transcripts without a project appear under "Unassigned".
+   * When multiple MCP servers are connected, merges counts the same way as the Transcripts tree.
    */
-  private async _fetchStats(): Promise<{
-    totalCount: number;
-    projects: Array<{ id: string | null; name: string; total: number; statuses: Record<string, number> }>;
-  }> {
+  private async _fetchStats(): Promise<DashboardStatsPayload> {
+    const empty = (partial: Partial<DashboardStatsPayload> = {}): DashboardStatsPayload => ({
+      totalCount: 0,
+      projects: [],
+      scopeTitle: 'Not connected to Protokoll.',
+      scopeDetail: 'Configure a server connection to load transcript statistics.',
+      showServerFilterButton: false,
+      queueNote: null,
+      ...partial,
+    });
+
     if (!this._mcpClient) {
-      return { totalCount: 0, projects: [] };
+      return empty();
     }
 
     try {
+      const cacheKey = this._statsCacheKey();
       const now = Date.now();
-      if (this._statsCache && now - this._statsCache.fetchedAtMs < 15_000) {
+      if (
+        this._statsCache &&
+        this._statsCache.cacheKey === cacheKey &&
+        now - this._statsCache.fetchedAtMs < 15_000
+      ) {
         return this._statsCache.data;
       }
 
-      const transcripts: Array<{
-        entities?: { projects?: Array<{ id?: string; name?: string }> };
-        status?: string;
-      }> = [];
-      const pageLimit = 250;
-      const maxPages = 40; // Caps dashboard stats at 10k rows.
-      let offset = 0;
-      for (let page = 0; page < maxPages; page++) {
-        const pageResult = await this._mcpClient.listTranscripts({ limit: pageLimit, offset });
-        const rows = (pageResult.transcripts || []) as Array<{
-          entities?: { projects?: Array<{ id?: string; name?: string }> };
-          status?: string;
-        }>;
-        transcripts.push(...rows);
-        if (!pageResult.pagination?.hasMore || rows.length === 0) {
-          break;
-        }
-        offset += pageLimit;
+      const transcripts = await this._collectTranscriptsForStats();
+      const { totalCount, projects } = this._aggregateTranscriptRows(transcripts);
+
+      const allConnected = this._serverClients;
+      const targets = this._targetServerEntries();
+      const filterActive = this._getServerFilterSet().size > 0;
+      const multi = allConnected.length > 1;
+      const allNames = allConnected.map((e) => e.name).join(', ');
+      const targetNames = targets.map((e) => e.name).join(', ');
+
+      let scopeTitle: string;
+      let scopeDetail: string;
+
+      if (allConnected.length === 0) {
+        const label = this._primaryServerLabel.trim() || 'your Protokoll server';
+        scopeTitle = `Transcript totals reflect one MCP connection (${label}).`;
+        scopeDetail =
+          'This is the active server only. Add more connections under Connection Status to merge transcript statistics from multiple servers.';
+      } else if (allConnected.length === 1) {
+        scopeTitle = `Transcript totals reflect ${allConnected[0].name}.`;
+        scopeDetail = 'One server is connected.';
+      } else if (!filterActive) {
+        scopeTitle = `Transcript totals combine all ${allConnected.length} connected servers.`;
+        scopeDetail = `Servers included: ${allNames}.`;
+      } else {
+        scopeTitle = `Transcript totals include ${targets.length} of ${allConnected.length} servers (filtered).`;
+        scopeDetail = `Filtered to: ${targetNames}. Uses the same server filter as the Transcripts sidebar.`;
       }
 
-      const projectMap = new Map<string, { id: string | null; statuses: Record<string, number> }>();
-      let totalCount = 0;
+      const queueNote = multi
+        ? `The transcription queue below is from the active server${
+            this._primaryServerLabel.trim() ? ` (${this._primaryServerLabel.trim()})` : ''
+          } only—not merged across every connection.`
+        : null;
 
-      const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      // Maps lowercase project name → canonical (first-seen) display name, for case-insensitive grouping
-      const nameCanonical = new Map<string, string>();
-
-      for (const t of transcripts) {
-        totalCount++;
-        const projectEntity = t.entities?.projects?.[0];
-        const rawName = projectEntity?.name;
-        // If the stored project name is a UUID it's corrupted data — treat as unassigned
-        const rawProjectName = (rawName && !UUID_RE.test(rawName)) ? rawName : 'Unassigned';
-        // Merge projects that differ only by case (use the first-seen casing as the canonical name)
-        const lowerKey = rawProjectName.toLowerCase();
-        if (!nameCanonical.has(lowerKey)) {
-          nameCanonical.set(lowerKey, rawProjectName);
-        }
-        const projectName = nameCanonical.get(lowerKey)!;
-        const projectId = (projectName !== 'Unassigned' ? projectEntity?.id : null) ?? null;
-        if (!projectMap.has(projectName)) {
-          projectMap.set(projectName, { id: projectId, statuses: {} });
-        }
-        const entry = projectMap.get(projectName)!;
-        // Normalise legacy 'open' status to 'in_progress'
-        const rawStatus: string = t.status ?? 'unknown';
-        const status = rawStatus === 'open' ? 'in_progress' : rawStatus;
-        entry.statuses[status] = (entry.statuses[status] ?? 0) + 1;
-      }
-
-      const projects = Array.from(projectMap.entries())
-        .map(([name, { id, statuses }]) => ({
-          id,
-          name,
-          total: Object.values(statuses).reduce((a, b) => a + b, 0),
-          statuses,
-        }))
-        .sort((a, b) => a.name.localeCompare(b.name));
-
-      const data = { totalCount, projects };
-      this._statsCache = {
-        fetchedAtMs: now,
-        data,
+      const data: DashboardStatsPayload = {
+        totalCount,
+        projects,
+        scopeTitle,
+        scopeDetail,
+        showServerFilterButton: multi,
+        queueNote,
       };
+
+      this._statsCache = { cacheKey, fetchedAtMs: now, data };
       return data;
     } catch (err) {
       console.error('Protokoll: [DASHBOARD] Failed to fetch stats:', err);
-      return { totalCount: 0, projects: [] };
+      return empty({
+        scopeTitle: 'Could not load transcript statistics.',
+        scopeDetail: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -409,6 +571,10 @@ export class DashboardViewProvider {
 
       case 'filter-project':
         await vscode.commands.executeCommand('protokoll.applyProjectFilter', message.projectId ?? null);
+        break;
+
+      case 'filter-servers':
+        await vscode.commands.executeCommand('protokoll.filterByServer');
         break;
 
       case 'navigate':
@@ -540,16 +706,39 @@ export class DashboardViewProvider {
     #stats-section, #queue-section { min-height: 48px; }
 
     /* ── Stats table (Step 7) ───────────────────────────────────────────── */
+    .stats-scope {
+      margin-bottom: 16px;
+      padding: 10px 12px;
+      border-radius: 6px;
+      background: var(--vscode-editor-inactiveSelectionBackground, rgba(128,128,128,.12));
+      border: 1px solid var(--vscode-widget-border, rgba(128,128,128,.2));
+    }
+
+    .stats-scope-title {
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 4px;
+      color: var(--vscode-editor-foreground);
+    }
+
+    .stats-scope-detail {
+      font-size: 12px;
+      color: var(--vscode-descriptionForeground);
+      line-height: 1.45;
+    }
+
     .stats-header {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
       margin-bottom: 16px;
     }
 
     .stats-header h2 {
       margin: 0;
       color: var(--vscode-editor-foreground);
+      flex: 1 1 auto;
     }
 
     .total-badge {
@@ -739,6 +928,14 @@ export class DashboardViewProvider {
       font-size: 11px;
       color: var(--vscode-descriptionForeground);
     }
+
+    .queue-scope-note {
+      font-size: 12px;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 10px;
+      line-height: 1.45;
+      max-width: 72ch;
+    }
   </style>
 </head>
 <body>
@@ -817,11 +1014,23 @@ export class DashboardViewProvider {
         return;
       }
 
-      const { totalCount, projects } = data;
+      const { totalCount, projects, scopeTitle, scopeDetail, showServerFilterButton } = data;
+      const colCount = 2 + ALL_STATUSES.length;
       const template = html\`
+        \${scopeTitle ? html\`
+          <div class="stats-scope">
+            <div class="stats-scope-title">\${scopeTitle}</div>
+            \${scopeDetail ? html\`<div class="stats-scope-detail">\${scopeDetail}</div>\` : ''}
+          </div>
+        \` : ''}
         <div class="stats-header">
           <h2>Transcripts</h2>
           <span class="total-badge">\${totalCount} total</span>
+          \${showServerFilterButton ? html\`
+            <button type="button" class="btn btn-secondary" @click=\${() => vscode.postMessage({ type: 'filter-servers' })}>
+              Filter servers…
+            </button>
+          \` : ''}
         </div>
         <table class="stats-table">
           <thead>
@@ -838,7 +1047,7 @@ export class DashboardViewProvider {
           </thead>
           <tbody>
             \${projects.length === 0
-              ? html\`<tr><td colspan="12" class="placeholder">No transcripts yet</td></tr>\`
+              ? html\`<tr><td colspan="\${colCount}" class="placeholder">No transcripts yet</td></tr>\`
               : projects.map(p => html\`
                 <tr class="clickable-row" @click=\${() => vscode.postMessage({ type: 'filter-project', projectId: p.id })}>
                   <td class="project-name">\${p.name}</td>
@@ -896,6 +1105,7 @@ export class DashboardViewProvider {
 
       if (!data || (data.pending?.length === 0 && data.processing?.length === 0 && data.recent?.length === 0)) {
         render(html\`
+          \${data?.queueNote ? html\`<p class="queue-scope-note">\${data.queueNote}</p>\` : ''}
           <div class="queue-header">
             <h2>Transcription Queue</h2>
             <span class="idle-badge">Idle</span>
@@ -917,6 +1127,7 @@ export class DashboardViewProvider {
       ];
 
       const template = html\`
+        \${data.queueNote ? html\`<p class="queue-scope-note">\${data.queueNote}</p>\` : ''}
         <div class="queue-header">
           <h2>Transcription Queue</h2>
           \${totalPending > 0
