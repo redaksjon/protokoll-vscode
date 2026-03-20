@@ -16,8 +16,22 @@ import type {
 import { resolveAgent } from './proxyUtils';
 import { appendScopedApiKeyHeaders } from './multiServer/auth';
 
+/** Parse Retry-After (seconds) for HTTP 429; cap so the UI never waits unreasonably long. */
+function parseRetryAfterMs(header: string | string[] | undefined): number | undefined {
+  if (header === undefined) {
+    return undefined;
+  }
+  const raw = Array.isArray(header) ? header[0] : header;
+  const sec = parseInt(String(raw).trim(), 10);
+  if (Number.isNaN(sec) || sec < 0) {
+    return undefined;
+  }
+  return Math.min(sec * 1000, 60_000);
+}
+
 export class McpClient {
   private static readonly REQUEST_TIMEOUT_MS = 15000;
+  private static readonly RATE_LIMIT_429_RETRIES = 5;
   private sessionId: string | null = null;
   private serverUrl: string;
   private sseConnection: http.ClientRequest | null = null; // HTTP request for SSE connection (works for both http and https)
@@ -27,6 +41,10 @@ export class McpClient {
   private onSessionRecoveredCallbacks: Array<() => void | Promise<void>> = []; // Callbacks to run after session recovery
   private apiKey?: string;
   private readonly profileUrl: string;
+  /** One in-flight POST /mcp at a time per client; reentrant so session recovery can nest. */
+  private mcpPostLockDepth = 0;
+  private mcpPostLockTail: Promise<void> = Promise.resolve();
+  private mcpPostUnlock: (() => void) | null = null;
 
   constructor(serverUrl: string, options?: { apiKey?: string }) {
     // Remove trailing slash to ensure consistent URL handling
@@ -141,9 +159,6 @@ export class McpClient {
   }
 
   /**
-   * Send a JSON-RPC request with automatic session recovery
-   */
-  /**
    * Extract JSON-RPC response from SSE-formatted response body.
    * The server may respond to POST requests with text/event-stream format,
    * where JSON-RPC messages are wrapped in SSE "event: message" / "data: ..." lines.
@@ -163,7 +178,65 @@ export class McpClient {
     return JSON.parse(jsonStr);
   }
 
+  private async acquireMcpPostLock(): Promise<void> {
+    if (this.mcpPostLockDepth > 0) {
+      this.mcpPostLockDepth += 1;
+      return;
+    }
+    const ticket = this.mcpPostLockTail;
+    let unblock!: () => void;
+    this.mcpPostLockTail = new Promise<void>((resolve) => {
+      unblock = resolve;
+    });
+    await ticket;
+    this.mcpPostLockDepth = 1;
+    this.mcpPostUnlock = unblock;
+  }
+
+  private releaseMcpPostLock(): void {
+    this.mcpPostLockDepth -= 1;
+    if (this.mcpPostLockDepth === 0) {
+      const u = this.mcpPostUnlock;
+      this.mcpPostUnlock = null;
+      u?.();
+    }
+  }
+
+  /**
+   * Serialize POST /mcp and retry on HTTP 429 so parallel tree loads do not burst the server.
+   * Reentrant: session recovery calls sendRequest from inside performMcpPost.
+   */
   private async sendRequest(
+    request: JsonRpcRequest,
+    retryOnSessionError: boolean = true,
+    timeoutMs: number = McpClient.REQUEST_TIMEOUT_MS
+  ): Promise<JsonRpcResponse> {
+    await this.acquireMcpPostLock();
+    try {
+      for (let attempt = 0; attempt < McpClient.RATE_LIMIT_429_RETRIES; attempt++) {
+        try {
+          return await this.performMcpPost(request, retryOnSessionError, timeoutMs);
+        } catch (error) {
+          const e = error as Error & { statusCode?: number; retryAfterMs?: number };
+          if (e.statusCode === 429 && attempt < McpClient.RATE_LIMIT_429_RETRIES - 1) {
+            const delayMs = e.retryAfterMs ?? Math.min(10_000, 750 * (attempt + 1));
+            console.warn(
+              `Protokoll: [RATE] HTTP 429; waiting ${delayMs}ms before retry ${attempt + 2}/${McpClient.RATE_LIMIT_429_RETRIES}`
+            );
+            await new Promise((r) => setTimeout(r, delayMs));
+            continue;
+          }
+          throw error;
+        }
+      }
+      throw new Error('MCP request exhausted rate-limit retries');
+    } finally {
+      this.releaseMcpPostLock();
+    }
+  }
+
+  /** Single POST attempt (session recovery may call sendRequest again). */
+  private performMcpPost(
     request: JsonRpcRequest,
     retryOnSessionError: boolean = true,
     timeoutMs: number = McpClient.REQUEST_TIMEOUT_MS
@@ -223,8 +296,18 @@ export class McpClient {
             errorText += chunk.toString();
           });
           res.on('end', async () => {
-            const error = new Error(`HTTP ${res.statusCode}: ${errorText}`);
-            
+            const error = new Error(`HTTP ${res.statusCode}: ${errorText}`) as Error & {
+              statusCode?: number;
+              retryAfterMs?: number;
+            };
+            error.statusCode = res.statusCode ?? undefined;
+            if (res.statusCode === 429) {
+              const ra = parseRetryAfterMs(res.headers['retry-after']);
+              if (ra !== undefined) {
+                error.retryAfterMs = ra;
+              }
+            }
+
             // Try to parse error as JSON-RPC to check for session errors
             let jsonRpcError: JsonRpcResponse | null = null;
             try {
@@ -232,7 +315,7 @@ export class McpClient {
             } catch {
               // Not JSON, that's okay
             }
-            
+
             // Check if this is a session error and we should retry
             if (retryOnSessionError && !this.recoveringSession && this.shouldRecoverSession(error, jsonRpcError || undefined)) {
               console.warn('Protokoll: [SESSION] Session error detected, attempting to recover...');
