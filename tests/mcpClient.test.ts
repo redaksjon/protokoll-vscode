@@ -3,9 +3,26 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mockHttpRequestFn, mockHttpsRequestFn, mockHttpRequest, resetHttpMocks } from './helpers/httpMock';
+
+// Mock http and https modules so all requests go through our mock
+vi.mock('http', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('http')>();
+    return {
+        ...actual,
+        request: mockHttpRequestFn,
+    };
+});
+vi.mock('https', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('https')>();
+    return {
+        ...actual,
+        request: mockHttpsRequestFn,
+    };
+});
+
 import { McpClient } from '../src/mcpClient';
 import type { JsonRpcResponse, TranscriptsListResponse, TranscriptContent, McpResourcesListResponse, McpResourceResponse } from '../src/types';
-import { mockHttpRequest, resetHttpMocks } from './helpers/httpMock';
 
 describe('McpClient', () => {
     let client: McpClient;

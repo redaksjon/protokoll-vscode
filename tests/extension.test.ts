@@ -27,6 +27,12 @@ describe('extension', () => {
                 get: vi.fn((key: string, defaultValue?: unknown) => defaultValue),
                 update: vi.fn(),
             },
+            secrets: {
+                get: vi.fn().mockResolvedValue(undefined),
+                store: vi.fn().mockResolvedValue(undefined),
+                delete: vi.fn().mockResolvedValue(undefined),
+                onDidChange: vi.fn().mockReturnValue({ dispose: vi.fn() }),
+            },
             subscriptions: [],
             extensionUri: vscode.Uri.parse('file:///test/extension'),
         } as unknown as vscode.ExtensionContext;

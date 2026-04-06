@@ -39,6 +39,8 @@ const mockVscode = {
       title: '',
       dispose: vi.fn(),
     })),
+    setStatusBarMessage: vi.fn(() => ({ dispose: vi.fn() })),
+    withProgress: vi.fn((_options: any, callback: any) => callback({ report: vi.fn() })),
   },
   workspace: {
     getConfiguration: vi.fn(() => ({
@@ -163,6 +165,19 @@ const mockVscode = {
     contextValue?: string;
     command?: unknown;
     description?: string;
+  },
+  ConfigurationTarget: {
+    Global: 1,
+    Workspace: 2,
+    WorkspaceFolder: 3,
+  },
+  ProgressLocation: {
+    Notification: 15,
+    Window: 10,
+  },
+  StatusBarAlignment: {
+    Left: 1,
+    Right: 2,
   },
 };
 

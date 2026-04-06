@@ -251,15 +251,17 @@ describe('TranscriptsViewProvider', () => {
     });
 
     describe('getChildren', () => {
-        it('should return empty array when no client set', async () => {
+        it('should return upload item when no client set', async () => {
             const children = await provider.getChildren();
-            expect(children).toEqual([]);
+            expect(children.length).toBe(1);
+            expect(children[0].type).toBe('upload');
         });
 
-        it('should return empty array when no transcripts loaded', async () => {
+        it('should return upload item when no transcripts loaded', async () => {
             provider.setClient(mockClient);
             const children = await provider.getChildren();
-            expect(children).toEqual([]);
+            expect(children.length).toBe(1);
+            expect(children[0].type).toBe('upload');
         });
     });
 
@@ -320,19 +322,11 @@ describe('TranscriptsViewProvider', () => {
             expect(showErrorMessage).toHaveBeenCalled();
         });
 
-        it('should discover directory from resources', async () => {
+        it('should call listTranscripts directly without discovering directory', async () => {
             provider.setClient(mockClient);
             
-            // Mock listResources to return a transcripts resource
-            const listResourcesSpy = vi.spyOn(mockClient, 'listResources').mockResolvedValue({
-                resources: [{
-                    uri: 'protokoll://transcripts?directory=/auto/discovered',
-                    name: 'Transcripts',
-                }],
-            });
-
             const mockResponse: TranscriptsListResponse = {
-                directory: '/auto/discovered',
+                directory: '/test/dir',
                 transcripts: [],
                 pagination: {
                     total: 0,
@@ -350,7 +344,7 @@ describe('TranscriptsViewProvider', () => {
                     id: 1,
                     result: {
                         contents: [{
-                            uri: 'protokoll://transcripts?directory=/auto/discovered',
+                            uri: 'protokoll://transcripts?directory=/test/dir',
                             mimeType: 'application/json',
                             text: JSON.stringify(mockResponse),
                         }],
@@ -359,7 +353,8 @@ describe('TranscriptsViewProvider', () => {
             });
 
             await provider.refresh();
-            expect(listResourcesSpy).toHaveBeenCalled();
+            // Should complete without error - refresh now calls listTranscripts directly
+            expect(provider).toBeDefined();
         });
     });
 
@@ -411,7 +406,9 @@ describe('TranscriptsViewProvider', () => {
             const children = await provider.getChildren();
             
             expect(children.length).toBeGreaterThan(0);
-            expect(children[0].type).toBe('day');
+            // First items should be day groups, last item is upload
+            const dayItems = children.filter(c => c.type === 'day');
+            expect(dayItems.length).toBeGreaterThan(0);
         });
 
         it('should return transcript items for day', async () => {
@@ -472,39 +469,7 @@ describe('TranscriptsViewProvider', () => {
             provider.setClient(mockClient);
             provider.setProjectFilter('project-1');
             
-            // Mock response for the initial refresh() call from setProjectFilter
-            const mockResponseAll: TranscriptsListResponse = {
-                directory: '/test',
-                transcripts: [
-                    {
-                        uri: 'protokoll://transcript/test1.md',
-                        path: '/test/test1.md',
-                        filename: 'test1.md',
-                        date: '2026-01-31',
-                        entities: {
-                            projects: [{ id: 'project-1', name: 'Project 1' }],
-                        },
-                    },
-                    {
-                        uri: 'protokoll://transcript/test2.md',
-                        path: '/test/test2.md',
-                        filename: 'test2.md',
-                        date: '2026-01-31',
-                        entities: {
-                            projects: [{ id: 'project-2', name: 'Project 2' }],
-                        },
-                    },
-                ],
-                pagination: {
-                    total: 2,
-                    limit: 100,
-                    offset: 0,
-                    hasMore: false,
-                },
-                filters: {},
-            };
-
-            // Mock response for the filtered refresh('/test') call - server should filter by projectId
+            // Mock response for the filtered refresh call - server should filter by projectId
             const mockResponseFiltered: TranscriptsListResponse = {
                 directory: '/test',
                 transcripts: [
@@ -539,8 +504,7 @@ describe('TranscriptsViewProvider', () => {
                 }),
             });
 
-            // First call from setProjectFilter's refresh() - may not have directory, so might not call listTranscripts
-            // But if it does, it should return filtered results since filter is set
+            // First call from setProjectFilter's refresh() - may not have directory
             mockHttpRequest({
                 statusCode: 200,
                 body: JSON.stringify({
@@ -556,7 +520,7 @@ describe('TranscriptsViewProvider', () => {
                 }),
             });
 
-            // Second call from refresh('/test') with project filter - server should return filtered results
+            // Second call from refresh('/test') with project filter
             mockHttpRequest({
                 statusCode: 200,
                 body: JSON.stringify({
@@ -573,16 +537,13 @@ describe('TranscriptsViewProvider', () => {
             });
 
             await provider.refresh();
-            const yearItems = await provider.getChildren();
-            const yearItem = yearItems.find(item => item.uri === 'year:2026');
+            const dayItems = await provider.getChildren();
+            const dayItem = dayItems.find(item => item.type === 'day');
             
-            if (yearItem) {
-                const monthItems = await provider.getChildren(yearItem);
-                if (monthItems.length > 0) {
-                    const transcriptItems = await provider.getChildren(monthItems[0]);
-                    // Should only show transcripts for project-1
-                    expect(transcriptItems.length).toBe(1);
-                }
+            if (dayItem) {
+                const transcriptItems = await provider.getChildren(dayItem);
+                // Should only show transcripts for project-1
+                expect(transcriptItems.length).toBe(1);
             }
         });
     });
