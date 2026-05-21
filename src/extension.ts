@@ -979,6 +979,21 @@ export async function activate(context: vscode.ExtensionContext) {
     await transcriptsViewProvider.refresh();
   });
 
+  transcriptDetailViewProvider.setOnEntityListChanged(async () => {
+    if (peopleViewProvider) {
+      await peopleViewProvider.refresh();
+    }
+    if (companiesViewProvider) {
+      await companiesViewProvider.refresh();
+    }
+    if (termsViewProvider) {
+      await termsViewProvider.refresh();
+    }
+    if (projectsViewProvider) {
+      await projectsViewProvider.refresh();
+    }
+  });
+
   // Initialize chats view provider
   chatsViewProvider = new ChatsViewProvider();
   // Set chats view provider reference in chat view provider

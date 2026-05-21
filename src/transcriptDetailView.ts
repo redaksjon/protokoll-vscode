@@ -181,6 +181,7 @@ export class TranscriptDetailViewProvider {
   private _activeSummaryIdByTranscript: Map<string, string> = new Map();
   private _resolvedSummaryToolName: string | null = null;
   private _onTranscriptChanged?: (transcriptUri?: string, updates?: Partial<Transcript>) => void | Promise<void>;
+  private _onEntityListChanged?: () => void | Promise<void>;
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
 
@@ -191,6 +192,10 @@ export class TranscriptDetailViewProvider {
    */
   setOnTranscriptChanged(callback: (transcriptUri?: string, updates?: Partial<Transcript>) => void | Promise<void>): void {
     this._onTranscriptChanged = callback;
+  }
+
+  setOnEntityListChanged(callback: () => void | Promise<void>): void {
+    this._onEntityListChanged = callback;
   }
 
   setChatProvider(chatProvider: ChatViewProvider): void {
@@ -612,7 +617,12 @@ export class TranscriptDetailViewProvider {
             }, 0);
             break;
           case 'changeDate':
-            await this.handleChangeDate(currentTranscript.transcript, message.transcriptPath, activeTranscriptUri);
+            await this.handleChangeDate(
+              currentTranscript.transcript,
+              message.transcriptPath,
+              activeTranscriptUri,
+              message.newDate,
+            );
             break;
           case 'addTag':
             await this.handleAddTag(currentTranscript.transcript, message.transcriptPath, activeTranscriptUri);
@@ -1448,37 +1458,56 @@ export class TranscriptDetailViewProvider {
     await this.showTranscript(transcriptUri, updatedTranscript);
   }
 
-  private async handleChangeDate(transcript: Transcript, transcriptPath: string, transcriptUri: string): Promise<void> {
+  private async handleChangeDate(
+    transcript: Transcript,
+    transcriptPath: string,
+    transcriptUri: string,
+    presetDate?: string,
+  ): Promise<void> {
     if (!this._client) {
       vscode.window.showErrorMessage('MCP client not initialized');
       return;
     }
 
     try {
-      // Prompt user for new date
-      const dateInput = await vscode.window.showInputBox({
-        prompt: 'Enter new date for transcript (YYYY-MM-DD)',
-        placeHolder: '2026-01-15',
-        validateInput: (value) => {
-          if (!value) {
-            return 'Date is required';
-          }
-          // Validate date format
-          const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-          if (!dateRegex.test(value)) {
-            return 'Invalid date format. Use YYYY-MM-DD (e.g., 2026-01-15)';
-          }
-          // Validate it's a valid date
-          const date = new Date(value);
-          if (isNaN(date.getTime())) {
-            return 'Invalid date';
-          }
-          return null;
-        },
-      });
+      const validateDateInput = (value: string): string | null => {
+        if (!value) {
+          return 'Date is required';
+        }
+        const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+        if (!dateRegex.test(value)) {
+          return 'Invalid date format. Use YYYY-MM-DD (e.g., 2026-01-15)';
+        }
+        const parsedDate = new Date(`${value}T12:00:00`);
+        if (isNaN(parsedDate.getTime())) {
+          return 'Invalid date';
+        }
+        return null;
+      };
+
+      let dateInput = presetDate?.trim();
+      if (dateInput) {
+        const validationError = validateDateInput(dateInput);
+        if (validationError) {
+          vscode.window.showErrorMessage(validationError);
+          return;
+        }
+      } else {
+        // Fallback for callers that still trigger changeDate without a preset value.
+        dateInput = await vscode.window.showInputBox({
+          prompt: 'Enter new date for transcript (YYYY-MM-DD)',
+          placeHolder: '2026-01-15',
+          validateInput: validateDateInput,
+        }) ?? undefined;
+      }
 
       if (!dateInput) {
-        return; // User cancelled
+        return;
+      }
+
+      const currentDateValue = this.formatDateInputValue(transcript.date || '');
+      if (currentDateValue && currentDateValue === dateInput) {
+        return;
       }
 
       // Convert absolute path to relative path
@@ -2419,6 +2448,19 @@ export class TranscriptDetailViewProvider {
             case 'removeProjectRelationship':
               await this.handleRemoveProjectRelationship(entityType, entityId, entityUri, message.targetUri, message.relationship);
               break;
+            case 'deleteEntity':
+              await this.handleDeleteEntity(entityType, entityId, entityUri, panel, message.entityName);
+              break;
+            case 'convertEntityType':
+              await this.handleConvertEntityType(
+                message.fromType,
+                message.toType,
+                entityId,
+                entityUri,
+                panel,
+                message.entityName
+              );
+              break;
           }
         },
         null
@@ -2938,6 +2980,100 @@ export class TranscriptDetailViewProvider {
     }
   }
 
+  private async notifyEntityListChanged(): Promise<void> {
+    if (this._onEntityListChanged) {
+      await this._onEntityListChanged();
+    }
+  }
+
+  private async handleDeleteEntity(
+    entityType: string,
+    entityId: string,
+    entityUri: string,
+    panel: vscode.WebviewPanel,
+    entityName?: string
+  ): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    const displayName = entityName?.trim() || entityId;
+    const confirm = await vscode.window.showWarningMessage(
+      `Delete ${entityType} "${displayName}"? This removes it from context permanently.`,
+      { modal: true },
+      'Delete'
+    );
+    if (confirm !== 'Delete') {
+      return;
+    }
+
+    try {
+      await this._client.callTool('protokoll_delete_entity', {
+        entityType,
+        entityId,
+      });
+
+      this._entityPanels.delete(entityUri);
+      panel.dispose();
+      await this.notifyEntityListChanged();
+      vscode.window.showInformationMessage(`${this.capitalizeFirst(entityType)} "${displayName}" deleted`);
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to delete ${entityType}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private async handleConvertEntityType(
+    fromType: 'company' | 'person',
+    toType: 'company' | 'person',
+    entityId: string,
+    entityUri: string,
+    panel: vscode.WebviewPanel,
+    entityName?: string
+  ): Promise<void> {
+    if (!this._client) {
+      vscode.window.showErrorMessage('MCP client not initialized');
+      return;
+    }
+
+    const displayName = entityName?.trim() || entityId;
+    const confirm = await vscode.window.showWarningMessage(
+      `Convert ${fromType} "${displayName}" to a ${toType}? Related transcript references will be updated.`,
+      { modal: true },
+      'Convert'
+    );
+    if (confirm !== 'Convert') {
+      return;
+    }
+
+    try {
+      const result = await this._client.callTool('protokoll_convert_entity_type', {
+        entityId,
+        fromType,
+        toType,
+      }) as { migratedTranscripts?: number; message?: string };
+
+      this._entityPanels.delete(entityUri);
+      panel.dispose();
+      await this.notifyEntityListChanged();
+      await this.handleOpenEntity(toType, entityId);
+
+      const migratedCount = result.migratedTranscripts ?? 0;
+      const migrationNote = migratedCount > 0
+        ? ` Updated ${migratedCount} transcript reference${migratedCount === 1 ? '' : 's'}.`
+        : '';
+      vscode.window.showInformationMessage(
+        `${result.message || `Converted to ${toType}`}.${migrationNote}`
+      );
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `Failed to convert ${fromType} to ${toType}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
   private async handleStartChatFromInputEntity(
     entityType: string,
     entityId: string,
@@ -3197,7 +3333,7 @@ export class TranscriptDetailViewProvider {
     }
   }
 
-  private async listEntitiesByType(entityType: string, search: string, limit = 25): Promise<Array<{ id: string; name: string }>> {
+  private async listEntitiesByType(entityType: string, search: string, limit = 100): Promise<Array<{ id: string; name: string }>> {
     if (!this._client) {
       return [];
     }
@@ -3344,7 +3480,7 @@ export class TranscriptDetailViewProvider {
 
     const refreshItems = async (query: string): Promise<void> => {
       latestQuery = query;
-      const entities = await this.listEntitiesByType(entityType, query, query.trim().length > 0 ? 25 : 10);
+      const entities = await this.listEntitiesByType(entityType, query, 100);
       if (latestQuery !== query) {
         return;
       }
@@ -3967,6 +4103,23 @@ export class TranscriptDetailViewProvider {
     return parsed.toLocaleString();
   }
 
+  private formatDateInputValue(dateString: string): string {
+    const trimmed = dateString.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+      return trimmed;
+    }
+
+    const parsed = this.parseClientLocalDate(trimmed);
+    if (!parsed) {
+      return '';
+    }
+
+    const year = parsed.getFullYear();
+    const month = String(parsed.getMonth() + 1).padStart(2, '0');
+    const day = String(parsed.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
   private parseClientLocalDate(dateString: string, timeString?: string): Date | null {
     const trimmedDate = dateString.trim();
     const dateOnlyMatch = trimmedDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -4529,6 +4682,38 @@ export class TranscriptDetailViewProvider {
         .edit-button:hover {
             background-color: var(--vscode-button-secondaryHoverBackground);
         }
+        .convert-button {
+            background-color: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border: 1px solid var(--vscode-button-border);
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: background-color 0.2s;
+        }
+        .convert-button:hover {
+            background-color: var(--vscode-button-secondaryHoverBackground);
+        }
+        .delete-button {
+            background-color: var(--vscode-inputValidation-errorBackground, #5a1d1d);
+            color: var(--vscode-inputValidation-errorForeground, #f48771);
+            border: 1px solid var(--vscode-inputValidation-errorBorder, #be1100);
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: background-color 0.2s;
+        }
+        .delete-button:hover {
+            filter: brightness(1.08);
+        }
         .header-buttons {
             position: absolute;
             top: 0;
@@ -4916,6 +5101,18 @@ export class TranscriptDetailViewProvider {
                 </svg>
                 Refresh
             </button>
+            ${entityType === 'company' ? `
+            <button class="convert-button" id="convert-to-person-button" title="Convert this company to a person">
+                Convert to Person
+            </button>` : ''}
+            ${entityType === 'person' ? `
+            <button class="convert-button" id="convert-to-company-button" title="Convert this person to a company">
+                Convert to Company
+            </button>` : ''}
+            ${entityType === 'person' || entityType === 'company' || entityType === 'term' ? `
+            <button class="delete-button" id="delete-entity-button" title="Delete this entity">
+                Delete
+            </button>` : ''}
         </div>
         <div class="entity-type">${this.escapeHtml(entityType)}</div>
         <h1 id="entity-name-display">${this.escapeHtml(entityName)}</h1>
@@ -5046,6 +5243,7 @@ export class TranscriptDetailViewProvider {
         const vscode = acquireVsCodeApi();
         const entityType = ${JSON.stringify(entityType)};
         const entityId = ${JSON.stringify(entityId)};
+        const entityName = ${JSON.stringify(entityName)};
         const entityUri = \`protokoll://entity/\${entityType}/\${encodeURIComponent(entityId)}\`;
 
         function startChatFromInput() {
@@ -5695,6 +5893,42 @@ export class TranscriptDetailViewProvider {
             });
         }
         
+        function setupEntityActionButtons() {
+            const deleteButton = document.getElementById('delete-entity-button');
+            if (deleteButton) {
+                deleteButton.addEventListener('click', function() {
+                    vscode.postMessage({
+                        command: 'deleteEntity',
+                        entityName: entityName,
+                    });
+                });
+            }
+
+            const convertToPersonButton = document.getElementById('convert-to-person-button');
+            if (convertToPersonButton) {
+                convertToPersonButton.addEventListener('click', function() {
+                    vscode.postMessage({
+                        command: 'convertEntityType',
+                        fromType: 'company',
+                        toType: 'person',
+                        entityName: entityName,
+                    });
+                });
+            }
+
+            const convertToCompanyButton = document.getElementById('convert-to-company-button');
+            if (convertToCompanyButton) {
+                convertToCompanyButton.addEventListener('click', function() {
+                    vscode.postMessage({
+                        command: 'convertEntityType',
+                        fromType: 'person',
+                        toType: 'company',
+                        entityName: entityName,
+                    });
+                });
+            }
+        }
+
         function setupProjectAssociation() {
             const addBtn = document.getElementById('add-project-btn');
             if (addBtn) {
@@ -5731,6 +5965,7 @@ export class TranscriptDetailViewProvider {
         setupInlineChatListeners();
         setupRefreshButton();
         setupEditButton();
+        setupEntityActionButtons();
         setupProjectUrlsListeners();
         setupProjectAssociation();
         loadRelatedTranscripts();
@@ -5742,6 +5977,7 @@ export class TranscriptDetailViewProvider {
                 setupInlineChatListeners();
                 setupRefreshButton();
                 setupEditButton();
+                setupEntityActionButtons();
                 setupProjectUrlsListeners();
                 setupProjectAssociation();
             });
@@ -5788,6 +6024,7 @@ export class TranscriptDetailViewProvider {
     const date = metadata.date ?? transcript.date ?? '';
     const time = metadata.time ?? transcript.time ?? '';
     const dateTime = date ? this.formatTranscriptDateTime(date, time) : 'Unknown date';
+    const dateInputValue = this.formatDateInputValue(date);
 
     // Get createdAt and updatedAt from transcript object (not in content.metadata)
     const createdAt = transcript.createdAt;
@@ -5924,6 +6161,36 @@ export class TranscriptDetailViewProvider {
             display: inline-flex;
             align-items: center;
             gap: 4px;
+        }
+        .date-picker-row {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .transcript-date-input {
+            background-color: var(--vscode-input-background);
+            color: var(--vscode-input-foreground);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 4px;
+            padding: 4px 8px;
+            font-family: inherit;
+            font-size: inherit;
+            line-height: 1.4;
+            min-height: 28px;
+            box-sizing: border-box;
+        }
+        .transcript-date-input:focus {
+            outline: 1px solid var(--vscode-focusBorder);
+            outline-offset: -1px;
+        }
+        .transcript-date-input::-webkit-calendar-picker-indicator {
+            cursor: pointer;
+            opacity: 0.85;
+            filter: invert(0.85);
+        }
+        .date-time-suffix {
+            color: var(--vscode-descriptionForeground);
         }
         .editable-date:hover {
             background-color: var(--vscode-list-hoverBackground);
@@ -7078,14 +7345,17 @@ export class TranscriptDetailViewProvider {
             <div class="metadata-content">
                 <div class="metadata-row">
                     <div class="metadata-label">Date/Time:</div>
-                    <div class="metadata-value">
-                        <span class="editable-date" onclick="changeDate()" title="Click to change transcript date">
-                            ${this.escapeHtml(dateTime)}
-                            <svg class="edit-icon-small" width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                                <path d="M11.5 1.5L14.5 4.5L5 14H2V11L11.5 1.5Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                                <path d="M10 3L13 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                            </svg>
-                        </span>
+                    <div class="metadata-value date-picker-row">
+                        <input
+                            type="date"
+                            class="transcript-date-input"
+                            id="transcript-date-input"
+                            value="${this.escapeHtml(dateInputValue)}"
+                            onchange="submitDateChange(this.value)"
+                            title="Pick transcript date"
+                        />
+                        ${time ? `<span class="date-time-suffix">${this.escapeHtml(time)}</span>` : ''}
+                        ${!dateInputValue && dateTime !== 'Unknown date' ? `<span class="date-time-suffix">${this.escapeHtml(dateTime)}</span>` : ''}
                     </div>
                 </div>
                 ${createdAt ? `
@@ -8213,7 +8483,24 @@ export class TranscriptDetailViewProvider {
             });
         }
 
+        function submitDateChange(newDate) {
+            if (!newDate) {
+                return;
+            }
+            vscode.postMessage({
+                command: 'changeDate',
+                transcriptPath: transcriptPath,
+                newDate: newDate
+            });
+        }
+
         function changeDate() {
+            const dateInput = document.getElementById('transcript-date-input');
+            if (dateInput instanceof HTMLInputElement) {
+                dateInput.showPicker?.();
+                dateInput.focus();
+                return;
+            }
             vscode.postMessage({
                 command: 'changeDate',
                 transcriptPath: transcriptPath
