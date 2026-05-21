@@ -168,6 +168,7 @@ export class TranscriptDetailViewProvider {
 
   private _panels: Map<string, vscode.WebviewPanel> = new Map();
   private _entityPanels: Map<string, vscode.WebviewPanel> = new Map(); // Track entity panels
+  private _pendingEntityActions: Set<string> = new Set();
   private _client: McpClient | null = null;
   private getDefaultContextDirectory(): string | undefined {
     return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -2380,42 +2381,47 @@ export class TranscriptDetailViewProvider {
     }
 
     try {
-      // Build entity URI: protokoll://entity/{type}/{id}
       const entityUri = `protokoll://entity/${entityType}/${encodeURIComponent(entityId)}`;
-      
-      // Read the entity resource
       const content = await this._client.readResource(entityUri);
-      
-      // Track when entity was fetched
       this._entityLastFetched.set(entityUri, new Date());
-      
-      // Parse entity content to extract name for title
+
       const entityData = this.parseEntityContent(content.text);
       const entityName = entityData.name || entityId;
       const panelTitle = `${this.capitalizeFirst(entityType)}: ${entityName}`;
-      
-      // Create a new webview panel to display the entity
+      const projectNameMap = await this.fetchProjectNameMap();
+      const lastFetched = this._entityLastFetched.get(entityUri);
+      const panelHtml = this.getEntityContent(
+        entityType,
+        entityId,
+        content.text,
+        entityData,
+        lastFetched,
+        projectNameMap
+      );
+
+      this.pruneDisposedEntityPanels();
+
+      const existingPanel = this._entityPanels.get(entityUri);
+      if (existingPanel) {
+        existingPanel.title = panelTitle;
+        existingPanel.webview.html = panelHtml;
+        existingPanel.reveal(this.getEntityViewColumn(), false);
+        return;
+      }
+
       const panel = vscode.window.createWebviewPanel(
         'protokoll.entity',
         panelTitle,
-        vscode.ViewColumn.Beside,
+        this.getEntityViewColumn(),
         {
           enableScripts: true,
           retainContextWhenHidden: true,
         }
       );
 
-      // Resolve project names for relationship display
-      const projectNameMap = await this.fetchProjectNameMap();
-
-      // Display entity content with last fetched time
-      const lastFetched = this._entityLastFetched.get(entityUri);
-      panel.webview.html = this.getEntityContent(entityType, entityId, content.text, entityData, lastFetched, projectNameMap);
-
-      // Track entity panel
+      panel.webview.html = panelHtml;
       this._entityPanels.set(entityUri, panel);
 
-      // Handle messages from entity webview
       panel.webview.onDidReceiveMessage(
         async (message) => {
           switch (message.command) {
@@ -2466,10 +2472,8 @@ export class TranscriptDetailViewProvider {
         null
       );
 
-      // Clean up on dispose
       panel.onDidDispose(async () => {
         this._entityPanels.delete(entityUri);
-        // Unsubscribe from entity resource when panel is closed
         if (this._client) {
           try {
             await this._client.unsubscribeFromResource(entityUri);
@@ -2480,20 +2484,38 @@ export class TranscriptDetailViewProvider {
         }
       }, null);
 
-      // Subscribe to this entity for change notifications
       console.log(`Protokoll: [ENTITY VIEW] Subscribing to entity for change notifications: ${entityUri}`);
       try {
         await this._client.subscribeToResource(entityUri);
         console.log(`Protokoll: [ENTITY VIEW] ✅ Successfully subscribed to entity: ${entityUri}`);
       } catch (error) {
         console.warn(`Protokoll: [ENTITY VIEW] ⚠️ Failed to subscribe to entity ${entityUri}:`, error);
-        // Continue anyway - subscription failure shouldn't prevent viewing
       }
     } catch (error) {
       vscode.window.showErrorMessage(
         `Failed to open entity: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+  }
+
+  private pruneDisposedEntityPanels(): void {
+    for (const [entityUri, panel] of this._entityPanels.entries()) {
+      try {
+        void panel.title;
+      } catch {
+        this._entityPanels.delete(entityUri);
+      }
+    }
+  }
+
+  private getEntityViewColumn(): vscode.ViewColumn {
+    this.pruneDisposedEntityPanels();
+    for (const panel of this._entityPanels.values()) {
+      if (panel.viewColumn !== undefined) {
+        return panel.viewColumn;
+      }
+    }
+    return vscode.ViewColumn.Active;
   }
 
   /**
@@ -2998,17 +3020,23 @@ export class TranscriptDetailViewProvider {
       return;
     }
 
-    const displayName = entityName?.trim() || entityId;
-    const confirm = await vscode.window.showWarningMessage(
-      `Delete ${entityType} "${displayName}"? This removes it from context permanently.`,
-      { modal: true },
-      'Delete'
-    );
-    if (confirm !== 'Delete') {
+    const actionKey = `delete:${entityUri}`;
+    if (this._pendingEntityActions.has(actionKey)) {
       return;
     }
+    this._pendingEntityActions.add(actionKey);
 
+    const displayName = entityName?.trim() || entityId;
     try {
+      const confirm = await vscode.window.showWarningMessage(
+        `Delete ${entityType} "${displayName}"? This removes it from context permanently.`,
+        { modal: true },
+        'Delete'
+      );
+      if (confirm !== 'Delete') {
+        return;
+      }
+
       await this._client.callTool('protokoll_delete_entity', {
         entityType,
         entityId,
@@ -3022,6 +3050,8 @@ export class TranscriptDetailViewProvider {
       vscode.window.showErrorMessage(
         `Failed to delete ${entityType}: ${error instanceof Error ? error.message : String(error)}`
       );
+    } finally {
+      this._pendingEntityActions.delete(actionKey);
     }
   }
 
@@ -3038,17 +3068,23 @@ export class TranscriptDetailViewProvider {
       return;
     }
 
-    const displayName = entityName?.trim() || entityId;
-    const confirm = await vscode.window.showWarningMessage(
-      `Convert ${fromType} "${displayName}" to a ${toType}? Related transcript references will be updated.`,
-      { modal: true },
-      'Convert'
-    );
-    if (confirm !== 'Convert') {
+    const actionKey = `convert:${entityUri}:${fromType}:${toType}`;
+    if (this._pendingEntityActions.has(actionKey)) {
       return;
     }
+    this._pendingEntityActions.add(actionKey);
 
+    const displayName = entityName?.trim() || entityId;
     try {
+      const confirm = await vscode.window.showWarningMessage(
+        `Convert ${fromType} "${displayName}" to a ${toType}? Related transcript references will be updated.`,
+        { modal: true },
+        'Convert'
+      );
+      if (confirm !== 'Convert') {
+        return;
+      }
+
       const result = await this._client.callTool('protokoll_convert_entity_type', {
         entityId,
         fromType,
@@ -3071,6 +3107,8 @@ export class TranscriptDetailViewProvider {
       vscode.window.showErrorMessage(
         `Failed to convert ${fromType} to ${toType}: ${error instanceof Error ? error.message : String(error)}`
       );
+    } finally {
+      this._pendingEntityActions.delete(actionKey);
     }
   }
 
@@ -5896,36 +5934,36 @@ export class TranscriptDetailViewProvider {
         function setupEntityActionButtons() {
             const deleteButton = document.getElementById('delete-entity-button');
             if (deleteButton) {
-                deleteButton.addEventListener('click', function() {
+                deleteButton.onclick = function() {
                     vscode.postMessage({
                         command: 'deleteEntity',
                         entityName: entityName,
                     });
-                });
+                };
             }
 
             const convertToPersonButton = document.getElementById('convert-to-person-button');
             if (convertToPersonButton) {
-                convertToPersonButton.addEventListener('click', function() {
+                convertToPersonButton.onclick = function() {
                     vscode.postMessage({
                         command: 'convertEntityType',
                         fromType: 'company',
                         toType: 'person',
                         entityName: entityName,
                     });
-                });
+                };
             }
 
             const convertToCompanyButton = document.getElementById('convert-to-company-button');
             if (convertToCompanyButton) {
-                convertToCompanyButton.addEventListener('click', function() {
+                convertToCompanyButton.onclick = function() {
                     vscode.postMessage({
                         command: 'convertEntityType',
                         fromType: 'person',
                         toType: 'company',
                         entityName: entityName,
                     });
-                });
+                };
             }
         }
 
@@ -5977,7 +6015,6 @@ export class TranscriptDetailViewProvider {
                 setupInlineChatListeners();
                 setupRefreshButton();
                 setupEditButton();
-                setupEntityActionButtons();
                 setupProjectUrlsListeners();
                 setupProjectAssociation();
             });
