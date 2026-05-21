@@ -1232,7 +1232,7 @@ export class TranscriptDetailViewProvider {
               },
             ] as Array<vscode.QuickPickItem & { id: string | null; isCreateNew?: boolean; active?: boolean }>)
           : []),
-        ...[...allProjects].sort((a, b) => a.name.localeCompare(b.name)).map(p => ({
+        ...[...allProjects].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })).map(p => ({
           label: p.active === false ? `$(circle-slash) ${p.name}` : p.name,
           description: p.active === false ? `${p.id} (inactive)` : p.id,
           id: p.id,
@@ -1341,6 +1341,7 @@ export class TranscriptDetailViewProvider {
         editResult = await this._client.callTool('protokoll_edit_transcript', {
           transcriptPath: transcriptPath,
           projectId: projectId,
+          projectName: projectName,
           ...toolContextArgs,
         }) as {
           success?: boolean;

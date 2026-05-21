@@ -2420,7 +2420,10 @@ export async function activate(context: vscode.ExtensionContext) {
             description: 'Remove project filter',
             id: null,
           },
-          ...activeProjects.map(p => ({
+          ...activeProjects
+            .slice()
+            .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+            .map(p => ({
             label: p.name,
             description: p.id === currentFilter ? 'Currently filtered' : p.id,
             id: p.id,
@@ -2974,7 +2977,10 @@ export async function activate(context: vscode.ExtensionContext) {
       }
 
       // Show quick pick to select project
-      const projectItems = activeProjects.map(p => ({
+      const projectItems = activeProjects
+        .slice()
+        .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+        .map(p => ({
         label: p.name,
         description: p.id,
         id: p.id,
@@ -3633,7 +3639,10 @@ export async function activate(context: vscode.ExtensionContext) {
           if (projectsResult.projects && projectsResult.projects.length > 0) {
             const activeProjects = projectsResult.projects.filter(p => p.active !== false);
             if (activeProjects.length > 0) {
-              const projectItems = activeProjects.map(p => ({
+              const projectItems = activeProjects
+                .slice()
+                .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+                .map(p => ({
                 label: p.name,
                 description: p.id,
                 id: p.id,
@@ -3783,6 +3792,15 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  const dashboardStatusBarItem = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Right,
+    100
+  );
+  dashboardStatusBarItem.text = '$(dashboard) Protokoll';
+  dashboardStatusBarItem.tooltip = 'Open Protokoll Dashboard';
+  dashboardStatusBarItem.command = 'protokoll.openDashboard';
+  dashboardStatusBarItem.show();
+
   const uploadAudioCommand = vscode.commands.registerCommand(
     'protokoll.uploadAudio',
     async () => {
@@ -3919,7 +3937,10 @@ export async function activate(context: vscode.ExtensionContext) {
         // Single-project access: remove unnecessary prompt and enforce the valid project id.
         project = activeProjects[0].id;
       } else if (activeProjects.length > 1) {
-        const projectPickItems: UploadProjectOption[] = activeProjects.map((p) => ({
+        const projectPickItems: UploadProjectOption[] = activeProjects
+          .slice()
+          .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+          .map((p) => ({
           label: p.name,
           description: p.id,
           id: p.id,
@@ -3944,7 +3965,7 @@ export async function activate(context: vscode.ExtensionContext) {
           title: 'Uploading audio...',
           cancellable: false,
         },
-        async () => {
+        async (progress) => {
           try {
             const result = await uploadService.uploadAudio({
               filePath,
@@ -3952,14 +3973,26 @@ export async function activate(context: vscode.ExtensionContext) {
               title: title && title.trim() ? title.trim() : undefined,
               project,
               apiKey,
+              onProgress: (state) => {
+                const percent = state.totalBytes > 0
+                  ? Math.min(100, Math.round((state.uploadedBytes / state.totalBytes) * 100))
+                  : 0;
+                const message = state.phase === 'creating'
+                  ? 'Preparing upload session'
+                  : state.phase === 'finalizing'
+                    ? 'Finalizing upload'
+                    : `Uploading ${percent}%`;
+                progress.report({ message });
+              },
             });
 
             if (result.success) {
               if (transcriptsViewProvider) {
                 await transcriptsViewProvider.refresh();
               }
+              const tracking = result.uuid?.substring(0, 8) || result.uploadId?.substring(0, 8) || 'unknown';
               void vscode.window.showInformationMessage(
-                `Audio uploaded successfully! Tracking ID: ${result.uuid?.substring(0, 8)}`,
+                `Audio uploaded successfully! Tracking ID: ${tracking}`,
                 'Open Dashboard'
               ).then((action) => {
                 if (action === 'Open Dashboard') {
@@ -4035,6 +4068,7 @@ export async function activate(context: vscode.ExtensionContext) {
     closeChatPanelCommand,
     createNoteCommand,
     openDashboardCommand,
+    dashboardStatusBarItem,
     uploadAudioCommand,
     backArrowHandler,
     configWatcher,
