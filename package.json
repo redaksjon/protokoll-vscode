@@ -157,6 +157,11 @@
         "category": "Protokoll"
       },
       {
+        "command": "protokoll.combineTranscripts",
+        "title": "Combine",
+        "category": "Protokoll"
+      },
+      {
         "command": "protokoll.identifyTasksInTranscript",
         "title": "Identify Tasks in Transcript",
         "category": "Protokoll"
@@ -554,6 +559,16 @@
         },
         {
           "command": "protokoll.changeSelectedTranscriptsStatus",
+          "when": "view == protokollTranscripts",
+          "group": "z_commands"
+        },
+        {
+          "command": "protokoll.combineTranscripts",
+          "when": "view == protokollTranscripts && viewItem == transcript",
+          "group": "z_commands"
+        },
+        {
+          "command": "protokoll.combineTranscripts",
           "when": "view == protokollTranscripts",
           "group": "z_commands"
         },

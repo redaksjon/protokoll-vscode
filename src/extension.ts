@@ -3099,6 +3099,107 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  const combineTranscriptsCommand = vscode.commands.registerCommand(
+    'protokoll.combineTranscripts',
+    async (item?: TranscriptItem) => {
+      if (!transcriptsViewProvider) {
+        vscode.window.showErrorMessage('Transcripts view provider not initialized.');
+        return;
+      }
+
+      const selectedItems = transcriptsViewProvider.getSelectedItems();
+      const candidateItems = selectedItems.length > 0
+        ? selectedItems
+        : (item?.transcript ? [item] : []);
+
+      const combineSelection = transcriptsViewProvider.getCombineSelection(candidateItems);
+      if (!combineSelection) {
+        vscode.window.showWarningMessage('Select at least two transcripts to combine.');
+        return;
+      }
+
+      const { target, orderedItems } = combineSelection;
+      const transcripts = orderedItems
+        .map((entry) => entry.transcript)
+        .filter((transcript): transcript is Transcript => !!transcript);
+
+      const serverIds = new Set(
+        transcripts
+          .map((transcript) => transcript.serverId ?? activeServerId)
+          .filter((serverId): serverId is string => !!serverId && serverId.trim().length > 0)
+      );
+      if (serverIds.size > 1) {
+        vscode.window.showWarningMessage(
+          'Selected transcripts come from multiple servers. Please select transcripts from one server to combine.'
+        );
+        return;
+      }
+
+      const targetServerId = Array.from(serverIds)[0] ?? activeServerId;
+      const client = getClientForServer(targetServerId);
+      if (!client) {
+        const targetName = targetServerId
+          ? (getConnectionById(targetServerId)?.name ?? targetServerId)
+          : 'selected server';
+        vscode.window.showErrorMessage(`Protokoll: Source server "${targetName}" is not connected.`);
+        return;
+      }
+
+      const targetTranscript = target.transcript;
+      if (!targetTranscript) {
+        vscode.window.showErrorMessage('No target transcript selected.');
+        return;
+      }
+
+      const targetTitle = targetTranscript.title || targetTranscript.filename;
+      const orderedLabels = orderedItems.map((entry) => {
+        const transcript = entry.transcript;
+        if (!transcript) {
+          return 'Untitled transcript';
+        }
+        const label = transcript.title || transcript.filename;
+        const timeLabel = transcript.time ? ` (${transcript.time})` : '';
+        return `${label}${timeLabel}`;
+      });
+
+      const confirm = await vscode.window.showWarningMessage(
+        `Combine ${orderedItems.length} transcripts into "${targetTitle}"?\n\n` +
+        `Join order (by time):\n${orderedLabels.map((label, index) => `${index + 1}. ${label}`).join('\n')}\n\n` +
+        'Other selected transcripts will be deleted after joining.',
+        { modal: true },
+        'Combine'
+      );
+      if (confirm !== 'Combine') {
+        return;
+      }
+
+      try {
+        const shouldPass = await shouldPassContextDirectory(client);
+        const contextDirectory = shouldPass ? getDefaultContextDirectory() : undefined;
+        const transcriptPaths = transcripts.map((transcript) => resolveTranscriptToolRef(transcript));
+        const targetPath = resolveTranscriptToolRef(targetTranscript);
+
+        await client.callTool('protokoll_join_transcripts', {
+          targetPath,
+          transcriptPaths,
+          ...(contextDirectory ? { contextDirectory } : {}),
+        });
+
+        vscode.window.showInformationMessage(
+          `Combined ${orderedItems.length} transcripts into "${targetTitle}".`
+        );
+
+        if (transcriptsViewProvider) {
+          await transcriptsViewProvider.refresh();
+        }
+      } catch (error) {
+        vscode.window.showErrorMessage(
+          `Failed to combine transcripts: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+  );
+
   interface IdentifyTaskCandidate {
     id: string;
     taskText: string;
@@ -4054,6 +4155,7 @@ export async function activate(context: vscode.ExtensionContext) {
     moveSelectedToProjectCommand,
     changeTranscriptStatusCommand,
     changeSelectedTranscriptsStatusCommand,
+    combineTranscriptsCommand,
     identifyTasksInTranscriptCommand,
     copyTranscriptCommand,
     copyTranscriptOriginalCommand,

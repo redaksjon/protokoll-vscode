@@ -116,6 +116,51 @@ export class TranscriptsViewProvider implements vscode.TreeDataProvider<Transcri
     return selection.filter(item => item.type === 'transcript' && item.transcript);
   }
 
+  compareTranscriptsChronologically(a: Transcript, b: Transcript): number {
+    const dateCompare = this.getTranscriptDate(a).getTime() - this.getTranscriptDate(b).getTime();
+    if (dateCompare !== 0) {
+      return dateCompare;
+    }
+
+    const timeA = a.time || '';
+    const timeB = b.time || '';
+    if (timeA && timeB) {
+      return timeA.localeCompare(timeB);
+    }
+
+    return (a.title || a.filename || '').localeCompare(b.title || b.filename || '');
+  }
+
+  getCombineSelection(selectedItems: TranscriptItem[]): {
+    target: TranscriptItem;
+    orderedItems: TranscriptItem[];
+  } | null {
+    if (selectedItems.length < 2) {
+      return null;
+    }
+
+    const target = selectedItems[0];
+    if (!target.transcript) {
+      return null;
+    }
+
+    const orderedItems = selectedItems
+      .slice()
+      .filter((item) => !!item.transcript)
+      .sort((left, right) => {
+        if (!left.transcript || !right.transcript) {
+          return 0;
+        }
+        return this.compareTranscriptsChronologically(left.transcript, right.transcript);
+      });
+
+    if (orderedItems.length < 2) {
+      return null;
+    }
+
+    return { target, orderedItems };
+  }
+
   setClient(client: McpClient): void {
     log('TranscriptsViewProvider.setClient called', { hasClient: !!client });
     const hadClient = !!this.client;
